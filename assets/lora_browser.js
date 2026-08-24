@@ -60,6 +60,7 @@
     ready: false,
     mounted: false,
     forceNative: false,
+    layoutBroken: false,
     remountQueued: false,
     dragging: false,
     lastSentSignature: null,
@@ -162,7 +163,7 @@
   /* Fail open: the native selector and multiplier box are only ever hidden
      while the panel is genuinely standing in for them. */
   function hideNative(hide) {
-    var conceal = !!hide && panelHasContent() && !S.forceNative;
+    var conceal = !!hide && panelHasContent() && !S.forceNative && !S.layoutBroken;
     nativeBlocks().forEach(function (block) {
       block.style.display = conceal ? "none" : "";
     });
@@ -980,6 +981,90 @@
     el.profiles.value = current;
   }
 
+  /* --------------------------------------------------------- diagnose */
+
+  /* Everything needed to tell "panel never built" from "panel built but is
+     not on screen" apart, without the user having to paste a script. */
+  function diagnose() {
+    var root = byId(IDS.root);
+    var report = {
+      instance: INSTANCE,
+      ready: S.ready,
+      mounted: S.mounted,
+      items: S.items.length,
+      activeRows: S.rows.length,
+      forceNative: S.forceNative,
+      layoutBroken: S.layoutBroken,
+      root: null,
+      chain: [],
+      firstHidden: null,
+      nativeControls: []
+    };
+    if (root) {
+      var rect = root.getBoundingClientRect();
+      var wrap = root.querySelector(".lb-grid-wrap");
+      report.root = {
+        id: root.id,
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        onScreen: !!root.offsetParent,
+        tiles: root.querySelectorAll(".lb-tile").length,
+        gridHeight: wrap ? Math.round(wrap.getBoundingClientRect().height) : -1,
+        cssApplied: wrap ? getComputedStyle(wrap).overflowY !== "visible" : false
+      };
+      var node = root, depth = 0;
+      while (node && depth < 14) {
+        var styles = getComputedStyle(node);
+        var height = Math.round(node.getBoundingClientRect().height);
+        var label = node.tagName.toLowerCase() + (node.id ? "#" + node.id : "") +
+          "." + String(node.className || "").split(" ").filter(Boolean).slice(0, 2).join(".") +
+          "[display=" + styles.display + ",h=" + height + "]";
+        report.chain.push(label);
+        if (!report.firstHidden && (styles.display === "none" || styles.visibility === "hidden" ||
+            styles.opacity === "0" || (node !== root && height === 0))) {
+          report.firstHidden = label;
+        }
+        node = node.parentElement;
+        depth += 1;
+      }
+    }
+    [IDS.nativeChoices, IDS.nativeMultipliers].forEach(function (id) {
+      var node = byId(id);
+      report.nativeControls.push(id + "=" + (node ? (node.offsetParent ? "visible" : "hidden") : "NOT FOUND"));
+    });
+    return report;
+  }
+
+  /* A panel that exists but collapsed to nothing is the worst failure mode:
+     the user sees an empty tab. Detect it, say so loudly, and give the native
+     controls back rather than leaving them with no LoRA UI. */
+  function auditLayout() {
+    if (!S.ready) { return; }
+    var root = byId(IDS.root);
+    if (!root) { return; }
+    var block = root.closest(".block") || root.parentElement;
+    var blockHeight = block ? block.getBoundingClientRect().height : 0;
+    // The LoRAs tab is simply not open: zero height is expected, not a fault.
+    if (blockHeight === 0) { return; }
+
+    // The panel has padding and a border, so a collapsed one still measures
+    // ~24px -- the content area is the honest signal. The grid always has
+    // height when healthy, even with no results (it shows an empty state).
+    var wrap = root.querySelector(".lb-grid-wrap");
+    var wrapHeight = wrap ? wrap.getBoundingClientRect().height : 0;
+    var collapsed = wrapHeight <= 4 || root.getBoundingClientRect().height < 48;
+    if (collapsed === S.layoutBroken) { return; }
+
+    S.layoutBroken = collapsed;
+    if (collapsed) {
+      console.warn("[LoRA Browser] panel rendered but has no height; restoring native controls.",
+                   JSON.stringify(diagnose()));
+    } else {
+      console.log("[LoRA Browser] panel layout recovered.");
+    }
+    hideNative(S.ready);
+  }
+
   /* ------------------------------------------------------------- boot */
 
   function boot() {
@@ -988,11 +1073,23 @@
     // MutationObserver catches most wipes instantly; this is the backstop for
     // anything that replaces the anchor without us seeing the mutation.
     if (!integrityTimer) {
-      integrityTimer = setInterval(checkIntegrity, 1000);
+      integrityTimer = setInterval(function () { checkIntegrity(); auditLayout(); }, 1000);
     }
   }
 
-  window.wgpLoraBrowser[INSTANCE] = { apply: apply, applyThumbs: applyThumbs, boot: boot, state: S };
+  window.wgpLoraBrowser[INSTANCE] = {
+    apply: apply, applyThumbs: applyThumbs, boot: boot, diagnose: diagnose, state: S
+  };
+
+  /* One word in the browser console reports every instance. */
+  window.wgpLoraBrowserDiagnose = function () {
+    var all = Object.keys(window.wgpLoraBrowser).map(function (key) {
+      return window.wgpLoraBrowser[key].diagnose();
+    });
+    var text = JSON.stringify({ instances: all }, null, 1);
+    console.log(text);
+    return text;
+  };
 
   console.log("[LoRA Browser] frontend installed for instance " + INSTANCE);
 
