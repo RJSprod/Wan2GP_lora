@@ -33,7 +33,11 @@ from .lora_browser.utils import normalize_id
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(PLUGIN_DIR, "assets")
 
-#: Components whose visible wrappers the panel replaces once it is ready.
+#: Prefixes for the elem_ids stamped on the components the panel replaces.
+#: WanGP builds the media-generator tab more than once (the generation form and
+#: the queue-edit form), so these must be per-instance -- a shared id would put
+#: duplicate ids in the DOM and getElementById would resolve the second tab's
+#: lookups to the first tab's controls.
 NATIVE_CHOICES_ELEM_ID = "wgp_lora_browser_native_choices"
 NATIVE_MULTIPLIERS_ELEM_ID = "wgp_lora_browser_native_multipliers"
 
@@ -225,16 +229,16 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             "__THUMB_BTN__": f"lb_thumb_btn_{instance_id}",
             "__THUMB_RES_ID__": f"lb_thumb_res_{instance_id}",
             "__REFRESH_BTN__": f"lb_refresh_btn_{instance_id}",
-            "__NATIVE_CHOICES__": NATIVE_CHOICES_ELEM_ID,
-            "__NATIVE_MULTIPLIERS__": NATIVE_MULTIPLIERS_ELEM_ID,
+            "__NATIVE_CHOICES__": f"{NATIVE_CHOICES_ELEM_ID}_{instance_id}",
+            "__NATIVE_MULTIPLIERS__": f"{NATIVE_MULTIPLIERS_ELEM_ID}_{instance_id}",
         }
 
         # Give the native components stable DOM ids so the frontend can hide
         # their wrappers by id instead of guessing at Gradio's hashed classes.
         if not getattr(loras_choices, "elem_id", None):
-            loras_choices.elem_id = NATIVE_CHOICES_ELEM_ID
+            loras_choices.elem_id = ids["__NATIVE_CHOICES__"]
         if not getattr(loras_multipliers, "elem_id", None):
-            loras_multipliers.elem_id = NATIVE_MULTIPLIERS_ELEM_ID
+            loras_multipliers.elem_id = ids["__NATIVE_MULTIPLIERS__"]
         ids["__NATIVE_CHOICES__"] = loras_choices.elem_id
         ids["__NATIVE_MULTIPLIERS__"] = loras_multipliers.elem_id
 
@@ -273,17 +277,21 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         main.load(fn=None, js=f"() => {{ {script} }}")
         main.load(fn=sync, inputs=sync_inputs, outputs=[payload_box], show_progress="hidden")
 
-        renderer = (
-            "(data) => { const api = window.wgpLoraBrowser && window.wgpLoraBrowser['%s'];"
-            " if (api) { api.apply(data); } }" % instance_id
-        )
-        payload_box.change(fn=None, inputs=[payload_box], js=renderer, show_progress="hidden")
+        def bridge_js(method: str, element_id: str) -> str:
+            return (
+                "() => { const api = window.wgpLoraBrowser && window.wgpLoraBrowser['%s'];"
+                " if (!api) { return; }"
+                " const host = document.getElementById('%s');"
+                " const field = host && host.querySelector('textarea, input');"
+                " if (field) { api.%s(field.value); } }" % (instance_id, element_id, method)
+            )
 
-        thumb_renderer = (
-            "(data) => { const api = window.wgpLoraBrowser && window.wgpLoraBrowser['%s'];"
-            " if (api) { api.applyThumbs(data); } }" % instance_id
+        payload_box.change(
+            fn=None, js=bridge_js("apply", ids["__PAYLOAD_ID__"]), show_progress="hidden"
         )
-        thumb_res.change(fn=None, inputs=[thumb_res], js=thumb_renderer, show_progress="hidden")
+        thumb_res.change(
+            fn=None, js=bridge_js("applyThumbs", ids["__THUMB_RES_ID__"]), show_progress="hidden"
+        )
 
         # Native -> plugin. Component change events are the common trigger, so
         # presets, .lset files, imported media settings, accelerator profiles
@@ -634,7 +642,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
         thumbs: dict[str, str] = {}
         listings: dict[str, list[str]] = {}
-        for lora_id in requested[:64]:
+        for lora_id in requested[:32]:
             entry = inventory.get(lora_id)
             if entry is None or not entry.path:
                 continue

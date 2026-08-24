@@ -598,7 +598,10 @@
     if (!S.pendingThumbs.length) { return; }
     clearTimeout(S.thumbTimer);
     S.thumbTimer = setTimeout(function () {
-      var batch = S.pendingThumbs.splice(0, 48);
+      // Small batches on purpose: a first-time video preview costs a frame
+      // decode server-side, so a large batch would stall behind the slowest
+      // file. Smaller rounds let the grid fill in progressively.
+      var batch = S.pendingThumbs.splice(0, 16);
       if (!batch.length) { return; }
       if (setHidden(IDS.thumbReq, JSON.stringify({ ids: batch }))) { clickHidden(IDS.thumbBtn); }
     }, 90);
