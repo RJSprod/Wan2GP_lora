@@ -119,6 +119,10 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 target_component_id="loras_multipliers",
                 new_component_constructor=lambda: self._build_panel(components),
             )
+            resolved = [name for name in self._global_requests if callable(getattr(self, name, None))
+                        or isinstance(getattr(self, name, None), str)]
+            print(f"[LoRA Browser] panel queued for injection after loras_multipliers; "
+                  f"WanGP globals resolved: {resolved or 'none'}")
         except Exception:
             # Fail open: any setup error leaves the native controls usable.
             print("[LoRA Browser] Setup failed; the native LoRA controls remain visible.")
@@ -301,6 +305,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         thumb_btn.click(fn=serve_thumbs, inputs=[thumb_req, state], outputs=[thumb_res], show_progress="hidden")
 
         self._wire_refresh(instance, refresh_btn, state, lset_name, loras_choices, sync, sync_inputs, payload_box)
+        print(f"[LoRA Browser] panel built (instance {instance_id}); "
+              f"native ids: {ids['__NATIVE_CHOICES__']}, {ids['__NATIVE_MULTIPLIERS__']}")
         return panel
 
     def _wire_refresh(self, instance, refresh_btn, state, lset_name, loras_choices, sync, sync_inputs, payload_box):

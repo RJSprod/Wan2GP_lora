@@ -250,7 +250,10 @@ def multiplier_fields(
         "multiplier_kind": codec.SIMPLE,
         "phase_values": [round(value, 4) for value in visible],
         "hidden_values": [round(value, 4) for value in values[phases.effective:]],
-        "linked": len(visible) > 1 and len(set(visible)) == 1,
+        # Linking is a UI preference the user sets, never inferred from the
+        # values happening to be equal -- otherwise a freshly added LoRA (1;1)
+        # would start linked and dragging phase 1 would silently move phase 2.
+        "linked": False,
     }
 
 

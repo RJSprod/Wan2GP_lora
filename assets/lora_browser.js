@@ -59,6 +59,8 @@
     linked: {},
     ready: false,
     mounted: false,
+    forceNative: false,
+    remountQueued: false,
     dragging: false,
     lastSentSignature: null,
     signature: "",
@@ -71,6 +73,8 @@
   var el = {};
   var observer = null;
   var resizeObserver = null;
+  var anchorObserver = null;
+  var integrityTimer = null;
   var menu = null;
 
   /* ------------------------------------------------------------ helpers */
@@ -146,19 +150,43 @@
     return found.length === 2 ? found : blocks;
   }
 
-  /* Fail open: the native selector and multiplier box stay visible until the
-     panel has rendered real state at least once. */
+  /* Has the panel actually drawn something a user can work with?  Layout box
+     size is deliberately not part of this: the LoRAs tab may not be the
+     selected tab, and a hidden tab legitimately measures zero. */
+  function panelHasContent() {
+    var root = byId(IDS.root);
+    if (!root) { return false; }
+    return !!(root.querySelector(".lb-tile") || root.querySelector(".lb-row") || root.querySelector(".lb-empty"));
+  }
+
+  /* Fail open: the native selector and multiplier box are only ever hidden
+     while the panel is genuinely standing in for them. */
   function hideNative(hide) {
+    var conceal = !!hide && panelHasContent() && !S.forceNative;
     nativeBlocks().forEach(function (block) {
-      block.style.display = hide ? "none" : "";
+      block.style.display = conceal ? "none" : "";
     });
   }
 
   /* ------------------------------------------------------------- mount */
 
-  function mount() {
+  /* The panel lives inside a gr.HTML component, and Gradio renders that with
+     Svelte's {@html value}: any re-render of the component reassigns its
+     innerHTML and destroys everything mounted into it.  So "mounted" can never
+     be a one-shot flag -- the skeleton has to be rebuildable at any time. */
+  function panelIntact() {
     var root = byId(IDS.root);
-    if (!root || S.mounted) { return !!root; }
+    return !!(root && el.root === root && root.querySelector('[data-lb="grid"]'));
+  }
+
+  function mount(force) {
+    var root = byId(IDS.root);
+    if (!root) { return false; }
+    if (!force && panelIntact()) { return true; }
+
+    // Tear down observers bound to the previous, now-detached skeleton.
+    if (observer) { observer.disconnect(); observer = null; }
+    if (resizeObserver) { resizeObserver.disconnect(); resizeObserver = null; }
 
     root.classList.add(NS);
     root.innerHTML =
@@ -191,7 +219,11 @@
         '</span>' +
       '</div>' +
       '<div class="lb-rows" data-lb="rows"></div>' +
-      '<div class="lb-status" data-lb="status"></div>';
+      '<div class="lb-statusbar">' +
+        '<span class="lb-status" data-lb="status"></span>' +
+        '<button type="button" class="lb-native-toggle" data-lb="native" ' +
+          'title="Show or hide WanGP\'s built-in LoRA controls">native controls</button>' +
+      '</div>';
 
     var pick = function (name) { return root.querySelector('[data-lb="' + name + '"]'); };
     el = {
@@ -201,15 +233,60 @@
       zoomIn: pick("zoom-in"), zoomOut: pick("zoom-out"),
       gridWrap: pick("grid-wrap"), grid: pick("grid"),
       activeTitle: pick("active-title"), disableAll: pick("disable-all"),
-      restore: pick("restore"), rows: pick("rows"), status: pick("status")
+      restore: pick("restore"), rows: pick("rows"), status: pick("status"),
+      nativeToggle: pick("native")
     };
 
     wireHeader();
     wireGrid();
     observeVisibility();
     observeResize();
+    watchAnchor();
     S.mounted = true;
     return true;
+  }
+
+  /* Recover from a wipe as soon as it happens, rather than waiting for the
+     next native change event to push a payload. */
+  function watchAnchor() {
+    var root = byId(IDS.root);
+    var holder = root && root.parentElement;
+    if (!holder) { return; }
+    if (anchorObserver) { anchorObserver.disconnect(); }
+    if (typeof MutationObserver !== "function") { return; }
+    anchorObserver = new MutationObserver(function () { scheduleRemount(); });
+    anchorObserver.observe(holder, { childList: true, subtree: true });
+  }
+
+  function scheduleRemount() {
+    if (S.remountQueued) { return; }
+    S.remountQueued = true;
+    requestAnimationFrame(function () {
+      S.remountQueued = false;
+      checkIntegrity();
+    });
+  }
+
+  /* If the skeleton is gone, rebuild it and repaint from cached state.  If it
+     cannot be rebuilt, give the native controls back rather than leaving the
+     user with no LoRA UI at all. */
+  function checkIntegrity() {
+    if (panelIntact()) { return; }
+    if (!mount(true)) {
+      hideNative(false);
+      return;
+    }
+    try {
+      S.applyZoom(S.zoomPx, false);
+      renderHeader();
+      renderGrid();
+      renderRows(true);
+      setStatus(S.status, S.statusWarn);
+      hideNative(S.ready && panelHasContent());
+    } catch (error) {
+      console.error("[LoRA Browser] remount failed", error);
+      hideNative(false);
+    }
   }
 
   function wireHeader() {
@@ -263,6 +340,14 @@
 
     el.disableAll.addEventListener("click", function () { send({ type: "disable_all" }); });
     el.restore.addEventListener("click", function () { send({ type: "restore" }); });
+
+    // Last-resort escape hatch. Automatic fail-open covers the failures we can
+    // detect; this covers the ones we cannot.
+    el.nativeToggle.addEventListener("click", function () {
+      S.forceNative = !S.forceNative;
+      el.nativeToggle.setAttribute("aria-pressed", S.forceNative ? "true" : "false");
+      hideNative(S.ready);
+    });
   }
 
   function profileMenuItems() {
@@ -794,6 +879,19 @@
   /* ---------------------------------------------------------- payload */
 
   function apply(json) {
+    try {
+      applyPayload(json);
+    } catch (error) {
+      // Any render failure must hand the native controls back rather than
+      // stranding the user with neither UI.
+      console.error("[LoRA Browser] render failed", error);
+      S.ready = false;
+      hideNative(false);
+      setStatus("LoRA Browser could not render; native controls restored.", true);
+    }
+  }
+
+  function applyPayload(json) {
     if (!json) { return; }
     var payload;
     try { payload = JSON.parse(json); } catch (error) {
@@ -850,6 +948,7 @@
     if (!S.ready) {
       S.ready = true;
       el.root.dataset.ready = "true";
+      console.log("[LoRA Browser] ready: " + S.items.length + " LoRAs, " + S.rows.length + " active");
       // Only now is it safe to take the native controls out of the layout.
       hideNative(true);
       send({ type: "ready" });
@@ -881,10 +980,18 @@
   /* ------------------------------------------------------------- boot */
 
   function boot() {
-    if (mount()) { hideNative(S.ready); }
+    if (!mount()) { return; }
+    hideNative(S.ready);
+    // MutationObserver catches most wipes instantly; this is the backstop for
+    // anything that replaces the anchor without us seeing the mutation.
+    if (!integrityTimer) {
+      integrityTimer = setInterval(checkIntegrity, 1000);
+    }
   }
 
   window.wgpLoraBrowser[INSTANCE] = { apply: apply, applyThumbs: applyThumbs, boot: boot, state: S };
+
+  console.log("[LoRA Browser] frontend installed for instance " + INSTANCE);
 
   // Show the shell straight away rather than waiting for the first payload.
   boot();

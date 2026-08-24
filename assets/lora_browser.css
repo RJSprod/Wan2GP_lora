@@ -302,6 +302,27 @@
 
 /* -------------------------------------------------------------- status */
 
+.__NS__ .lb-statusbar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.__NS__ .lb-native-toggle {
+  font: inherit;
+  font-size: var(--text-xs, 11px);
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  opacity: 0.55;
+  color: var(--body-text-color-subdued, var(--body-text-color));
+  white-space: nowrap;
+}
+.__NS__ .lb-native-toggle:hover,
+.__NS__ .lb-native-toggle[aria-pressed="true"] { opacity: 1; }
+
 .__NS__ .lb-status {
   font-size: var(--text-xs, 11px);
   color: var(--body-text-color-subdued, var(--body-text-color));

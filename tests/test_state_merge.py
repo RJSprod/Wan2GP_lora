@@ -153,6 +153,18 @@ class TestAdvancedPreservation:
         assert up.convert_to_simple(stack, "b.safetensors", phases) is True
         assert stack.tokens == ["1;1"]
 
+    def test_phases_are_never_auto_linked(self, inventory):
+        """Equal values are a coincidence, not a request to couple the sliders."""
+        phases = up.resolve_phases(H3_MODEL_DEF, 2)
+        assert up.multiplier_fields("1;1", phases, "a.safetensors")["linked"] is False
+        assert up.multiplier_fields("0.5;0.5", phases, "a.safetensors")["linked"] is False
+
+    def test_unlinked_edit_leaves_the_other_phase_alone(self, inventory):
+        phases = up.resolve_phases(H3_MODEL_DEF, 2)
+        stack = up.Stack.from_native(["a.safetensors"], "1;1")
+        up.set_phase_value(stack, "a.safetensors", 0, 0.45, phases, {}, linked=False)
+        assert stack.tokens == ["0.45;1"]
+
     def test_advanced_rows_are_flagged_for_the_editor(self, inventory):
         phases = up.resolve_phases(H3_MODEL_DEF, 2)
         fields = up.multiplier_fields("0.5,0.9", phases, "b.safetensors")
