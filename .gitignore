@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.thumb_cache/
+*.egg-info/
+.DS_Store
+
+# Plugin state written at runtime when WanGP's config directory is unavailable
+data/
+lora_browser_thumbs/
+wan2gp_lora_browser.json

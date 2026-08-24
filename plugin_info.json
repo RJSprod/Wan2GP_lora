@@ -1,0 +1,9 @@
+{
+  "name": "LoRA Browser",
+  "author": "RJSprod",
+  "version": "1.0.0",
+  "description": "Thumbnail LoRA browser and real-time multiplier editor for WanGP.",
+  "type": ["extension"],
+  "date": "2026-08-24",
+  "wan2gp_version": "12.642"
+}
