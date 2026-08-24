@@ -15,6 +15,19 @@
   font-size: var(--text-sm, 13px);
 }
 
+/* WanGP groups the LoRA inputs into a Gradio form and the panel is injected
+   inside it. Once those inputs are hidden the form would otherwise draw an
+   empty bordered strip around the panel. Not namespaced by instance on
+   purpose: this element is an ancestor of the panel, not a descendant. */
+.form.wgp-lora-browser-form-host {
+  border: 0 !important;
+  padding: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  gap: 0 !important;
+  overflow: visible !important;
+}
+
 /* ---------------------------------------------------------------- header */
 
 .__NS__ .lb-header {

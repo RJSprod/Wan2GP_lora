@@ -130,11 +130,28 @@
      Preferred route is the elem_id the plugin assigns them.  The fallback uses
      position: the panel is injected directly after the multiplier textbox, so
      the two blocks preceding our host are the native controls. */
+  /* Pick the element to hide for one native control.
+     Climbing to the component's wrapper is what makes it disappear cleanly,
+     but the wrapper must never be an ancestor of our own panel: WanGP groups
+     loras_choices and loras_multipliers into a Gradio <div class="form">, and
+     the panel is injected INSIDE that same form. Hiding the form would hide
+     the panel with it. When the wrapper is unsafe, hide just the element that
+     carries the elem_id. */
+  function hideTargetFor(id) {
+    var node = byId(id);
+    if (!node) { return null; }
+    var root = byId(IDS.root);
+    var candidate = node.closest(".block, .form") || node;
+    if (root && candidate.contains(root)) { candidate = node; }
+    if (root && candidate.contains(root)) { return null; }
+    return candidate;
+  }
+
   function nativeBlocks() {
     var blocks = [];
     [IDS.nativeChoices, IDS.nativeMultipliers].forEach(function (id) {
-      var node = byId(id);
-      if (node) { blocks.push(node.closest(".block, .form") || node); }
+      var target = hideTargetFor(id);
+      if (target) { blocks.push(target); }
     });
     if (blocks.length === 2) { return blocks; }
 
@@ -164,9 +181,21 @@
      while the panel is genuinely standing in for them. */
   function hideNative(hide) {
     var conceal = !!hide && panelHasContent() && !S.forceNative && !S.layoutBroken;
-    nativeBlocks().forEach(function (block) {
+    var root = byId(IDS.root);
+    var heightBefore = root ? root.getBoundingClientRect().height : 0;
+    var targets = nativeBlocks();
+
+    targets.forEach(function (block) {
       block.style.display = conceal ? "none" : "";
     });
+
+    // Backstop for any DOM shape we did not anticipate: if concealing the
+    // native controls just collapsed the panel, we hid one of our own
+    // ancestors. Put it back rather than leaving an empty tab.
+    if (conceal && root && heightBefore > 0 && root.getBoundingClientRect().height === 0) {
+      targets.forEach(function (block) { block.style.display = ""; });
+      console.warn("[LoRA Browser] hiding the native controls collapsed the panel; leaving them visible.");
+    }
   }
 
   /* ------------------------------------------------------------- mount */
@@ -237,6 +266,9 @@
       restore: pick("restore"), rows: pick("rows"), status: pick("status"),
       nativeToggle: pick("native")
     };
+
+    var sharedForm = root.parentElement && root.closest(".form");
+    if (sharedForm) { sharedForm.classList.add("wgp-lora-browser-form-host"); }
 
     wireHeader();
     wireGrid();
