@@ -237,11 +237,33 @@ class TestStrengthEditing:
         up.set_phase_value(stack, "a.safetensors", 0, bad, phases, {})
         assert stack.tokens == ["0.4;0.9"]
 
-    def test_absurd_values_are_bounded(self, inventory):
-        phases = up.resolve_phases(H3_MODEL_DEF, 1)
-        stack = up.Stack.from_native(["a.safetensors"], "1")
+    def test_out_of_range_reverts_instead_of_clamping(self, inventory):
+        """A typo must not quietly become the boundary value."""
+        phases = up.resolve_phases(SINGLE_PHASE_MODEL_DEF, 1)
+        stack = up.Stack.from_native(["a.safetensors"], "0.7")
         up.set_phase_value(stack, "a.safetensors", 0, 1e12, phases, {})
-        assert float(stack.tokens[0].split(";")[0]) == up.VALUE_LIMIT
+        assert stack.tokens == ["0.7"]
+        up.set_phase_value(stack, "a.safetensors", 0, -50, phases, {})
+        assert stack.tokens == ["0.7"]
+
+    def test_negative_multipliers_are_supported(self, inventory):
+        phases = up.resolve_phases(H3_MODEL_DEF, 2)
+        stack = up.Stack.from_native(["a.safetensors"], "1;1")
+        up.set_phase_value(stack, "a.safetensors", 0, -0.75, phases, {})
+        assert stack.tokens == ["-0.75;1"]
+
+    def test_the_full_supported_range_is_accepted(self, inventory):
+        phases = up.resolve_phases(SINGLE_PHASE_MODEL_DEF, 1)
+        stack = up.Stack.from_native(["a.safetensors"], "1")
+        for value in (up.VALUE_MIN, up.VALUE_MAX, 3.5, -2.25):
+            up.set_phase_value(stack, "a.safetensors", 0, value, phases, {})
+            assert float(stack.tokens[0]) == value
+
+    def test_values_are_rounded_to_two_decimals(self, inventory):
+        phases = up.resolve_phases(SINGLE_PHASE_MODEL_DEF, 1)
+        stack = up.Stack.from_native(["a.safetensors"], "1")
+        up.set_phase_value(stack, "a.safetensors", 0, 0.123456, phases, {})
+        assert stack.tokens == ["0.12"]
 
 
 class TestRowsAndItems:

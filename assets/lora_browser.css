@@ -71,6 +71,12 @@
   padding: 4px 8px;
   min-height: 28px;
 }
+.__NS__ select.lb-select {
+  color: var(--input-text-color, var(--body-text-color));
+  background: var(--input-background-fill, var(--background-fill-primary));
+  color-scheme: light dark;
+  max-width: 11rem;
+}
 .__NS__ button.lb-btn {
   background: var(--button-secondary-background-fill);
   color: var(--button-secondary-text-color);
@@ -236,12 +242,18 @@
   border-radius: var(--radius-sm, 6px);
   background: var(--input-background-fill);
 }
+/* The strength controls get the width; the name truncates and the "i" button
+   carries the full record. */
 .__NS__ .lb-row-name {
-  flex: 1 1 150px;
-  min-width: 110px;
-  word-break: break-word;
+  flex: 1 1 90px;
+  min-width: 60px;
+  max-width: 34%;
   font-size: var(--text-xs, 12px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
+.__NS__ .lb-phases { flex: 1 1 auto; justify-content: flex-end; }
 .__NS__ .lb-row-note {
   font-size: 10px;
   padding: 0 5px;
@@ -258,12 +270,56 @@
   color: var(--body-text-color-subdued, var(--body-text-color));
   white-space: nowrap;
 }
-.__NS__ .lb-phase input[type="range"] { width: 108px; accent-color: var(--color-accent, currentColor); }
+.__NS__ .lb-phase input[type="range"] {
+  width: 96px;
+  accent-color: var(--color-accent, currentColor);
+  background: transparent;
+}
+.__NS__ .lb-phase input[type="range"]:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Number inputs do not inherit Gradio's field styling, so on a dark theme they
+   rendered as the browser default: white on white. Every colour is stated. */
+.__NS__ input[type="number"],
 .__NS__ .lb-phase input[type="number"] {
-  width: 66px;
+  width: 68px;
+  font: inherit;
   font-variant-numeric: tabular-nums;
+  text-align: right;
   padding: 2px 4px;
   min-height: 24px;
+  color: var(--input-text-color, var(--body-text-color));
+  background: var(--input-background-fill, var(--background-fill-primary));
+  border: 1px solid var(--input-border-color, var(--border-color-primary));
+  border-radius: var(--radius-xs, 4px);
+  color-scheme: light dark;   /* makes the native spinners follow the theme */
+}
+.__NS__ input[type="number"]:focus {
+  outline: none;
+  border-color: var(--input-border-color-focus, var(--color-accent, currentColor));
+}
+.__NS__ input[type="number"]::placeholder { color: var(--body-text-color-subdued, inherit); }
+
+/* Line-height sized steppers: easy to hit, and they must not grow the row. */
+.__NS__ button.lb-btn.lb-step {
+  min-height: 24px;
+  height: 24px;
+  min-width: 22px;
+  padding: 0 6px;
+  line-height: 1;
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+.__NS__ button.lb-btn.lb-inspect {
+  min-height: 24px;
+  height: 24px;
+  min-width: 24px;
+  padding: 0;
+  font-style: italic;
+  font-weight: 700;
+  flex: 0 0 auto;
 }
 .__NS__ .lb-advanced {
   flex: 1 1 auto;
@@ -347,4 +403,195 @@
   .__NS__ .lb-search { flex-basis: 100%; }
   .__NS__ .lb-row-name { flex-basis: 100%; }
   .__NS__ .lb-phase input[type="range"] { width: 84px; }
+}
+
+/* ------------------------------------------------------- video previews */
+
+.__NS__ .lb-tile { position: relative; }
+.__NS__ .lb-play {
+  position: absolute;
+  right: 6px;
+  bottom: 28px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--border-color-primary);
+  background: color-mix(in srgb, var(--background-fill-primary) 78%, transparent);
+  color: var(--body-text-color);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.85;
+}
+.__NS__ .lb-play:hover { opacity: 1; }
+.__NS__ .lb-tile.lb-playing .lb-play { opacity: 1; }
+.__NS__ .lb-tile.lb-loading .lb-play { opacity: 0.5; cursor: progress; }
+.__NS__ video.lb-thumb {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  border-radius: var(--radius-xs, 4px);
+  background: #000;
+  display: block;
+}
+
+/* -------------------------------------------------------- inspect view */
+
+.lb-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2vmin;
+  background: rgba(0, 0, 0, 0.62);
+}
+.lb-modal-overlay .lb-modal {
+  width: 96vw;
+  height: 94vh;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-color-primary);
+  border-radius: var(--radius-lg, 10px);
+  background: var(--background-fill-primary, var(--input-background-fill));
+  color: var(--body-text-color);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+.lb-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-color-primary);
+  background: var(--background-fill-secondary);
+}
+.lb-modal-title {
+  font-weight: 600;
+  font-size: var(--text-md, 15px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lb-modal-body {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: minmax(240px, 22rem) 1fr;
+  gap: 0;
+  min-height: 0;
+}
+.lb-modal-side {
+  padding: 14px;
+  overflow-y: auto;
+  border-right: 1px solid var(--border-color-primary);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  font-size: var(--text-sm, 13px);
+}
+.lb-modal-media {
+  padding: 14px;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 14px;
+  align-content: start;
+}
+.lb-modal-facts { display: flex; flex-direction: column; gap: 4px; }
+.lb-modal-facts > div { display: flex; gap: 8px; align-items: baseline; }
+.lb-fact-key {
+  flex: 0 0 5.5rem;
+  color: var(--body-text-color-subdued, inherit);
+  font-size: var(--text-xs, 11px);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.lb-modal-link { color: var(--color-accent, inherit); margin-top: 6px; }
+.lb-modal-section { display: flex; flex-direction: column; gap: 6px; }
+.lb-modal-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.lb-modal-section-title {
+  font-size: var(--text-xs, 11px);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--body-text-color-subdued, inherit);
+}
+.lb-modal-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.45;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.lb-words { display: flex; flex-wrap: wrap; gap: 5px; }
+.lb-word {
+  font: inherit;
+  font-size: var(--text-xs, 11px);
+  padding: 2px 8px;
+  border-radius: 999px;
+  cursor: pointer;
+  color: var(--body-text-color);
+  background: var(--background-fill-secondary);
+  border: 1px solid var(--border-color-primary);
+}
+.lb-word:hover { border-color: var(--border-color-accent, var(--color-accent)); }
+.lb-copy {
+  font-size: var(--text-xs, 11px) !important;
+  min-height: 22px !important;
+  padding: 1px 8px !important;
+}
+.lb-media-card {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--border-color-primary);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--background-fill-secondary);
+  padding: 8px;
+}
+.lb-media-frame {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 160px;
+  border-radius: var(--radius-xs, 4px);
+  background: var(--background-fill-primary, #0000);
+  overflow: hidden;
+}
+.lb-media-frame img,
+.lb-media-frame video {
+  max-width: 100%;
+  max-height: 46vh;
+  border-radius: var(--radius-xs, 4px);
+  display: block;
+}
+.lb-media-loading {
+  padding: 20px;
+  font-size: var(--text-xs, 11px);
+  color: var(--body-text-color-subdued, inherit);
+}
+.lb-media-prompt { margin: 0; display: flex; flex-direction: column; gap: 4px; }
+.lb-prompt-text {
+  font-size: var(--text-xs, 11px);
+  max-height: 7.5em;
+  padding: 5px 7px;
+  border-radius: var(--radius-xs, 4px);
+  background: var(--input-background-fill, var(--background-fill-primary));
+  border: 1px solid var(--border-color-primary);
+}
+
+@media (max-width: 760px) {
+  .lb-modal-body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+  .lb-modal-side { border-right: 0; border-bottom: 1px solid var(--border-color-primary); max-height: 40vh; }
 }

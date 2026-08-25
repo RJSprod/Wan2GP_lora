@@ -17,12 +17,17 @@ from .utils import format_number, is_finite_number, normalize_id
 
 PHASE_2_TILING_GUIDANCE_VALUE = "2~"
 
-#: Slider presentation range.  Values outside it stay valid and editable in the
-#: numeric field -- WanGP multipliers are not limited to 0..1.
+#: The slider covers the common 0..1 range at 0.01 steps. Values outside it are
+#: entered in the numeric field, which accepts the full supported range; the
+#: slider disables itself rather than silently clamping a value it cannot show.
 SLIDER_MIN = 0.0
-SLIDER_MAX = 2.0
-SLIDER_STEP = 0.001
-VALUE_LIMIT = 1000.0
+SLIDER_MAX = 1.0
+SLIDER_STEP = 0.01
+
+#: Hard bounds for the numeric field. Negative multipliers are legitimate
+#: (they invert a LoRA's effect) and WanGP does not cap the upper end either.
+VALUE_MIN = -10.0
+VALUE_MAX = 10.0
 
 #: Field separator used only inside the canonical fingerprint below.
 _SIGNATURE_SEP = "\x1f"
@@ -88,11 +93,17 @@ def phase_labels(phases: int) -> list[str]:
 
 
 def sanitize_value(value: Any, fallback: float = 1.0) -> float:
-    """Reject NaN/Infinity and absurd magnitudes coming from the frontend."""
+    """Reject NaN/Infinity and out-of-range values coming from the frontend.
+
+    Anything outside the supported range falls back to the previous value
+    rather than being clamped, so a typo cannot quietly become -10.
+    """
     if not is_finite_number(value):
         return fallback
-    number = float(value)
-    return max(-VALUE_LIMIT, min(VALUE_LIMIT, number))
+    number = round(float(value), 2)
+    if number < VALUE_MIN or number > VALUE_MAX:
+        return fallback
+    return number
 
 
 @dataclass
@@ -178,12 +189,20 @@ def build_items(
     metadata=None,
     model_key: str = "",
     memory: dict[str, list[float]] | None = None,
+    catalogue: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Browser tiles for everything WanGP can activate for this model."""
+    """Browser tiles for everything WanGP can activate for this model.
+
+    ``catalogue`` maps LoRA id -> CatalogueIndex, supplying the Civitai name and
+    trigger words. Those travel with the payload so naming, search and sort all
+    happen client-side with no round trip.
+    """
     memory = memory or {}
+    catalogue = catalogue or {}
     items = []
     for entry in inventory.entries:
         position = stack.index_of(entry.id)
+        index = catalogue.get(entry.id)
         item: dict[str, Any] = {
             "id": entry.id,
             "name": entry.name,
@@ -194,6 +213,11 @@ def build_items(
             "tag": metadata.tag(model_key, entry.id) if metadata else "",
             "system_managed": stack.is_system(position),
             "missing": False,
+            "civitai_name": getattr(index, "civitai_name", "") if index else "",
+            "words": list(getattr(index, "trained_words", []) or []) if index else [],
+            "has_catalogue": bool(getattr(index, "has_sidecar", False)) if index else False,
+            "has_video": bool(entry.video_preview) if entry else False,
+            "mtime": entry.mtime,
         }
         if position >= 0:
             item.update(multiplier_fields(stack.tokens[position], phases, entry.id, memory))
@@ -206,17 +230,22 @@ def build_active_rows(
     stack: "Stack",
     phases: PhaseConfig,
     memory: dict[str, list[float]] | None = None,
+    catalogue: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Editable rows, in native order, including LoRAs missing from disk."""
     memory = memory or {}
+    catalogue = catalogue or {}
     rows = []
     for position, lora_id in enumerate(stack.ids):
         entry = inventory.get(lora_id)
+        index = catalogue.get(lora_id)
         fallback_name = lora_id.rsplit("/", 1)[-1]
         row: dict[str, Any] = {
             "id": lora_id,
             "name": entry.name if entry else fallback_name,
             "label": entry.label if entry else fallback_name,
+            "civitai_name": getattr(index, "civitai_name", "") if index else "",
+            "has_catalogue": bool(getattr(index, "has_sidecar", False)) if index else False,
             "system_managed": stack.is_system(position),
             "missing": entry is None,
         }

@@ -13,13 +13,28 @@ thumbnail browser and a real-time strength editor.
   can actually use.
 - **Click to include / exclude.** A newly included LoRA starts at `1.0` on every
   editable phase.
-- **Continuous strength sliders** plus exact numeric fields, per guidance phase,
-  synced back to WanGP with a short debounce. Values are not clamped to `0..1`.
+- **Strength controls** per guidance phase: a `0..1` slider for the common case,
+  `±0.01` stepper buttons, and a numeric field accepting `-10.00` to `10.00`.
+  Negative multipliers work. Outside `0..1` the slider disables itself rather
+  than misrepresenting the value, and an out-of-range entry reverts on blur.
 - **Image previews first, video previews as a still.** A LoRA with only a video
   preview gets its *first frame* decoded server-side and cached; the video itself
   is never loaded in the browser.
-- **Stack profiles** — lightweight LoRA-only recalls, plus favourites, tags and a
-  persistent thumbnail zoom.
+- **Sort and search that understand your library.** Sort by name, Civitai name,
+  recently added, active or favourites. Search matches filenames, Civitai names,
+  trigger words and tags, with `kw:`, `name:`, `file:` and `tag:` prefixes to
+  target one field.
+- **Civitai names.** When a LoRA has a catalogue folder beside it, its Civitai
+  name is shown instead of the raw filename. Toggle with the `Aa` button.
+- **Inspect** (right-click a tile, or the `i` button on an active row) opens a
+  near-full-screen view of that LoRA's catalogue: description, trigger words,
+  and every downloaded image and video with the prompt that produced it —
+  all copyable.
+- **Video previews play in place.** A LoRA whose only preview is a video still
+  gets a first-frame thumbnail; a play badge swaps in a muted, looping,
+  on-demand player. Nothing is fetched until you click it.
+- **Stack profiles** — save, recall, update, rename, delete, and set a default
+  per model — plus favourites, tags and a persistent thumbnail zoom.
 - **Everything WanGP already does keeps working.** Presets, `.lset` files,
   accelerator profiles, settings recovered from generated images and videos,
   queue edits and model switches all flow into the panel automatically.
@@ -103,6 +118,25 @@ marked as managed and are excluded from *Disable all* and from stack profiles.
 - Absolute paths never reach the browser, and all display text is inserted as
   text nodes rather than HTML.
 
+## The Civitai catalogue
+
+Several features read the sidecar folders written by a Civitai enrichment script
+(`process_minimaxH3_lora.py`) that lives alongside your LoRAs:
+
+```
+<lora dir>/
+  cool_lora.safetensors
+  cool_lora.png | .mp4        host preview
+  cool_lora/                  sidecar, named after the file stem
+    summary.txt               name, creator, trigger words  (the search index)
+    cool_lora.json            combined Civitai record       (the Inspect view)
+    media/001.jpg 001.json    downloaded media + prompt metadata
+```
+
+Indexing reads only `summary.txt` — a few hundred bytes — so a large library
+stays fast; the full record is parsed only when you open Inspect. LoRAs without
+a sidecar work exactly as before, just without Civitai names or Inspect.
+
 ## Preferences
 
 Favourites, tags, zoom and stack profiles are stored in
@@ -129,7 +163,8 @@ lora_browser/
   ui_payloads.py           state model, phase resolution, action application
   inventory.py             native LoRA list -> displayable entries
   thumbnails.py            preview matching, first-frame decode, cache
-  metadata_store.py        favourites, tags, zoom (atomic JSON)
+  catalogue.py             read the Civitai sidecar folders
+  metadata_store.py        favourites, tags, zoom, sort (atomic JSON)
   profile_store.py         stack profiles
 assets/                    panel CSS and JavaScript
 ```

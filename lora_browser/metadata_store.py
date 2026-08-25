@@ -25,13 +25,27 @@ MIN_ZOOM_PX = 72
 MAX_ZOOM_PX = 176
 
 
+#: How the grid is ordered. Purely presentational; never affects the native
+#: multiplier order, which stays positional.
+SORT_MODES = ("name", "civitai", "recent", "active", "favorite")
+DEFAULT_SORT = "name"
+
+#: Which name a tile shows. Civitai names are usually more coherent than the
+#: downloaded filename, so they are preferred when a sidecar supplies one.
+NAME_MODES = ("civitai", "file")
+DEFAULT_NAME_MODE = "civitai"
+
+
 def default_document() -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "zoom_px": DEFAULT_ZOOM_PX,
+        "sort_mode": DEFAULT_SORT,
+        "name_mode": DEFAULT_NAME_MODE,
         "favorites": {},
         "tags": {},
         "profiles": {},
+        "default_profiles": {},
     }
 
 
@@ -81,11 +95,17 @@ class MetadataStore:
             # upgrading again does not throw the user's data away.
             document.update(payload)
             return document
-        for key in ("favorites", "tags", "profiles"):
+        for key in ("favorites", "tags", "profiles", "default_profiles"):
             value = payload.get(key)
             if isinstance(value, dict):
                 document[key] = value
         document["zoom_px"] = self.sanitize_zoom(payload.get("zoom_px"))
+        document["sort_mode"] = self.sanitize_choice(
+            payload.get("sort_mode"), SORT_MODES, DEFAULT_SORT
+        )
+        document["name_mode"] = self.sanitize_choice(
+            payload.get("name_mode"), NAME_MODES, DEFAULT_NAME_MODE
+        )
         document["schema_version"] = SCHEMA_VERSION
         return document
 
@@ -132,6 +152,47 @@ class MetadataStore:
             self.data["zoom_px"] = zoom
             self.save()
         return zoom
+
+    @staticmethod
+    def sanitize_choice(value: Any, allowed: tuple[str, ...], fallback: str) -> str:
+        text = str(value or "").strip().lower()
+        return text if text in allowed else fallback
+
+    @property
+    def sort_mode(self) -> str:
+        return self.sanitize_choice(self.data.get("sort_mode"), SORT_MODES, DEFAULT_SORT)
+
+    def set_sort_mode(self, value: Any) -> str:
+        mode = self.sanitize_choice(value, SORT_MODES, DEFAULT_SORT)
+        if mode != self.data.get("sort_mode"):
+            self.data["sort_mode"] = mode
+            self.save()
+        return mode
+
+    @property
+    def name_mode(self) -> str:
+        return self.sanitize_choice(self.data.get("name_mode"), NAME_MODES, DEFAULT_NAME_MODE)
+
+    def set_name_mode(self, value: Any) -> str:
+        mode = self.sanitize_choice(value, NAME_MODES, DEFAULT_NAME_MODE)
+        if mode != self.data.get("name_mode"):
+            self.data["name_mode"] = mode
+            self.save()
+        return mode
+
+    def default_profile(self, model_key: str) -> str:
+        return str(self.data.get("default_profiles", {}).get(model_key or "default", "") or "")
+
+    def set_default_profile(self, model_key: str, name: str) -> str:
+        defaults = self.data.setdefault("default_profiles", {})
+        key = model_key or "default"
+        text = str(name or "").strip()
+        if text:
+            defaults[key] = text
+        else:
+            defaults.pop(key, None)
+        self.save()
+        return text
 
     def is_favorite(self, model_key: str, lora_id: str) -> bool:
         return bool(self.data.get("favorites", {}).get(scope_key(model_key, lora_id)))

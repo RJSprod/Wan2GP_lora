@@ -28,6 +28,11 @@ class InventoryEntry:
     label: str = ""
     #: Absolute path on disk. Stays on the Python side — never serialised.
     path: str | None = None
+    #: Modification time, used only for the "recently added" sort order.
+    mtime: float = 0.0
+    #: True when a same-stem video preview exists, so the tile can offer a
+    #: play control instead of only a still frame.
+    video_preview: bool = False
 
     @property
     def exists(self) -> bool:
@@ -106,7 +111,35 @@ def build_inventory(native_values, lora_dir: str = "") -> Inventory:
         )
 
     _apply_disambiguators(entries)
+    _annotate_files(entries)
     return Inventory(entries=entries, lora_dir=lora_dir)
+
+
+def _annotate_files(entries: list[InventoryEntry]) -> None:
+    """Fill in mtime and video-preview presence with one listing per folder."""
+    from .thumbnails import VIDEO_EXTENSIONS
+
+    listings: dict[str, dict[str, str]] = {}
+    for entry in entries:
+        if not entry.path:
+            continue
+        directory = os.path.dirname(entry.path)
+        if directory not in listings:
+            try:
+                listings[directory] = {name.lower(): name for name in os.listdir(directory)}
+            except OSError:
+                listings[directory] = {}
+        listing = listings[directory]
+
+        try:
+            entry.mtime = os.path.getmtime(entry.path)
+        except OSError:
+            entry.mtime = 0.0
+
+        stem = os.path.splitext(os.path.basename(entry.path))[0].lower()
+        entry.video_preview = any(
+            f"{stem}{extension}" in listing for extension in VIDEO_EXTENSIONS
+        )
 
 
 def _apply_disambiguators(entries: list[InventoryEntry]) -> None:

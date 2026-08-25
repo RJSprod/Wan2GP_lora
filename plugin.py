@@ -14,7 +14,9 @@ normally.
 
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import os
 import traceback
 from typing import Any
@@ -23,12 +25,18 @@ import gradio as gr
 
 from shared.utils.plugins import WAN2GPPlugin
 
+from .lora_browser import catalogue as cat
 from .lora_browser import ui_payloads as up
 from .lora_browser.inventory import build_inventory, diff_ids
 from .lora_browser.metadata_store import MetadataStore, resolve_store_path
 from .lora_browser.profile_store import ProfileEntry, ProfileError, ProfileStore
-from .lora_browser.thumbnails import ThumbnailCache, find_preview
-from .lora_browser.utils import normalize_id
+from .lora_browser.thumbnails import (
+    VIDEO_EXTENSIONS,
+    Preview,
+    ThumbnailCache,
+    find_preview,
+)
+from .lora_browser.utils import is_within, normalize_id
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(PLUGIN_DIR, "assets")
@@ -38,6 +46,14 @@ ASSETS_DIR = os.path.join(PLUGIN_DIR, "assets")
 #: the queue-edit form), so these must be per-instance -- a shared id would put
 #: duplicate ids in the DOM and getElementById would resolve the second tab's
 #: lookups to the first tab's controls.
+#: Catalogue images are re-encoded to this size for the Inspect view: large
+#: enough to judge a preview, small enough to inline.
+MODAL_IMAGE_MAX_DIM = 1400
+
+#: Hard ceiling on any single inlined file. Videos are fetched one at a time on
+#: an explicit click, so this bounds the cost without exposing a static route.
+MEDIA_INLINE_LIMIT = 32 * 1024 * 1024
+
 NATIVE_CHOICES_ELEM_ID = "wgp_lora_browser_native_choices"
 NATIVE_MULTIPLIERS_ELEM_ID = "wgp_lora_browser_native_multipliers"
 
@@ -69,6 +85,10 @@ class InstanceState:
         self.pending_status = ""
         self.pending_warn = False
         self.ready = False
+        #: lora id -> (sidecar mtime, CatalogueIndex). Reading summary.txt for
+        #: every LoRA on every payload would be wasteful; the sidecar only
+        #: changes when the enrichment script runs again.
+        self.catalogue_cache: dict[str, tuple[float, Any]] = {}
 
     def next_revision(self) -> int:
         self.revision += 1
@@ -139,6 +159,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             instance.model_key = ""
             instance.inventory_ids = []
             instance.phase_memory.clear()
+            instance.catalogue_cache.clear()
             instance.restore_snapshot = None
             instance.next_revision()
 
@@ -257,8 +278,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         def act(action_json, state_value, selected, multipliers, guidance=None):
             return self._apply_action(instance, action_json, state_value, selected, multipliers, guidance)
 
-        def serve_thumbs(request_json, state_value):
-            return self._serve_thumbnails(instance, request_json, state_value)
+        def serve_media(request_json, state_value):
+            return self._serve_media(instance, request_json, state_value)
 
         with gr.Column(elem_classes=["wgp-lora-browser-host"]) as panel:
             gr.HTML(f"<style>{css}</style>", visible=True)
@@ -290,7 +311,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             fn=None, js=bridge_js("apply", ids["__PAYLOAD_ID__"]), show_progress="hidden"
         )
         thumb_res.change(
-            fn=None, js=bridge_js("applyThumbs", ids["__THUMB_RES_ID__"]), show_progress="hidden"
+            fn=None, js=bridge_js("applyMedia", ids["__THUMB_RES_ID__"]), show_progress="hidden"
         )
 
         # Native -> plugin. Component change events are the common trigger, so
@@ -310,7 +331,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             show_progress="hidden",
         )
 
-        thumb_btn.click(fn=serve_thumbs, inputs=[thumb_req, state], outputs=[thumb_res], show_progress="hidden")
+        thumb_btn.click(fn=serve_media, inputs=[thumb_req, state], outputs=[thumb_res], show_progress="hidden")
 
         self._wire_refresh(instance, refresh_btn, state, lset_name, loras_choices, sync, sync_inputs, payload_box)
         print(f"[LoRA Browser] panel built (instance {instance_id}); "
@@ -352,6 +373,30 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
     # ---------------------------------------------------------- payload
 
+    def _catalogue_index(self, instance: InstanceState, inventory) -> dict:
+        """Civitai name and trigger words per LoRA, cached on sidecar mtime."""
+        index: dict[str, Any] = {}
+        for entry in inventory.entries:
+            if not entry.path:
+                continue
+            directory = cat.sidecar_dir(entry.path)
+            if directory is None:
+                continue
+            try:
+                stamp = os.path.getmtime(directory)
+            except OSError:
+                stamp = 0.0
+
+            cached = instance.catalogue_cache.get(entry.id)
+            if cached is not None and cached[0] == stamp:
+                index[entry.id] = cached[1]
+                continue
+
+            record = cat.read_index(entry.path)
+            instance.catalogue_cache[entry.id] = (stamp, record)
+            index[entry.id] = record
+        return index
+
     def _context(self, instance: InstanceState, state_value, selected, multipliers, guidance):
         model_type = self._model_type(state_value)
         model_def = self._model_def(model_type)
@@ -386,19 +431,30 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 status = f"{len(missing)} selected LoRA(s) missing locally: {names}"
                 warn = True
 
+            catalogue = self._catalogue_index(instance, inventory)
             payload = {
                 "revision": instance.next_revision(),
                 "model_key": model_type,
                 "phases": {"capacity": phases.capacity, "effective": phases.effective},
                 "phase_labels": up.phase_labels(phases.effective),
-                "items": up.build_items(inventory, stack, phases, self._metadata, model_type, instance.phase_memory),
-                "active": up.build_active_rows(inventory, stack, phases, instance.phase_memory),
+                "items": up.build_items(
+                    inventory, stack, phases, self._metadata, model_type,
+                    instance.phase_memory, catalogue,
+                ),
+                "active": up.build_active_rows(
+                    inventory, stack, phases, instance.phase_memory, catalogue,
+                ),
                 "profiles": self._profiles.names(model_type) if self._profiles else [],
                 "active_profile": self._profiles.match(model_type, entries) if self._profiles else "",
+                "default_profile": self._metadata.default_profile(model_type) if self._metadata else "",
                 "zoom_px": self._metadata.zoom_px if self._metadata else 104,
+                "sort_mode": self._metadata.sort_mode if self._metadata else "name",
+                "name_mode": self._metadata.name_mode if self._metadata else "civitai",
                 "slider_min": up.SLIDER_MIN,
                 "slider_max": up.SLIDER_MAX,
                 "slider_step": up.SLIDER_STEP,
+                "value_min": up.VALUE_MIN,
+                "value_max": up.VALUE_MAX,
                 "can_restore": instance.restore_snapshot is not None,
                 "signature": signature,
                 "status": status,
@@ -505,6 +561,16 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 self._metadata.set_zoom(action.get("value"))
             return False
 
+        if kind == "sort":
+            if self._metadata:
+                self._metadata.set_sort_mode(action.get("value"))
+            return False
+
+        if kind == "name_mode":
+            if self._metadata:
+                self._metadata.set_name_mode(action.get("value"))
+            return False
+
         if kind == "disable_all":
             return self._disable_all(instance, stack, inventory)
 
@@ -564,12 +630,33 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
             if kind == "profile_rename":
                 renamed = self._profiles.rename(name, str(action.get("new_name", "") or ""))
+                if self._metadata and self._metadata.default_profile(model_type) == name:
+                    self._metadata.set_default_profile(model_type, renamed.name)
                 instance.note(f"Profile renamed to '{renamed.name}'.")
                 return False
 
             if kind == "profile_delete":
                 self._profiles.delete(name)
+                if self._metadata and self._metadata.default_profile(model_type) == name:
+                    self._metadata.set_default_profile(model_type, "")
                 instance.note(f"Profile '{name}' deleted.")
+                return False
+
+            if kind == "profile_default":
+                # Toggle: choosing the current default clears it.
+                if self._metadata:
+                    current = self._metadata.default_profile(model_type)
+                    if not name or current == name:
+                        self._metadata.set_default_profile(model_type, "")
+                        instance.note("Default profile cleared.")
+                    elif self._profiles.get(name) is None:
+                        instance.note(f"Profile '{name}' not found.", True)
+                    else:
+                        self._metadata.set_default_profile(model_type, name)
+                        instance.note(
+                            f"'{name}' is now the default for this model; "
+                            "it is applied when you switch to it with no LoRAs selected."
+                        )
                 return False
 
             if kind == "profile_recall":
@@ -619,7 +706,154 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
     # -------------------------------------------------------- thumbnails
 
-    def _serve_thumbnails(self, instance: InstanceState, request_json, state_value) -> str:
+    def _serve_media(self, instance: InstanceState, request_json, state_value) -> str:
+        """One bridge for every on-demand asset the browser asks for.
+
+        Kinds: ``thumbs`` (grid tiles), ``inspect`` (catalogue for one LoRA),
+        ``media`` (one catalogue image/video), ``video`` (a tile's preview
+        video). Everything is addressed by stable LoRA id -- the frontend never
+        supplies a filesystem path.
+        """
+        try:
+            request = json.loads(request_json or "{}")
+        except (TypeError, ValueError):
+            return json.dumps({"kind": "none"})
+        if not isinstance(request, dict):
+            return json.dumps({"kind": "none"})
+
+        kind = str(request.get("kind", "thumbs"))
+        try:
+            if kind == "inspect":
+                return self._serve_inspect(instance, request, state_value)
+            if kind == "media":
+                return self._serve_catalogue_media(instance, request, state_value)
+            if kind == "video":
+                return self._serve_preview_video(instance, request, state_value)
+            return self._serve_thumbnails(instance, request, state_value)
+        except Exception as error:
+            traceback.print_exc()
+            return json.dumps({"kind": kind, "error": str(error)})
+
+    def _entry_for(self, state_value, lora_id):
+        """Resolve a frontend-supplied id against the current native inventory."""
+        model_type = self._model_type(state_value)
+        lora_dir = self._lora_dir(model_type)
+        inventory = build_inventory(self._native_loras(state_value, []), lora_dir)
+        return inventory.get(normalize_id(lora_id)), lora_dir
+
+    def _serve_inspect(self, instance, request, state_value) -> str:
+        entry, lora_dir = self._entry_for(state_value, request.get("id"))
+        if entry is None or not entry.path:
+            return json.dumps({"kind": "inspect", "error": "That LoRA is not in the current inventory."})
+
+        detail = cat.read_detail(entry.path)
+        return json.dumps({
+            "kind": "inspect",
+            "id": entry.id,
+            "name": entry.name,
+            "civitai_name": detail.civitai_name,
+            "version_name": detail.version_name,
+            "creator": detail.creator,
+            "base_model": detail.base_model,
+            "description": detail.description,
+            "version_description": detail.version_description,
+            "trained_words": detail.trained_words,
+            "civitai_url": detail.civitai_url,
+            "sha256": detail.sha256,
+            "error": detail.error,
+            # Paths stay server-side; the browser asks for media by index.
+            "media": [
+                {
+                    "index": item.index,
+                    "kind": item.kind,
+                    "prompt": item.prompt,
+                    "negative_prompt": item.negative_prompt,
+                    "width": item.width,
+                    "height": item.height,
+                }
+                for item in detail.media
+            ],
+        })
+
+    def _serve_catalogue_media(self, instance, request, state_value) -> str:
+        entry, _ = self._entry_for(state_value, request.get("id"))
+        if entry is None or not entry.path:
+            return json.dumps({"kind": "media", "error": "unknown LoRA"})
+
+        try:
+            wanted = int(request.get("index", 0))
+        except (TypeError, ValueError):
+            return json.dumps({"kind": "media", "error": "bad index"})
+
+        detail = cat.read_detail(entry.path)
+        item = next((media for media in detail.media if media.index == wanted), None)
+        if item is None:
+            return json.dumps({"kind": "media", "error": "no such media"})
+
+        data = (
+            self._image_data_uri(item.path)
+            if item.kind == "image"
+            else self._file_data_uri(item.path)
+        )
+        if not data:
+            return json.dumps({"kind": "media", "id": entry.id, "index": wanted,
+                               "error": "could not read media"})
+        return json.dumps({"kind": "media", "id": entry.id, "index": wanted,
+                           "media_kind": item.kind, "data": data})
+
+    def _serve_preview_video(self, instance, request, state_value) -> str:
+        """The same-stem video beside the .safetensors, for tile playback."""
+        entry, lora_dir = self._entry_for(state_value, request.get("id"))
+        if entry is None or not entry.path:
+            return json.dumps({"kind": "video", "error": "unknown LoRA"})
+
+        directory = os.path.dirname(entry.path)
+        stem = os.path.splitext(os.path.basename(entry.path))[0].lower()
+        try:
+            listing = os.listdir(directory)
+        except OSError:
+            listing = []
+
+        match = None
+        for name in listing:
+            base, extension = os.path.splitext(name)
+            if base.lower() == stem and extension.lower() in VIDEO_EXTENSIONS:
+                match = os.path.join(directory, name)
+                break
+        if match is None or (lora_dir and not is_within(lora_dir, match)):
+            return json.dumps({"kind": "video", "id": entry.id, "error": "no preview video"})
+
+        data = self._file_data_uri(match)
+        if not data:
+            return json.dumps({"kind": "video", "id": entry.id, "error": "video too large to preview"})
+        return json.dumps({"kind": "video", "id": entry.id, "data": data})
+
+    def _image_data_uri(self, path: str) -> str:
+        """Re-encode a catalogue image down to a sane size for the modal."""
+        if self._thumbnails is None:
+            return ""
+        preview = Preview(path, "image")
+        return ThumbnailCache(self._thumbnails.cache_dir, MODAL_IMAGE_MAX_DIM).get(preview) or ""
+
+    @staticmethod
+    def _file_data_uri(path: str) -> str:
+        """Raw bytes as a data: URI, refused above the size cap.
+
+        Videos are only ever fetched one at a time, on an explicit click, which
+        is what keeps this affordable and avoids exposing the LoRA folder as a
+        static route.
+        """
+        try:
+            if os.path.getsize(path) > MEDIA_INLINE_LIMIT:
+                return ""
+            with open(path, "rb") as handle:
+                payload = base64.b64encode(handle.read()).decode("ascii")
+        except OSError:
+            return ""
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        return f"data:{mime};base64,{payload}"
+
+    def _serve_thumbnails(self, instance: InstanceState, request, state_value) -> str:
         """Resolve previews for the tiles the browser can actually see.
 
         The frontend only ever sends stable LoRA IDs; paths are resolved here
@@ -627,14 +861,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         exposed as a static route -- each tile gets a small derived WebP as a
         data URI instead.
         """
-        try:
-            request = json.loads(request_json or "{}")
-            requested = [normalize_id(value) for value in request.get("ids", []) or []]
-        except (TypeError, ValueError):
-            return json.dumps({"thumbs": {}})
-
+        requested = [normalize_id(value) for value in request.get("ids", []) or []]
         if not requested or self._thumbnails is None:
-            return json.dumps({"thumbs": {}})
+            return json.dumps({"kind": "thumbs", "thumbs": {}})
 
         model_type = self._model_type(state_value)
         lora_dir = self._lora_dir(model_type) or instance.lora_dir
@@ -658,4 +887,4 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             data_uri = self._thumbnails.get(preview)
             if data_uri:
                 thumbs[lora_id] = data_uri
-        return json.dumps({"thumbs": thumbs})
+        return json.dumps({"kind": "thumbs", "thumbs": thumbs})

@@ -315,38 +315,177 @@ class TestProfiles:
         assert payload["profiles"] == []
 
 
-class TestThumbnailBridge:
-    def test_the_frontend_can_only_ask_by_stable_id(self, plugin, state, tmp_path):
+class TestMediaBridge:
+    """One bridge serves grid thumbnails, catalogue detail and media bytes."""
+
+    def _library(self, tmp_path, with_sidecar=True):
         pillow = pytest.importorskip("PIL.Image")
         lora_dir = tmp_path / "loras"
-        lora_dir.mkdir(parents=True, exist_ok=True)
-        (lora_dir / "a.safetensors").write_bytes(b"")
+        (lora_dir / "sub").mkdir(parents=True, exist_ok=True)
+        for name in ("a.safetensors", "b.safetensors"):
+            (lora_dir / name).write_bytes(b"")
+        (lora_dir / "sub" / "c.safetensors").write_bytes(b"")
         pillow.new("RGB", (64, 64), (200, 30, 30)).save(str(lora_dir / "a.png"))
 
-        instance = plugin._instance("test")
-        result = json.loads(
-            plugin._serve_thumbnails(instance, json.dumps({"ids": ["a.safetensors"]}), state)
+        if with_sidecar:
+            side = lora_dir / "a"
+            (side / "media").mkdir(parents=True, exist_ok=True)
+            (side / "summary.txt").write_text(
+                "Civitai model name: Alpha Motion\n\nTrained words:\n- alphaword\n",
+                encoding="utf-8",
+            )
+            (side / "a.json").write_text(json.dumps({
+                "sha256": "deadbeef",
+                "modelVersion": {"id": 2, "modelId": 1, "name": "v1",
+                                 "trainedWords": ["alphaword"]},
+                "model": {"id": 1, "name": "Alpha Motion",
+                          "description": "<p>Alpha <b>does</b> things</p>",
+                          "creator": {"username": "maker"}},
+            }), encoding="utf-8")
+            pillow.new("RGB", (900, 600), (20, 90, 160)).save(str(side / "media" / "001.jpg"))
+            (side / "media" / "001.json").write_text(json.dumps({
+                "index": 1, "source_url": "https://cdn/1.jpg",
+                "civitai": {"width": 900, "height": 600,
+                            "meta": {"prompt": "alpha prompt", "negativePrompt": "bad"}},
+            }), encoding="utf-8")
+        return lora_dir
+
+    def ask(self, plugin, state, request):
+        return json.loads(
+            plugin._serve_media(plugin._instance("test"), json.dumps(request), state)
         )
+
+    def test_thumbnails_are_addressed_by_stable_id(self, plugin, state, tmp_path):
+        self._library(tmp_path)
+        result = self.ask(plugin, state, {"kind": "thumbs", "ids": ["a.safetensors"]})
         assert result["thumbs"]["a.safetensors"].startswith("data:image/webp;base64,")
 
-        # An arbitrary path is not resolvable and yields nothing.
-        escaped = json.loads(
-            plugin._serve_thumbnails(instance, json.dumps({"ids": ["../../secret"]}), state)
-        )
-        assert escaped["thumbs"] == {}
+    def test_an_arbitrary_path_resolves_to_nothing(self, plugin, state, tmp_path):
+        self._library(tmp_path)
+        assert self.ask(plugin, state, {"kind": "thumbs", "ids": ["../../secret"]})["thumbs"] == {}
 
     def test_a_lora_without_a_preview_is_simply_absent(self, plugin, state, tmp_path):
-        lora_dir = tmp_path / "loras"
-        lora_dir.mkdir(parents=True, exist_ok=True)
-        (lora_dir / "b.safetensors").write_bytes(b"")
-        result = json.loads(
-            plugin._serve_thumbnails(plugin._instance("test"), json.dumps({"ids": ["b.safetensors"]}), state)
-        )
-        assert result["thumbs"] == {}
+        self._library(tmp_path)
+        assert self.ask(plugin, state, {"kind": "thumbs", "ids": ["b.safetensors"]})["thumbs"] == {}
 
     def test_malformed_requests_are_ignored(self, plugin, state):
-        result = json.loads(plugin._serve_thumbnails(plugin._instance("test"), "not json", state))
-        assert result["thumbs"] == {}
+        result = json.loads(plugin._serve_media(plugin._instance("test"), "not json", state))
+        assert result["kind"] == "none"
+
+    def test_inspect_returns_the_catalogue(self, plugin, state, tmp_path):
+        self._library(tmp_path)
+        result = self.ask(plugin, state, {"kind": "inspect", "id": "a.safetensors"})
+        assert result["civitai_name"] == "Alpha Motion"
+        assert result["creator"] == "maker"
+        assert result["trained_words"] == ["alphaword"]
+        assert "does" in result["description"] and "<b>" not in result["description"]
+        assert result["media"][0]["prompt"] == "alpha prompt"
+
+    def test_inspect_never_leaks_filesystem_paths(self, plugin, state, tmp_path):
+        self._library(tmp_path)
+        raw = plugin._serve_media(
+            plugin._instance("test"),
+            json.dumps({"kind": "inspect", "id": "a.safetensors"}),
+            state,
+        )
+        assert str(tmp_path) not in raw
+
+    def test_inspect_without_a_sidecar_reports_an_error(self, plugin, state, tmp_path):
+        self._library(tmp_path)
+        result = self.ask(plugin, state, {"kind": "inspect", "id": "b.safetensors"})
+        assert result["error"]
+
+    def test_inspect_refuses_an_unknown_lora(self, plugin, state, tmp_path):
+        self._library(tmp_path)
+        assert self.ask(plugin, state, {"kind": "inspect", "id": "../escape"})["error"]
+
+    def test_catalogue_media_is_fetched_by_index(self, plugin, state, tmp_path):
+        self._library(tmp_path)
+        result = self.ask(plugin, state, {"kind": "media", "id": "a.safetensors", "index": 1})
+        assert result["media_kind"] == "image"
+        assert result["data"].startswith("data:image/webp;base64,")
+
+    def test_a_missing_media_index_is_reported(self, plugin, state, tmp_path):
+        self._library(tmp_path)
+        assert self.ask(plugin, state, {"kind": "media", "id": "a.safetensors", "index": 99})["error"]
+
+    def test_preview_video_is_served_only_when_one_exists(self, plugin, state, tmp_path):
+        lora_dir = self._library(tmp_path)
+        assert self.ask(plugin, state, {"kind": "video", "id": "a.safetensors"})["error"]
+
+        (lora_dir / "a.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
+        result = self.ask(plugin, state, {"kind": "video", "id": "a.safetensors"})
+        assert result["data"].startswith("data:video/mp4;base64,")
+
+    def test_an_oversized_file_is_refused_rather_than_inlined(self, plugin, state, tmp_path, monkeypatch):
+        lora_dir = self._library(tmp_path)
+        (lora_dir / "a.mp4").write_bytes(b"\x00" * 4096)
+        monkeypatch.setattr(plugin_module, "MEDIA_INLINE_LIMIT", 16)
+        assert self.ask(plugin, state, {"kind": "video", "id": "a.safetensors"})["error"]
+
+
+class TestCatalogueInPayload:
+    def test_civitai_name_and_words_reach_the_browser(self, plugin, state, tmp_path):
+        TestMediaBridge()._library(tmp_path)
+        payload = payload_of(plugin, state, [], "")
+        item = next(i for i in payload["items"] if i["id"] == "a.safetensors")
+        assert item["civitai_name"] == "Alpha Motion"
+        assert item["words"] == ["alphaword"]
+        assert item["has_catalogue"] is True
+
+    def test_a_lora_without_a_sidecar_is_marked_as_such(self, plugin, state, tmp_path):
+        TestMediaBridge()._library(tmp_path)
+        payload = payload_of(plugin, state, [], "")
+        item = next(i for i in payload["items"] if i["id"] == "b.safetensors")
+        assert item["civitai_name"] == ""
+        assert item["has_catalogue"] is False
+
+    def test_video_preview_presence_is_flagged(self, plugin, state, tmp_path):
+        lora_dir = TestMediaBridge()._library(tmp_path)
+        (lora_dir / "b.mp4").write_bytes(b"\x00")
+        payload = payload_of(plugin, state, [], "")
+        flags = {i["id"]: i["has_video"] for i in payload["items"]}
+        assert flags["b.safetensors"] is True
+        assert flags["a.safetensors"] is False
+
+    def test_sort_and_name_preferences_round_trip(self, plugin, state):
+        act(plugin, {"type": "sort", "value": "recent"}, state, [], "")
+        act(plugin, {"type": "name_mode", "value": "file"}, state, [], "")
+        payload = payload_of(plugin, state, [], "")
+        assert payload["sort_mode"] == "recent"
+        assert payload["name_mode"] == "file"
+
+    def test_an_unknown_sort_mode_falls_back(self, plugin, state):
+        act(plugin, {"type": "sort", "value": "nonsense"}, state, [], "")
+        assert payload_of(plugin, state, [], "")["sort_mode"] == "name"
+
+
+class TestDefaultProfile:
+    def test_set_and_clear(self, plugin, state):
+        act(plugin, {"type": "profile_save", "name": "Mine"}, state, ["a.safetensors"], "0.8;0.4")
+        act(plugin, {"type": "profile_default", "name": "Mine"}, state, [], "")
+        assert payload_of(plugin, state, [], "")["default_profile"] == "Mine"
+
+        # Choosing the same profile again toggles it off.
+        act(plugin, {"type": "profile_default", "name": "Mine"}, state, [], "")
+        assert payload_of(plugin, state, [], "")["default_profile"] == ""
+
+    def test_deleting_the_default_clears_it(self, plugin, state):
+        act(plugin, {"type": "profile_save", "name": "Mine"}, state, ["a.safetensors"], "1;1")
+        act(plugin, {"type": "profile_default", "name": "Mine"}, state, [], "")
+        act(plugin, {"type": "profile_delete", "name": "Mine"}, state, [], "")
+        assert payload_of(plugin, state, [], "")["default_profile"] == ""
+
+    def test_renaming_the_default_follows_it(self, plugin, state):
+        act(plugin, {"type": "profile_save", "name": "Old"}, state, ["a.safetensors"], "1;1")
+        act(plugin, {"type": "profile_default", "name": "Old"}, state, [], "")
+        act(plugin, {"type": "profile_rename", "name": "Old", "new_name": "New"}, state, [], "")
+        assert payload_of(plugin, state, [], "")["default_profile"] == "New"
+
+    def test_an_unknown_profile_cannot_become_default(self, plugin, state):
+        _, _, payload = act(plugin, {"type": "profile_default", "name": "Ghost"}, state, [], "")
+        assert payload["status_warn"] is True
+        assert payload["default_profile"] == ""
 
 
 class TestModelChange:
