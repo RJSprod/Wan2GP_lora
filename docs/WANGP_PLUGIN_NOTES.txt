@@ -1,0 +1,364 @@
+================================================================================
+WANGP PLUGIN DEVELOPMENT NOTES
+Why the LoRA Browser panel would not render, and what to know before you
+build or extend a WanGP UI-injection plugin.
+
+Project:      wan2gp-lora-browser (RJSprod/Wan2GP_lora)
+Written:      2026-08-25
+Verified on:  WanGP 12.642, Gradio 5.29.0, Windows install at C:\Roots\Wan2GP
+================================================================================
+
+
+--------------------------------------------------------------------------------
+0. THE ONE-LINE ANSWER
+--------------------------------------------------------------------------------
+
+The plugin was hiding its own parent.
+
+WanGP wraps `loras_choices` and `loras_multipliers` in a Gradio
+<div class="form">. `insert_after("loras_multipliers", ...)` places your panel
+INSIDE that same form. Our code found each native control with
+
+    node.closest(".block, .form")
+
+which walked up past the custom HierarchySelector and landed on the shared
+form. Setting display:none on it hid the native controls AND the panel.
+
+Everything else was working: the plugin loaded, injected, read 131 LoRAs and 8
+active ones, and mounted. It was simply inside a hidden parent.
+
+RULE: never hide an element that contains your own injected UI. Always test
+`candidate.contains(yourRoot)` before hiding, and verify your panel still has
+height afterwards.
+
+
+--------------------------------------------------------------------------------
+1. FOUR SEPARATE BUGS, IN THE ORDER THEY WERE FOUND
+--------------------------------------------------------------------------------
+
+All four produced the same user-visible symptom: an empty LoRAs tab. They had
+nothing to do with each other. Expect to peel several layers.
+
+--- BUG 1: gr.HTML re-render wipes your mounted DOM -------------------------
+Commit 3ad92e8
+
+SYMPTOM   Panel appears, then vanishes. Native controls stay hidden. No way back.
+CAUSE     The panel mounts into a gr.HTML component. Gradio renders gr.HTML with
+          Svelte's {@html value}. ANY re-render of that component reassigns its
+          innerHTML and destroys everything you mounted inside it. Our mount()
+          guarded on a one-shot `mounted` flag, so the skeleton could never be
+          rebuilt, while the `ready` flag kept the native controls hidden.
+FIX       Treat the gr.HTML anchor as ephemeral:
+            - mount() detects a wiped anchor and rebuilds the skeleton
+            - tear down observers bound to the detached DOM first
+            - a MutationObserver on the anchor recovers instantly
+            - a 1s integrity check backstops mutations you don't observe
+            - after rebuilding, repaint from cached state so the user sees nothing
+LESSON    Never assume DOM you injected into a Gradio HTML component still
+          exists. Anything mounted there must be rebuildable at any moment.
+
+--- BUG 2: duplicate elem_ids across plugin instances -----------------------
+Commit 61ca2a9
+
+SYMPTOM   Second tab hides the wrong controls; its own native controls remain
+          visible next to the panel.
+CAUSE     WanGP builds the media-generator form TWICE - the generation tab and
+          the queue-edit tab - so post_ui_setup runs twice and the plugin is
+          injected twice. We stamped the same elem_id onto both instances'
+          components, putting duplicate ids in the DOM. getElementById returns
+          the first match, so instance 2 resolved to instance 1's controls.
+FIX       Suffix every elem_id you create with the instance id. Derive it from
+          a stable per-instance value, e.g. `loras_multipliers._id`.
+LESSON    Your constructor WILL run more than once. Namespace every id, every
+          CSS class, and every window-global by instance. Keep per-instance
+          state in a dict keyed by that id, never on `self`.
+
+          NOTE: the plugin manager sets requested components as attributes on
+          your plugin object, but ONLY the first time (it skips if the attribute
+          already exists). So `self.loras_choices` is the FIRST tab's component
+          forever. Always use the `components` dict passed to post_ui_setup.
+
+--- BUG 3: link state inferred from equal values ----------------------------
+Commit 61ca2a9 (found by browser testing, unrelated to rendering)
+
+SYMPTOM   Dragging Phase 1 silently moved Phase 2.
+CAUSE     "Phases linked" was computed as `values.length > 1 && all equal`.
+          A freshly added LoRA is "1;1", so every new LoRA started linked.
+FIX       Linking is a user preference that defaults to off. Never infer UI
+          intent from data that is equal by coincidence.
+
+--- BUG 4: hiding the shared Gradio form (THE ROOT CAUSE) -------------------
+Commit 79f4d46
+
+SYMPTOM   Panel builds, logs "ready: 131 LoRAs, 8 active", is never visible.
+CAUSE     See section 0.
+FIX       Two layers, both in assets/lora_browser.js:
+
+          (a) Targeted - refuse any wrapper that contains your panel:
+
+              function hideTargetFor(id) {
+                var node = byId(id);
+                if (!node) { return null; }
+                var root = byId(IDS.root);
+                var candidate = node.closest(".block, .form") || node;
+                if (root && candidate.contains(root)) { candidate = node; }
+                if (root && candidate.contains(root)) { return null; }
+                return candidate;
+              }
+
+          (b) DOM-shape agnostic backstop - measure before and after, revert
+              if hiding collapsed you. This alone would have caught the bug
+              without knowing anything about Gradio forms:
+
+              var heightBefore = root.getBoundingClientRect().height;
+              targets.forEach(t => t.style.display = "none");
+              if (heightBefore > 0 && root.getBoundingClientRect().height === 0) {
+                targets.forEach(t => t.style.display = "");   // undo
+                console.warn("hiding collapsed the panel");
+              }
+
+          (c) Cosmetic - the shared form still draws its border/padding around
+              your panel once its inputs are hidden. Tag it and neutralise it:
+
+              .form.wgp-lora-browser-form-host {
+                border: 0 !important; padding: 0 !important;
+                background: transparent !important;
+              }
+
+WHY IT TOOK FOUR ROUNDS
+    A local Gradio harness reproduced the app faithfully EXCEPT that it used a
+    plain gr.Dropdown for loras_choices. A gr.Dropdown renders its own .block
+    wrapper, so closest() stopped before the form and the bad path never ran.
+    Real WanGP uses a custom HierarchySelector component
+    (shared/gradio/hierarchy_selector.py) which - based on the observed DOM -
+    does not render its own .block. That single difference hid the bug.
+
+    LESSON: when your harness substitutes a simplified component for a custom
+    one, you have not tested the thing that breaks. Either use the real
+    component or explicitly simulate its DOM shape (see section 5).
+
+
+--------------------------------------------------------------------------------
+2. HARD RULES FOR INJECTING UI INTO WANGP
+--------------------------------------------------------------------------------
+
+ 1. NEVER hide an ancestor of your own injected UI. Check `.contains()` first.
+ 2. ALWAYS verify after hiding that your panel still has height; revert if not.
+ 3. FAIL OPEN. Native controls must be visible by default and must come back on
+    any failure. A user must never be left with no UI at all. Give them a manual
+    "show native controls" escape hatch for failures you cannot detect.
+ 4. Only hide native controls AFTER your replacement has rendered real content -
+    check for actual rendered nodes, not just that a container exists.
+ 5. Assume your constructor runs multiple times. Namespace everything by
+    instance id.
+ 6. Treat any DOM inside a gr.HTML component as disposable. Be able to rebuild.
+ 7. Use the `components` dict from post_ui_setup, not `self.<component>`.
+ 8. Wrap post_ui_setup and your panel constructor in try/except. An exception
+    inside `with gr.Column():` leaves a partly built component in the tree.
+ 9. Do NOT expose the LoRA directory with gr.set_static_paths(). Serve small
+    derived thumbnails as data: URIs instead.
+10. Print a startup breadcrumb from Python and the browser so a broken install
+    is diagnosable from a log paste.
+
+
+--------------------------------------------------------------------------------
+3. WANGP INTEGRATION FACTS (verified against WanGP 12.642 source)
+--------------------------------------------------------------------------------
+
+3.1 How component names resolve
+    wgp.py ends generate_media_tab() with:
+        locals_dict = locals()
+        app.run_component_insertion(locals_dict)
+    So the strings you pass to request_component() are LOCAL VARIABLE NAMES in
+    generate_media_tab, not DOM elem_ids. Confirmed available:
+        loras_choices, loras_multipliers, guidance_phases, num_inference_steps,
+        state, lset_name, main, model_choice_target, main_tabs
+    `main` is the gr.Blocks, passed in as a parameter - use main.load(...).
+
+3.2 How insert_after actually works (shared/utils/plugins.py)
+        target_index = parent.children.index(target)
+        with parent:
+            new_component = constructor()
+        newly_added = parent.children.pop(-1)
+        parent.children.insert(target_index + 1, newly_added)
+    Consequences:
+      - Your constructor must add EXACTLY ONE top-level child to the parent.
+      - `parent` is loras_multipliers' parent, which is Gradio's implicit
+        <div class="form"> wrapping the two LoRA inputs - NOT the tab column.
+        This is what caused Bug 4.
+
+3.3 How plugins are imported
+        module = importlib.import_module(f"{plugin_dir_name}.plugin")
+        for name, obj in inspect.getmembers(module, inspect.isclass):
+            if issubclass(obj, WAN2GPPlugin) and obj != WAN2GPPlugin: ...break
+    Consequences:
+      - The plugin FOLDER NAME must be a valid Python identifier. A folder like
+        "wan2gp-lora-browser" (with dashes) cannot be imported this way.
+        "Wan2GP_lora" works.
+      - getmembers is alphabetical and the loop breaks on the first match, so do
+        not import another WAN2GPPlugin subclass into plugin.py's namespace.
+      - Relative imports (from .lora_browser import ...) work fine.
+
+3.4 The loras_multipliers grammar (shared/utils/loras_mutipliers.py)
+    Tokens are POSITIONAL: token i belongs to activated_loras[i].
+      - Lines whose first non-space char is '#' are comments, dropped.
+      - '|' separates accelerator-managed multipliers (left) from user ones
+        (right). Only the NUMBER OF TOKENS to its left carries meaning.
+      - ';' separates guidance phases        e.g. 0.8;1
+      - ',' separates step/time varying vals e.g. 1,0.5,0.25
+      - ':' separates multiplier branches    e.g. 0.5:0.9
+      - A token with fewer ';' parts than the phase count is padded by repeating
+        its last value, so "0.8" == "0.8;0.8".
+      - A token with MORE parts than the phase count is REJECTED by WanGP.
+
+    CRITICAL SERIALIZATION GOTCHA
+      preparse_loras_multipliers() does:
+          loras_multipliers.replace("|", " ").strip().split(" ")
+      Splitting on a single space means "1 | 1" becomes "1   1" and tokenises
+      into EMPTY STRINGS, which then fail float validation. Always emit the bar
+      with no surrounding spaces:
+          "1 0.5|0.8;1"        correct
+          "1 0.5 | 0.8;1"      breaks generation
+
+3.5 Phase resolution - do not hardcode per model
+    wgp.py computes:
+        lora_multiplier_phases = int(model_def.get("lora_multiplier_phases",
+                                     guidance_phases) or guidance_phases or 1)
+    And the guidance_phases dropdown can hold the STRING "2~"
+    (PHASE_2_TILING_GUIDANCE_VALUE, "Two Phases with Tiling") - still two
+    multiplier phases, not three.
+
+    Track TWO numbers, they are not the same:
+      capacity  = how many phases a token may declare (lora_multiplier_phases)
+      effective = how many sliders to show (min(capacity, guidance count))
+
+    MiniMax H3 declares lora_multiplier_phases = 2 regardless of guidance mode,
+    so in One Phase mode the token may legitimately still carry two values -
+    which is how a tuned Phase 2 survives a trip through One Phase. For models
+    whose capacity follows the guidance mode, the token must shrink and you have
+    to remember the hidden value yourself.
+
+3.6 LoRA identity
+    setup_loras() stores LoRAs as paths RELATIVE to the model's LoRA dir, via
+    get_lora_local_path(). Use that relative path as your stable id. Never key
+    by list index - removing the middle LoRA of a stack would shift every
+    multiplier onto the wrong file. Basename alone is not unique either
+    (subdirectories can repeat names).
+
+3.7 Refresh
+    refresh_lora_list(state, lset_name, loras_choices) -> (lset update,
+    loras_choices update). Reuse it; do not write a second discovery path.
+    state["loras"] is WanGP's authoritative selectable list.
+
+3.8 Syncing back from WanGP
+    Bind to .change on loras_choices / loras_multipliers / guidance_phases.
+    That single trigger covers presets, .lset files, accelerator profiles,
+    settings recovered from generated media, queue edits and model switches -
+    no need to special-case each upstream button.
+
+3.9 Noise you can ignore
+    "Too many arguments provided for the endpoint." is a stock Gradio 5.29
+    client-side warning emitted for ANY event that passes `inputs`. Reproducible
+    in a four-line Gradio app with no plugin loaded. Not your bug.
+
+
+--------------------------------------------------------------------------------
+4. THE DIAGNOSTIC THAT FOUND IT
+--------------------------------------------------------------------------------
+
+Python logs told us the plugin loaded, injected and reached "ready" with real
+data. That ruled out registration, injection and the data layer, but could not
+distinguish "never built" from "built but off screen". What closed the case was
+a browser-side self-report:
+
+    wgpLoraBrowserDiagnose()
+
+It returns, per instance: panel width/height, onScreen, tile count, whether the
+CSS applied, the full ANCESTOR CHAIN with each element's display and height, the
+first hidden ancestor, and native-control visibility.
+
+The output that solved it:
+
+    "div#component-1109.column.wgp-lora-browser-host [display=flex, h=0]"
+    "div.form.svelte-633qhp                          [display=none, h=0]"  <-- !
+    "div#component-359.column.svelte-vt1mxs          [display=flex, h=68]"
+
+A parent with display:none that only our own code could have set.
+
+BUILD THIS INTO YOUR PLUGIN FROM DAY ONE. The ancestor chain is the single most
+valuable field - it turns "it doesn't work" into a named element in one paste.
+
+
+--------------------------------------------------------------------------------
+5. HOW TO TEST WITHOUT LAUNCHING WANGP
+--------------------------------------------------------------------------------
+
+WanGP needs a GPU and minutes to start; that loop is too slow for UI work.
+Build a standalone harness instead:
+
+  1. pip install gradio==5.29.0 playwright
+  2. Stub `shared.utils.plugins.WAN2GPPlugin` with the same method surface.
+  3. Rebuild wgp.py's LoRA tab shape: Blocks > Tabs > Tab > Column > Markdown,
+     Row(lset dropdown + refresh), loras_choices, loras_multipliers - then call
+     a copy of PluginManager.run_component_insertion_and_setup(locals()).
+  4. Build the tab TWICE to mirror the generation + queue-edit instances.
+  5. Populate a fake LoRA dir at realistic scale (131 files, some with .png /
+     .mp4 previews) - small fixtures hide layout and performance bugs.
+  6. Drive it with Playwright and assert on the DOM, not on screenshots.
+
+  Chromium is usually already present; if playwright's expected build is
+  missing, pass executable_path explicitly.
+
+SIMULATE THE COMPONENTS YOU CANNOT IMPORT
+  This is the step that would have saved three rounds. HierarchySelector is not
+  importable outside WanGP, so explicitly recreate its DOM difference:
+
+      // make closest('.block, .form') escalate to the shared form
+      document.querySelectorAll('[id^="wgp_lora_browser_native_"]')
+              .forEach(n => n.classList.remove('block'));
+
+  Then re-run the code path that hides the natives and assert the panel still
+  has height. Pre-fix this yields panelHeight 0 with the form display:none;
+  post-fix it yields the full height with the natives still hidden.
+
+ALWAYS RUN THE NEGATIVE TEST
+  After fixing, revert the fix (git stash), run the same test, and confirm it
+  FAILS. Bugs 1 and 4 were both confirmed this way. Without it you cannot tell a
+  real fix from a coincidence - twice during this work a "reproduction" passed
+  against the broken code and had to be rebuilt.
+
+
+--------------------------------------------------------------------------------
+6. REPO MAP AND TESTS
+--------------------------------------------------------------------------------
+
+  plugin.py                  WanGP lifecycle, component wiring, JSON bridge only
+  lora_browser/
+    multiplier_codec.py      parse/serialise loras_multipliers  (heavily tested)
+    ui_payloads.py           state model, phase resolution, action application
+    inventory.py             native LoRA list -> displayable entries
+    thumbnails.py            preview matching, first-frame decode, cache
+    metadata_store.py        favourites, tags, zoom (atomic JSON)
+    profile_store.py         stack profiles
+  assets/lora_browser.css    panel styling, from Gradio theme tokens
+  assets/lora_browser.js     panel frontend (mount, render, bridges, diagnose)
+  tests/                     167 tests, no WanGP or GPU required
+
+  Run:  pip install pytest Pillow  &&  python -m pytest
+
+  Keep parsing, reconciliation and persistence OUT of plugin.py. Everything in
+  lora_browser/ is pure and testable; that is why multiplier corruption bugs
+  were caught by unit tests while every rendering bug needed a real browser.
+
+  Placeholder markers to be aware of: assets/*.js and *.css contain __INST__,
+  __NS__, __ROOT__ etc. which plugin.py substitutes per instance at build time.
+
+INSTALL
+  WanGP > Plugins > Install New Plugin > paste the repo URL > Download and
+  Install > enable > Save Settings > restart. The folder name WanGP creates must
+  be a valid Python identifier (see 3.3). No pip dependencies are added; Pillow
+  and OpenCV already ship with WanGP.
+
+================================================================================
+END
+================================================================================
