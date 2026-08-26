@@ -4,13 +4,19 @@ A profile deliberately stores nothing but the user's LoRA stack — no prompt,
 resolution, steps or seed.  Those belong to WanGP presets and settings files;
 duplicating them here would create a second, competing configuration system.
 
-Profiles are scoped to the model they were saved under and never carry
-accelerator/system LoRAs, which WanGP manages on its own.
+A profile is **not** tied to the model it was saved under.  Whole model
+families (every LTX 2 variant, say) share one LoRA folder and can load each
+other's LoRAs, so the model key would be a false barrier.  Availability is the
+only rule: a profile applies as far as the LoRAs in it are visible to the
+current model.  ``model_key`` is kept purely as provenance.
+
+Profiles never carry accelerator/system LoRAs, which WanGP manages on its own.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -95,15 +101,34 @@ class ProfileStore:
     def _profiles(self) -> dict[str, Any]:
         return self.metadata.data.setdefault("profiles", {})
 
-    def names(self, model_key: str = "") -> list[str]:
-        """Profile names, compatible ones first, each sorted case-insensitively."""
-        compatible, others = [], []
-        for name, payload in self._profiles.items():
-            if not isinstance(payload, dict):
-                continue
-            saved_key = str(payload.get("model_key", "") or "")
-            (compatible if not model_key or saved_key == model_key else others).append(name)
-        return sorted(compatible, key=str.casefold) + sorted(others, key=str.casefold)
+    def names(self, inventory_ids: Iterable[str] | None = None) -> list[str]:
+        """Profile names, the ones this model can apply in full listed first."""
+        complete, incomplete = self.partition(inventory_ids)
+        return complete + incomplete
+
+    def partition(self, inventory_ids: Iterable[str] | None = None) -> tuple[list[str], list[str]]:
+        """Split the profiles into (fully available, partly missing) names.
+
+        The model a profile was saved under plays no part: only whether the
+        current inventory can supply its LoRAs.  Passing ``None`` means "the
+        inventory is unknown", and nothing is called incomplete.
+        """
+        stored = [name for name, payload in self._profiles.items() if isinstance(payload, dict)]
+        if inventory_ids is None:
+            return sorted(stored, key=str.casefold), []
+
+        known = {normalize_id(value) for value in inventory_ids}
+        complete, incomplete = [], []
+        for name in stored:
+            profile = self.get(name)
+            missing = profile is not None and any(entry.id not in known for entry in profile.loras)
+            (incomplete if missing else complete).append(name)
+        return sorted(complete, key=str.casefold), sorted(incomplete, key=str.casefold)
+
+    def missing_ids(self, profile: Profile, inventory_ids: Iterable[str]) -> list[str]:
+        """LoRA ids in ``profile`` that the current model cannot see."""
+        known = {normalize_id(value) for value in inventory_ids}
+        return [entry.id for entry in profile.loras if entry.id not in known]
 
     def get(self, name: str) -> Profile | None:
         payload = self._profiles.get(str(name or ""))
@@ -139,20 +164,18 @@ class ProfileStore:
         self._profiles.pop(str(name))
         self.metadata.save()
 
-    def is_compatible(self, profile: Profile, model_key: str) -> bool:
-        """An unscoped legacy profile stays usable; a mismatched one does not."""
-        return not profile.model_key or not model_key or profile.model_key == model_key
-
-    def match(self, model_key: str, entries: list[ProfileEntry]) -> str:
+    def match(self, entries: list[ProfileEntry]) -> str:
         """Name of the profile that exactly equals the current stack, else "".
 
         Used so the dropdown never claims profile "X" is active once external
-        state (a preset, an .lset, imported media settings) has diverged.
+        state (a preset, an .lset, imported media settings) has diverged.  A
+        stack that is on screen is by definition available, so the model a
+        matching profile was saved under is irrelevant here too.
         """
         signature = _signature(entries)
         for name in self._profiles:
             profile = self.get(name)
-            if profile is None or not self.is_compatible(profile, model_key):
+            if profile is None:
                 continue
             if _signature(profile.loras) == signature:
                 return name

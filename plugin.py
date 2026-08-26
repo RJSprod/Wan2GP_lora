@@ -432,6 +432,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 warn = True
 
             catalogue = self._catalogue_index(instance, inventory)
+            complete, incomplete = (
+                self._profiles.partition(inventory.ids) if self._profiles else ([], [])
+            )
             payload = {
                 "revision": instance.next_revision(),
                 "model_key": model_type,
@@ -444,8 +447,11 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 "active": up.build_active_rows(
                     inventory, stack, phases, instance.phase_memory, catalogue,
                 ),
-                "profiles": self._profiles.names(model_type) if self._profiles else [],
-                "active_profile": self._profiles.match(model_type, entries) if self._profiles else "",
+                "profiles": complete + incomplete,
+                # Named so the dropdown can flag a profile this model can only
+                # apply in part -- it is still selectable.
+                "profiles_incomplete": incomplete,
+                "active_profile": self._profiles.match(entries) if self._profiles else "",
                 "default_profile": self._metadata.default_profile(model_type) if self._metadata else "",
                 "zoom_px": self._metadata.zoom_px if self._metadata else 104,
                 "sort_mode": self._metadata.sort_mode if self._metadata else "name",
@@ -660,20 +666,35 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 return False
 
             if kind == "profile_recall":
-                return self._recall_profile(instance, name, stack, inventory, phases, model_type)
+                return self._recall_profile(instance, name, stack, inventory)
         except ProfileError as error:
             instance.note(str(error), True)
         return False
 
-    def _recall_profile(self, instance, name, stack, inventory, phases, model_type) -> bool:
+    def _recall_profile(self, instance, name, stack, inventory) -> bool:
         profile = self._profiles.get(name)
         if profile is None:
             instance.note(f"Profile '{name}' not found.", True)
             return False
-        if not self._profiles.is_compatible(profile, model_key=model_type):
-            # Never blindly apply a stack saved under a different model.
+        if not profile.loras:
+            instance.note(f"Profile '{name}' has no LoRAs to apply.", True)
+            return False
+
+        # The model a profile was saved under is provenance, not a gate: model
+        # families that share a LoRA folder (every LTX 2 variant, say) see each
+        # other's LoRAs, so availability is the only thing that can block a
+        # recall.
+        applied, missing = [], []
+        for entry in profile.loras:
+            if inventory.get(entry.id) is None:
+                missing.append(entry.id)
+                continue
+            applied.append(entry)
+
+        if not applied:
             instance.note(
-                f"Profile '{name}' was saved for '{profile.model_key}' and was not applied.", True
+                f"Profile '{name}' was not applied - none of its "
+                f"{len(missing)} LoRA(s) are available to this model.", True
             )
             return False
 
@@ -682,13 +703,6 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         keep = max(0, stack.separator_index) if stack.separator_index >= 0 else 0
         system_ids = stack.ids[:keep]
         system_tokens = stack.tokens[:keep]
-
-        applied, missing = [], []
-        for entry in profile.loras:
-            if inventory.get(entry.id) is None:
-                missing.append(entry.id)
-                continue
-            applied.append(entry)
 
         stack.ids = system_ids + [entry.id for entry in applied]
         stack.tokens = system_tokens + [entry.multiplier for entry in applied]
