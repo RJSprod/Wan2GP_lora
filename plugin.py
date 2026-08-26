@@ -114,6 +114,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         self.type = ["extension"]
 
         self._instances: dict[Any, InstanceState] = {}
+        #: At most one "Fetch all" run, shared by every media-generator tab.
+        self._bulk: civitai.BulkFetch | None = None
         self._metadata: MetadataStore | None = None
         self._profiles: ProfileStore | None = None
         self._thumbnails: ThumbnailCache | None = None
@@ -754,6 +756,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 return self._serve_inspect(instance, request, state_value)
             if kind == "fetch":
                 return self._serve_fetch(instance, request, state_value)
+            if kind == "fetch_all":
+                return self._serve_fetch_all(instance, request, state_value)
             if kind == "media":
                 return self._serve_catalogue_media(instance, request, state_value)
             if kind == "video":
@@ -792,6 +796,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             "civitai_url": detail.civitai_url,
             "sha256": detail.sha256,
             "has_catalogue": cat.sidecar_dir(entry.path) is not None,
+            # Named so the view can say what an existing catalogue still lacks
+            # rather than looking finished because it has pictures.
+            "missing": civitai.missing_parts(entry.path),
             "note": detail.error,
             # Paths stay server-side; the browser asks for media by index.
             "media": [
@@ -849,6 +856,52 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         })
         instance.note(report.message, not report.ok)
         return json.dumps(payload)
+
+    def _bulk_payload(self, extra: dict | None = None) -> str:
+        payload = {"kind": "fetch_all", "running": False, "total": 0, "done": 0}
+        if self._bulk is not None:
+            payload.update(self._bulk.status())
+            payload["running"] = self._bulk.running
+        payload.update(extra or {})
+        return json.dumps(payload)
+
+    def _serve_fetch_all(self, instance, request, state_value) -> str:
+        """Start, poll or stop a catalogue fetch across the whole inventory.
+
+        The work runs on a worker thread and the frontend polls: a hundred
+        LoRAs is minutes of hashing and downloading, which no single bridge
+        call should be holding open.
+        """
+        action = str(request.get("action", "start"))
+
+        if action == "stop":
+            if self._bulk is not None:
+                self._bulk.cancel()
+            return self._bulk_payload()
+
+        if action == "status":
+            if self._bulk is not None and not self._bulk.running:
+                instance.note(self._bulk.summary())
+            return self._bulk_payload()
+
+        if self._bulk is not None and self._bulk.running:
+            return self._bulk_payload()      # already going; just report it
+
+        model_type = self._model_type(state_value)
+        lora_dir = self._lora_dir(model_type)
+        inventory = build_inventory(self._native_loras(state_value, []), lora_dir)
+        targets = [
+            entry.path for entry in inventory.entries
+            if entry.path and civitai.needs_fetch(entry.path)
+        ]
+        if not targets:
+            instance.note("Every LoRA this model offers already has a catalogue.")
+            return self._bulk_payload({"running": False, "total": 0, "finished": True})
+
+        self._bulk = civitai.BulkFetch(
+            targets, api_key=self._civitai_key(), lora_root=lora_dir
+        ).start()
+        return self._bulk_payload({"running": True})
 
     def _serve_catalogue_media(self, instance, request, state_value) -> str:
         entry, _ = self._entry_for(state_value, request.get("id"))

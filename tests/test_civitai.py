@@ -248,6 +248,203 @@ class TestFetch:
         assert "not on disk" in report.message
 
 
+class TestMissingParts:
+    """What counts as missing, judged against the record already on disk."""
+
+    def test_a_lora_with_no_folder_needs_everything(self, lora):
+        assert civitai.missing_parts(str(lora)) == ["catalogue"]
+
+    def test_a_freshly_fetched_lora_is_complete(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        assert civitai.missing_parts(str(lora)) == []
+        assert civitai.needs_fetch(str(lora)) is False
+
+    def test_a_folder_without_a_summary(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        os.remove(lora.parent / lora.stem / "summary.txt")
+        assert civitai.missing_parts(str(lora)) == ["summary"]
+
+    def test_media_present_but_prompts_missing(self, lora, civitai_api):
+        """The reported case: images on disk, structure built without prompts."""
+        civitai.fetch_sidecar(str(lora))
+        media_dir = lora.parent / lora.stem / "media"
+        for name in ("001.json", "002.json"):
+            os.remove(media_dir / name)
+
+        assert civitai.missing_parts(str(lora)) == ["prompts"]
+        assert civitai.needs_fetch(str(lora)) is True
+
+    def test_a_prompt_sidecar_without_its_record_counts_as_missing(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        (lora.parent / lora.stem / "media" / "001.json").write_text(
+            json.dumps({"index": 1, "source_url": "https://image.civitai.com/x"}),
+            encoding="utf-8",
+        )
+        assert civitai.missing_parts(str(lora)) == ["prompts"]
+
+    def test_an_unreadable_prompt_sidecar_counts_as_missing(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        (lora.parent / lora.stem / "media" / "002.json").write_text("{ broken", encoding="utf-8")
+        assert civitai.missing_parts(str(lora)) == ["prompts"]
+
+    def test_one_absent_media_file_out_of_several(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        os.remove(lora.parent / lora.stem / "media" / "002.jpeg")
+        assert civitai.missing_parts(str(lora)) == ["media"]
+
+    def test_a_folder_with_no_record_at_all(self, lora):
+        side = lora.parent / lora.stem
+        (side / "media").mkdir(parents=True)
+        (side / "media" / "001.jpg").write_bytes(b"\xff\xd8\xff")
+        assert civitai.missing_parts(str(lora)) == ["summary", "records"]
+
+    def test_a_missing_trigger_words_file(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        os.remove(lora.parent / lora.stem / f"{lora.stem}.txt")
+        assert civitai.missing_parts(str(lora)) == ["trigger words"]
+
+    def test_a_lora_civitai_has_no_media_for_is_complete_once_fetched(
+        self, lora, monkeypatch
+    ):
+        """Otherwise it would be re-hashed by every single Fetch all."""
+        monkeypatch.setattr(civitai, "urlopen", FakeCivitai(version=dict(VERSION, images=[])))
+        civitai.fetch_sidecar(str(lora))
+        assert civitai.missing_parts(str(lora)) == []
+
+    def test_everything_at_once_is_reported_together(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        side = lora.parent / lora.stem
+        os.remove(side / "summary.txt")
+        os.remove(side / f"{lora.stem}.txt")
+        for name in os.listdir(side / "media"):
+            os.remove(side / "media" / name)
+        assert civitai.missing_parts(str(lora)) == [
+            "summary", "trigger words", "media", "prompts",
+        ]
+
+
+class TestToppingUpAnIncompleteCatalogue:
+    """A fetch over an existing folder must repair it, not just skip it."""
+
+    def test_prompts_are_rewritten_for_media_already_on_disk(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        media_dir = lora.parent / lora.stem / "media"
+        for name in ("001.json", "002.json"):
+            os.remove(media_dir / name)
+
+        civitai_api.urls.clear()
+        report = civitai.fetch_sidecar(str(lora))
+
+        assert report.ok is True
+        assert report.downloaded == 0          # the images were already there
+        assert report.skipped == 2
+        assert not [url for url in civitai_api.urls if "image.civitai.com" in url]
+
+        detail = cat.read_detail(str(lora))
+        assert detail.media[0].prompt == "a quiet street at night"
+        assert detail.media[1].negative_prompt == "blurry"
+        assert civitai.missing_parts(str(lora)) == []
+
+    def test_a_thinner_older_prompt_record_is_replaced(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        (lora.parent / lora.stem / "media" / "001.json").write_text(
+            json.dumps({"index": 1, "civitai": {"type": "video"}}), encoding="utf-8"
+        )
+        assert cat.read_detail(str(lora)).media[0].prompt == ""
+
+        civitai.fetch_sidecar(str(lora))
+        assert cat.read_detail(str(lora)).media[0].prompt == "a quiet street at night"
+
+
+class TestBulkFetch:
+    @pytest.fixture
+    def library(self, tmp_path):
+        root = tmp_path / "loras"
+        root.mkdir()
+        paths = []
+        for name in ("one", "two", "three"):
+            path = root / f"{name}.safetensors"
+            path.write_bytes(b"weights for " + name.encode())
+            paths.append(str(path))
+        return root, paths
+
+    def test_every_lora_gets_a_catalogue(self, library, civitai_api):
+        root, paths = library
+        job = civitai.BulkFetch(paths, lora_root=str(root))
+        job.run()
+
+        state = job.status()
+        assert (state["done"], state["fetched"], state["finished"]) == (3, 3, True)
+        assert state["media"] == 6
+        assert all(not civitai.needs_fetch(path) for path in paths)
+
+    def test_a_lora_civitai_does_not_know_is_counted_apart_from_a_failure(
+        self, library, monkeypatch
+    ):
+        from urllib.error import HTTPError
+
+        root, paths = library
+        calls = {"n": 0}
+
+        def sometimes_missing(request, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise HTTPError(request.full_url, 404, "Not Found", {}, None)
+            if calls["n"] == 2:
+                raise OSError("no route to host")
+            return FakeCivitai()(request, timeout)
+
+        monkeypatch.setattr(civitai, "urlopen", sometimes_missing)
+        monkeypatch.setattr(civitai, "DEFAULT_RETRIES", 0)
+        job = civitai.BulkFetch(paths, lora_root=str(root), retries=0)
+        job.run()
+
+        state = job.status()
+        assert state["done"] == 3
+        assert state["missing"] == 1
+        assert state["failed"] == 1
+        assert state["fetched"] == 1
+        assert "not on Civitai" in job.summary()
+
+    def test_one_bad_lora_does_not_end_the_run(self, library, civitai_api, monkeypatch):
+        root, paths = library
+        real = civitai.fetch_sidecar
+
+        def explode(path, **kwargs):
+            if path.endswith("two.safetensors"):
+                raise RuntimeError("disk on fire")
+            return real(path, **kwargs)
+
+        monkeypatch.setattr(civitai, "fetch_sidecar", explode)
+        job = civitai.BulkFetch(paths, lora_root=str(root))
+        job.run()
+
+        state = job.status()
+        assert (state["done"], state["fetched"], state["failed"]) == (3, 2, 1)
+
+    def test_cancelling_stops_the_loop_and_says_so(self, library, civitai_api):
+        root, paths = library
+        job = civitai.BulkFetch(paths, lora_root=str(root))
+        job.cancel()
+        job.run()
+
+        state = job.status()
+        assert (state["done"], state["cancelled"], state["finished"]) == (0, True, True)
+        assert "stopped early" in job.summary()
+
+    def test_an_empty_run_is_finished_before_it_starts(self):
+        job = civitai.BulkFetch([])
+        assert job.running is False
+        assert job.status()["total"] == 0
+
+    def test_the_thread_reports_the_same_result(self, library, civitai_api):
+        root, paths = library
+        job = civitai.BulkFetch(paths, lora_root=str(root)).start()
+        job._thread.join(timeout=30)
+        assert job.running is False
+        assert job.status()["fetched"] == 3
+
+
 class TestSummaryRoundTrip:
     def test_what_is_written_is_what_the_index_parses(self):
         text = civitai.build_summary(

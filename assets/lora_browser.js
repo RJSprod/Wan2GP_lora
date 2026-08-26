@@ -57,6 +57,7 @@
     profiles: [],
     profilesIncomplete: [],
     civitaiKeySet: false,
+    bulkFetch: null,
     activeProfile: "",
     status: "",
     statusWarn: false,
@@ -79,6 +80,7 @@
     mediaQueue: [],
     mediaInFlight: null,
     mediaTimer: null,
+    bulkTimer: null,
     playingTile: null,
     searchTerms: [],
     modal: null,
@@ -466,8 +468,72 @@
           );
           if (key === null) { return; }
           send({ type: "civitai_key", value: key });
-        } }
+        } },
+      { separator: true },
+      bulkFetchMenuItem()
     ];
+  }
+
+  /* One item, two jobs: start a run, or stop the one already going. The label
+     carries the progress so the menu is also where you check on it. */
+  function bulkFetchMenuItem() {
+    var bulk = S.bulkFetch;
+    if (bulk && bulk.running) {
+      return { label: "Stop fetching (" + bulk.done + "/" + bulk.total + ")...",
+        run: function () { requestBulkFetch("stop"); } };
+    }
+    return { label: "Fetch all missing info...",
+      run: function () { requestBulkFetch("start"); } };
+  }
+
+  /* Fetching every missing catalogue is minutes of hashing and downloading, so
+     the server runs it on a worker thread and we poll for progress. The status
+     line is the progress bar. */
+  function requestBulkFetch(action) {
+    if (action === "start") { setStatus("Looking for LoRAs with no catalogue..."); }
+    requestMedia({ kind: "fetch_all", action: action }, function (response) {
+      if (!response) { return; }
+      S.bulkFetch = response;
+      if (response.running) {
+        showBulkProgress(response);
+        if (!S.bulkTimer) { S.bulkTimer = setTimeout(pollBulkFetch, 1500); }
+        return;
+      }
+      finishBulkFetch(response);
+    });
+  }
+
+  function pollBulkFetch() {
+    S.bulkTimer = null;
+    requestMedia({ kind: "fetch_all", action: "status" }, function (response) {
+      if (!response) { return; }
+      S.bulkFetch = response;
+      if (response.running) {
+        showBulkProgress(response);
+        S.bulkTimer = setTimeout(pollBulkFetch, 1500);
+        return;
+      }
+      finishBulkFetch(response);
+    });
+  }
+
+  function showBulkProgress(bulk) {
+    // Cancelling is cooperative: the LoRA in flight is allowed to finish so it
+    // never leaves a half-written folder behind.
+    if (bulk.cancelled) { setStatus("Stopping after the current LoRA..."); return; }
+    setStatus("Fetching catalogues " + bulk.done + "/" + bulk.total +
+      (bulk.current ? " - " + bulk.current : "") + "...");
+  }
+
+  function finishBulkFetch() {
+    if (S.bulkTimer) { clearTimeout(S.bulkTimer); S.bulkTimer = null; }
+    // New previews and Civitai names only reach the grid on the next payload,
+    // and tiles that had no preview were cached as having none.
+    S.thumbs = {};
+    S.requested = {};
+    // The server left the outcome as this instance's status, and a fresh
+    // payload is what both collects it and redraws the enriched tiles.
+    send({ type: "ready" });
   }
 
   /* ------------------------------------------------------------- grid */
@@ -1379,6 +1445,17 @@
      for any model family Civitai knows -- there is nothing model-specific to
      configure. It can take a while on a LoRA with ten videos, so the request
      gets its own generous timeout and the button reports progress in place. */
+  function fetchNote(detail) {
+    if (!detail.has_catalogue) { return "Looks this file up on Civitai by its checksum."; }
+    var missing = detail.missing || [];
+    if (missing.length) {
+      // A catalogue with pictures but no prompts still reads as finished
+      // otherwise, so name what is actually absent.
+      return "Missing: " + missing.join(", ") + ". Fetching adds it.";
+    }
+    return "This catalogue is complete. Fetching refreshes it.";
+  }
+
   function fetchSection(overlay, id, detail) {
     var section = document.createElement("div");
     section.className = "lb-modal-section lb-fetch";
@@ -1393,10 +1470,7 @@
 
     var note = document.createElement("div");
     note.className = "lb-fetch-note";
-    note.textContent = detail.note ||
-      (detail.has_catalogue
-        ? "Adds anything missing; media already on disk is kept."
-        : "Looks this file up on Civitai by its checksum.");
+    note.textContent = detail.note || fetchNote(detail);
     section.appendChild(note);
 
     button.addEventListener("click", function () {

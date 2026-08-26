@@ -444,6 +444,110 @@ class TestCivitaiFetch:
         assert payload["message"]
 
 
+class TestFetchAll:
+    """One menu item, over everything the model offers that has no catalogue."""
+
+    @pytest.fixture
+    def library(self, tmp_path):
+        root = tmp_path / "loras"
+        (root / "sub").mkdir(parents=True, exist_ok=True)
+        for name in LORAS:
+            (root / name).write_bytes(b"weights " + name.encode())
+        return root
+
+    def _drain(self, plugin, state):
+        """Run the job to completion the way the frontend's polling would."""
+        started = serve(plugin, {"kind": "fetch_all", "action": "start"}, state)
+        if plugin._bulk is not None and plugin._bulk._thread is not None:
+            plugin._bulk._thread.join(timeout=30)
+        return started, serve(plugin, {"kind": "fetch_all", "action": "status"}, state)
+
+    def test_it_enriches_every_lora_that_had_nothing(
+        self, plugin, state, library, monkeypatch
+    ):
+        monkeypatch.setattr(plugin_module.civitai, "urlopen", _FakeCivitai())
+        started, done = self._drain(plugin, state)
+
+        assert started["total"] == len(LORAS)
+        assert done["finished"] is True
+        assert done["fetched"] == len(LORAS)
+        for item in payload_of(plugin, state, [], "")["items"]:
+            assert item["has_catalogue"] is True
+            assert item["civitai_name"] == "Live Wallpaper Style"
+
+    def test_a_lora_that_already_has_a_catalogue_is_left_alone(
+        self, plugin, state, library, monkeypatch
+    ):
+        monkeypatch.setattr(plugin_module.civitai, "urlopen", _FakeCivitai())
+        serve(plugin, {"kind": "fetch", "id": "a.safetensors"}, state)
+
+        started, _ = self._drain(plugin, state)
+        assert started["total"] == len(LORAS) - 1
+
+    def test_a_catalogue_with_images_but_no_prompts_is_picked_up(
+        self, plugin, state, library, monkeypatch
+    ):
+        """Having pictures is not the same as being complete."""
+        monkeypatch.setattr(plugin_module.civitai, "urlopen", _FakeCivitai())
+        self._drain(plugin, state)
+        os.remove(library / "a" / "media" / "001.json")
+
+        started, done = self._drain(plugin, state)
+        assert started["total"] == 1
+        assert done["fetched"] == 1
+        assert (library / "a" / "media" / "001.json").exists()
+
+        payload = serve(plugin, {"kind": "inspect", "id": "a.safetensors"}, state)
+        assert payload["media"][0]["prompt"] == "a quiet street"
+        assert payload["missing"] == []
+
+    def test_nothing_to_do_reports_instead_of_starting_a_run(
+        self, plugin, state, library, monkeypatch
+    ):
+        monkeypatch.setattr(plugin_module.civitai, "urlopen", _FakeCivitai())
+        self._drain(plugin, state)
+
+        again = serve(plugin, {"kind": "fetch_all", "action": "start"}, state)
+        assert again["total"] == 0
+        assert again["running"] is False
+        assert "already has a catalogue" in payload_of(plugin, state, [], "")["status"]
+
+    def test_the_outcome_lands_on_the_status_line(
+        self, plugin, state, library, monkeypatch
+    ):
+        monkeypatch.setattr(plugin_module.civitai, "urlopen", _FakeCivitai())
+        self._drain(plugin, state)
+        status = payload_of(plugin, state, [], "")["status"]
+        assert status.startswith("Fetched 3 of 3 LoRA(s)")
+
+    def test_a_second_start_does_not_launch_a_competing_run(
+        self, plugin, state, library, monkeypatch
+    ):
+        import threading
+
+        release = threading.Event()
+
+        def blocking(path, **kwargs):
+            release.wait(timeout=10)
+            return plugin_module.civitai.FetchReport(ok=True, message="held")
+
+        monkeypatch.setattr(plugin_module.civitai, "fetch_sidecar", blocking)
+        serve(plugin, {"kind": "fetch_all", "action": "start"}, state)
+        first = plugin._bulk
+
+        try:
+            payload = serve(plugin, {"kind": "fetch_all", "action": "start"}, state)
+            assert payload["running"] is True
+            assert plugin._bulk is first
+        finally:
+            release.set()
+            first._thread.join(timeout=10)
+
+    def test_stop_is_accepted_even_with_no_run_in_flight(self, plugin, state, library):
+        payload = serve(plugin, {"kind": "fetch_all", "action": "stop"}, state)
+        assert payload["running"] is False
+
+
 class TestCivitaiKey:
     def test_a_stored_key_is_reported_but_never_sent_to_the_browser(self, plugin, state):
         act(plugin, {"type": "civitai_key", "value": "secret-key"}, state, [], "")
