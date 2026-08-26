@@ -248,6 +248,118 @@ class TestFetch:
         assert "not on disk" in report.message
 
 
+class TestNeedsFetch:
+    """What "Fetch all" counts as missing."""
+
+    def test_a_lora_with_no_folder_needs_one(self, lora):
+        assert civitai.needs_fetch(str(lora)) is True
+
+    def test_a_freshly_fetched_lora_does_not(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        assert civitai.needs_fetch(str(lora)) is False
+
+    def test_a_folder_without_a_summary_needs_one(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        os.remove(lora.parent / lora.stem / "summary.txt")
+        assert civitai.needs_fetch(str(lora)) is True
+
+    def test_a_catalogue_with_no_media_needs_one(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        media_dir = lora.parent / lora.stem / "media"
+        for name in os.listdir(media_dir):
+            os.remove(media_dir / name)
+        assert civitai.needs_fetch(str(lora)) is True
+
+
+class TestBulkFetch:
+    @pytest.fixture
+    def library(self, tmp_path):
+        root = tmp_path / "loras"
+        root.mkdir()
+        paths = []
+        for name in ("one", "two", "three"):
+            path = root / f"{name}.safetensors"
+            path.write_bytes(b"weights for " + name.encode())
+            paths.append(str(path))
+        return root, paths
+
+    def test_every_lora_gets_a_catalogue(self, library, civitai_api):
+        root, paths = library
+        job = civitai.BulkFetch(paths, lora_root=str(root))
+        job.run()
+
+        state = job.status()
+        assert (state["done"], state["fetched"], state["finished"]) == (3, 3, True)
+        assert state["media"] == 6
+        assert all(not civitai.needs_fetch(path) for path in paths)
+
+    def test_a_lora_civitai_does_not_know_is_counted_apart_from_a_failure(
+        self, library, monkeypatch
+    ):
+        from urllib.error import HTTPError
+
+        root, paths = library
+        calls = {"n": 0}
+
+        def sometimes_missing(request, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise HTTPError(request.full_url, 404, "Not Found", {}, None)
+            if calls["n"] == 2:
+                raise OSError("no route to host")
+            return FakeCivitai()(request, timeout)
+
+        monkeypatch.setattr(civitai, "urlopen", sometimes_missing)
+        monkeypatch.setattr(civitai, "DEFAULT_RETRIES", 0)
+        job = civitai.BulkFetch(paths, lora_root=str(root), retries=0)
+        job.run()
+
+        state = job.status()
+        assert state["done"] == 3
+        assert state["missing"] == 1
+        assert state["failed"] == 1
+        assert state["fetched"] == 1
+        assert "not on Civitai" in job.summary()
+
+    def test_one_bad_lora_does_not_end_the_run(self, library, civitai_api, monkeypatch):
+        root, paths = library
+        real = civitai.fetch_sidecar
+
+        def explode(path, **kwargs):
+            if path.endswith("two.safetensors"):
+                raise RuntimeError("disk on fire")
+            return real(path, **kwargs)
+
+        monkeypatch.setattr(civitai, "fetch_sidecar", explode)
+        job = civitai.BulkFetch(paths, lora_root=str(root))
+        job.run()
+
+        state = job.status()
+        assert (state["done"], state["fetched"], state["failed"]) == (3, 2, 1)
+
+    def test_cancelling_stops_the_loop_and_says_so(self, library, civitai_api):
+        root, paths = library
+        job = civitai.BulkFetch(paths, lora_root=str(root))
+        job.cancel()
+        job.run()
+
+        state = job.status()
+        assert (state["done"], state["cancelled"], state["finished"]) == (0, True, True)
+        assert "stopped early" in job.summary()
+
+    def test_an_empty_run_is_finished_before_it_starts(self):
+        job = civitai.BulkFetch([])
+        assert job.running is False
+        assert job.status()["total"] == 0
+
+    def test_the_thread_reports_the_same_result(self, library, civitai_api):
+        root, paths = library
+        job = civitai.BulkFetch(paths, lora_root=str(root)).start()
+        job._thread.join(timeout=30)
+        assert job.running is False
+        assert job.status()["fetched"] == 3
+
+
 class TestSummaryRoundTrip:
     def test_what_is_written_is_what_the_index_parses(self):
         text = civitai.build_summary(

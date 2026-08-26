@@ -360,6 +360,15 @@ def _loose_media(directory: str) -> dict[int, str]:
     return found
 
 
+def has_media(directory: str) -> bool:
+    """Whether the sidecar holds any renderable media.
+
+    Cheap on purpose -- a listing, no JSON parsing -- because "Fetch all" asks
+    this about every LoRA the model offers before deciding what to work on.
+    """
+    return bool(_media_files(os.path.join(directory, MEDIA_DIRNAME)) or _loose_media(directory))
+
+
 def _read_media(directory: str) -> list[MediaItem]:
     media_dir = os.path.join(directory, MEDIA_DIRNAME)
     files = _media_files(media_dir) or _loose_media(directory)

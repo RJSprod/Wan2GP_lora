@@ -24,6 +24,7 @@ import mimetypes
 import os
 import shutil
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -84,9 +85,17 @@ class FetchReport:
     failed: int = 0
     media_total: int = 0
     name: str = ""
+    #: Civitai has no record of this exact file. Distinguished from a failure
+    #: because a bulk run must be able to say "not on Civitai" rather than
+    #: "something went wrong".
+    not_found: bool = False
 
 
 # ------------------------------------------------------------------ http
+
+
+#: Matched by the bulk runner, so keep it a constant rather than a literal.
+_NOT_FOUND = "Civitai does not have this exact file"
 
 
 def _headers(api_key: str) -> dict[str, str]:
@@ -145,7 +154,7 @@ def get_json(
 
         except HTTPError as error:
             if error.code == 404:
-                return None, "Civitai does not have this exact file"
+                return None, _NOT_FOUND
             if error.code in (401, 403):
                 return None, (
                     f"Civitai refused the request (HTTP {error.code}); "
@@ -520,7 +529,10 @@ def fetch_sidecar(
         retries=retries,
     )
     if version is None:
-        return FetchReport(message=f"Nothing fetched - {error}.")
+        return FetchReport(
+            message=f"Nothing fetched - {error}.",
+            not_found=error == _NOT_FOUND,
+        )
 
     model: dict[str, Any] = {}
     model_id = version.get("modelId")
@@ -596,6 +608,145 @@ def fetch_sidecar(
     )
     report.message = _describe(report, promoted)
     return report
+
+
+# ------------------------------------------------------------- fetch all
+
+
+def needs_fetch(lora_path: str) -> bool:
+    """True when a LoRA has no catalogue worth keeping.
+
+    Cheap on purpose -- a couple of stats and a listing -- because "Fetch all"
+    asks this about every LoRA the model offers before deciding what to work on.
+    A folder a fetch has completed for has both a ``summary.txt`` and at least
+    one media file; anything short of that counts as missing, and anything
+    complete is left alone so an already-enriched library is not re-hashed.
+
+    A LoRA Civitai genuinely has no media for keeps answering True, and so gets
+    looked up again on the next run.  That costs one hash and one request, and
+    is the honest answer: nothing on disk distinguishes it from a LoRA whose
+    media has yet to be downloaded.
+    """
+    directory = cat.sidecar_dir(lora_path)
+    if directory is None:
+        return True
+    if not os.path.isfile(os.path.join(directory, cat.SUMMARY_FILENAME)):
+        return True
+    return not cat.has_media(directory)
+
+
+class BulkFetch:
+    """One "Fetch all" run, over many LoRAs, on a worker thread.
+
+    It lives here rather than in ``plugin.py`` so the loop can be driven and
+    inspected without Gradio: :meth:`run` is an ordinary blocking call, and
+    :meth:`start` is the only part that involves a thread.  The plugin owns at
+    most one of these at a time and does nothing but start it, poll
+    :meth:`status` and, if asked, :meth:`cancel` it.
+    """
+
+    def __init__(
+        self,
+        paths,
+        *,
+        api_key: str = "",
+        lora_root: str = "",
+        timeout: float = DEFAULT_TIMEOUT,
+        retries: int = DEFAULT_RETRIES,
+    ):
+        self.paths = [str(path) for path in paths]
+        self._api_key = api_key
+        self._lora_root = lora_root
+        self._timeout = timeout
+        self._retries = retries
+
+        self._lock = threading.Lock()
+        self._done = 0
+        self._current = ""
+        self._fetched = 0
+        self._missing = 0
+        self._failed = 0
+        self._media = 0
+        self._finished = not self.paths
+        self._cancelled = False
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> "BulkFetch":
+        self._thread = threading.Thread(target=self.run, name="lora-browser-fetch-all", daemon=True)
+        self._thread.start()
+        return self
+
+    def cancel(self) -> None:
+        """Ask the loop to stop after the LoRA it is on. A fetch in flight is
+        allowed to finish so it never leaves a half-written folder."""
+        with self._lock:
+            self._cancelled = True
+
+    @property
+    def running(self) -> bool:
+        with self._lock:
+            return not self._finished
+
+    def run(self) -> None:
+        try:
+            for path in self.paths:
+                with self._lock:
+                    if self._cancelled:
+                        break
+                    self._current = os.path.basename(path)
+
+                try:
+                    report = fetch_sidecar(
+                        path,
+                        api_key=self._api_key,
+                        timeout=self._timeout,
+                        retries=self._retries,
+                        lora_root=self._lora_root,
+                    )
+                except Exception as error:  # one bad LoRA must not end the run
+                    print(f"[LoRA Browser] fetch all: {os.path.basename(path)}: {error}")
+                    report = FetchReport(message=str(error))
+
+                with self._lock:
+                    self._done += 1
+                    if report.ok:
+                        self._fetched += 1
+                        self._media += report.downloaded
+                    elif report.not_found:
+                        self._missing += 1
+                    else:
+                        self._failed += 1
+        finally:
+            with self._lock:
+                self._finished = True
+                self._current = ""
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "total": len(self.paths),
+                "done": self._done,
+                "current": self._current,
+                "fetched": self._fetched,
+                "missing": self._missing,
+                "failed": self._failed,
+                "media": self._media,
+                "finished": self._finished,
+                "cancelled": self._cancelled,
+            }
+
+    def summary(self) -> str:
+        state = self.status()
+        parts = [f"Fetched {state['fetched']} of {state['total']} LoRA(s)"]
+        if state["media"]:
+            parts.append(f"{state['media']} media file(s)")
+        if state["missing"]:
+            parts.append(f"{state['missing']} not on Civitai")
+        if state["failed"]:
+            parts.append(f"{state['failed']} failed")
+        if state["cancelled"]:
+            parts.append("stopped early")
+        return " - ".join(parts) + "."
 
 
 def _describe(report: FetchReport, promoted: list[str]) -> str:

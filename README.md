@@ -175,6 +175,15 @@ Re-fetching is additive: media already on disk is never downloaded again, while
 the JSON and summary documents are rebuilt, which is how an older or hand-made
 sidecar is brought into the shape the panel reads.
 
+**Fetch all missing info** — the last item in the *Manage profiles* (`⋯`) menu —
+does the same for every LoRA the current model offers that has no catalogue yet.
+A LoRA counts as missing when it has no sidecar folder, no `summary.txt`, or no
+media; anything complete is skipped, so an already-enriched library is not
+re-hashed. The run happens in the background with progress on the status line,
+and the same menu item becomes *Stop fetching* while it is going. LoRAs Civitai
+does not have are reported as such and, since nothing on disk marks them, are
+looked up again on the next run.
+
 Two things are worth knowing. Only prompts the uploader actually published come
 down — many video LoRAs have none, and those media show without a caption. And
 media is only ever fetched from Civitai's own hosts, with the filename chosen
