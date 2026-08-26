@@ -55,6 +55,7 @@
     valueMin: -10,
     valueMax: 10,
     profiles: [],
+    profilesIncomplete: [],
     activeProfile: "",
     status: "",
     statusWarn: false,
@@ -1552,6 +1553,7 @@
     S.items = payload.items || [];
     S.rows = payload.active || [];
     S.profiles = payload.profiles || [];
+    S.profilesIncomplete = payload.profiles_incomplete || [];
     S.activeProfile = payload.active_profile || "";
     S.canRestore = !!payload.can_restore;
     S.signature = payload.signature || "";
@@ -1621,8 +1623,16 @@
     S.profiles.forEach(function (name) {
       var option = document.createElement("option");
       option.value = name;
-      // The default for this model is marked so the dropdown alone tells you.
-      option.textContent = name === S.defaultProfile ? name + "  \u2605" : name;
+      // The default for this model is marked so the dropdown alone tells you,
+      // and so is a profile this model cannot supply every LoRA for -- it can
+      // still be recalled, it just arrives short.
+      var label = name;
+      if (name === S.defaultProfile) { label += "  \u2605"; }
+      if (S.profilesIncomplete.indexOf(name) !== -1) {
+        label += "  \u26A0";
+        option.title = "Some LoRAs in this profile are not available here";
+      }
+      option.textContent = label;
       el.profiles.appendChild(option);
     });
     el.profiles.value = current;

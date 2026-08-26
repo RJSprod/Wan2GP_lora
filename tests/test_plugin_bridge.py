@@ -294,12 +294,44 @@ class TestProfiles:
         # External state diverged: the profile must no longer show as active.
         assert payload_of(plugin, state, ["a.safetensors"], "0.2;0.2")["active_profile"] == ""
 
-    def test_a_profile_from_another_model_is_not_applied(self, plugin, state):
+    def test_a_profile_from_another_model_is_applied_when_its_loras_exist(self, plugin, state):
+        """Sibling models (the LTX 2 family) share a LoRA folder -- never blocked."""
         act(plugin, {"type": "profile_save", "name": "Mine"}, state, ["a.safetensors"], "0.8;0.4")
         other = {"model_type": "wan22", "loras": list(LORAS)}
-        choices, _, payload = act(plugin, {"type": "profile_recall", "name": "Mine"}, other, [], "")
+        choices, mults, payload = act(plugin, {"type": "profile_recall", "name": "Mine"}, other, [], "")
+        assert choices["value"] == ["a.safetensors"]
+        assert mults["value"] == "0.8;0.4"
+        assert payload["status_warn"] is False
+
+    def test_a_profile_whose_loras_are_all_absent_is_refused(self, plugin, state):
+        act(plugin, {"type": "profile_save", "name": "Mine"}, state, ["a.safetensors"], "0.8;0.4")
+        bare = {"model_type": "wan22", "loras": ["other.safetensors"]}
+        choices, _, payload = act(plugin, {"type": "profile_recall", "name": "Mine"}, bare, [], "")
         assert "value" not in choices
         assert payload["status_warn"] is True
+        assert "was not applied" in payload["status"]
+
+    def test_a_partly_available_profile_applies_what_it_can(self, plugin, state):
+        act(
+            plugin, {"type": "profile_save", "name": "Mine"},
+            state, ["a.safetensors", "b.safetensors"], "0.8;0.4 0.5;0.5",
+        )
+        partial = {"model_type": "wan22", "loras": ["a.safetensors"]}
+        choices, mults, payload = act(plugin, {"type": "profile_recall", "name": "Mine"}, partial, [], "")
+        assert choices["value"] == ["a.safetensors"]
+        assert mults["value"] == "0.8;0.4"
+        assert payload["status_warn"] is True
+
+    def test_the_dropdown_flags_a_profile_this_model_cannot_fully_supply(self, plugin, state):
+        act(
+            plugin, {"type": "profile_save", "name": "Mine"},
+            state, ["a.safetensors", "b.safetensors"], "0.8;0.4 0.5;0.5",
+        )
+        partial = {"model_type": "wan22", "loras": ["a.safetensors"]}
+        payload = payload_of(plugin, partial, [], "")
+        assert payload["profiles"] == ["Mine"]
+        assert payload["profiles_incomplete"] == ["Mine"]
+        assert payload_of(plugin, state, [], "")["profiles_incomplete"] == []
 
     def test_recall_preserves_wangp_managed_loras(self, plugin, state):
         act(plugin, {"type": "profile_save", "name": "Mine"}, state, ["b.safetensors"], "0.5;0.5")

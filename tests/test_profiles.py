@@ -165,39 +165,59 @@ class TestProfileLifecycle:
         assert reloaded.get("Kept").loras[1].id == "sub/bar.safetensors"
 
 
-class TestModelScope:
-    def test_compatible_models(self, profiles):
+ALL_IDS = [entry.id for entry in STACK]
+
+
+class TestAvailability:
+    """The model a profile was saved under never blocks it; only its LoRAs do."""
+
+    def test_the_saving_model_is_kept_only_as_provenance(self, profiles):
+        saved = profiles.save("H3", "minimax_h3", STACK)
+        assert saved.model_key == "minimax_h3"
+        # Recorded, never consulted: availability alone decides.
+        assert profiles.partition(ALL_IDS) == (["H3"], [])
+
+    def test_a_profile_from_another_model_is_available_when_its_loras_are(self, profiles):
+        # A sibling model sharing the same LoRA folder sees the same files.
         profiles.save("H3", "minimax_h3", STACK)
-        assert profiles.is_compatible(profiles.get("H3"), "minimax_h3") is True
+        assert profiles.missing_ids(profiles.get("H3"), ALL_IDS) == []
 
-    def test_incompatible_model_is_flagged(self, profiles):
+    def test_absent_loras_are_reported(self, profiles):
         profiles.save("H3", "minimax_h3", STACK)
-        assert profiles.is_compatible(profiles.get("H3"), "wan22") is False
+        assert profiles.missing_ids(profiles.get("H3"), ["foo.safetensors"]) == [
+            "sub/bar.safetensors"
+        ]
 
-    def test_an_unscoped_profile_stays_usable(self, profiles):
-        profiles.save("Legacy", "", STACK)
-        assert profiles.is_compatible(profiles.get("Legacy"), "minimax_h3") is True
+    def test_fully_available_profiles_are_listed_first(self, profiles):
+        profiles.save("zzz complete", "wan22", STACK)
+        profiles.save("aaa partial", "minimax_h3", STACK + [ProfileEntry(id="ghost.safetensors")])
+        assert profiles.names(ALL_IDS) == ["zzz complete", "aaa partial"]
 
-    def test_compatible_profiles_are_listed_first(self, profiles):
-        profiles.save("zzz other", "wan22", STACK)
-        profiles.save("aaa mine", "minimax_h3", STACK)
-        assert profiles.names("minimax_h3")[0] == "aaa mine"
+    def test_partition_names_the_incomplete_profiles(self, profiles):
+        profiles.save("Complete", "wan22", STACK)
+        profiles.save("Partial", "wan22", [ProfileEntry(id="ghost.safetensors")])
+        assert profiles.partition(ALL_IDS) == (["Complete"], ["Partial"])
+
+    def test_an_unknown_inventory_calls_nothing_incomplete(self, profiles):
+        profiles.save("Whatever", "wan22", STACK)
+        assert profiles.partition() == (["Whatever"], [])
 
 
 class TestExactMatchDetection:
     def test_the_current_stack_matches_its_profile(self, profiles):
         profiles.save("Exact", "h3", STACK)
-        assert profiles.match("h3", STACK) == "Exact"
+        assert profiles.match(STACK) == "Exact"
 
     def test_a_changed_multiplier_no_longer_matches(self, profiles):
         profiles.save("Exact", "h3", STACK)
         diverged = [ProfileEntry(id=STACK[0].id, multiplier="0.4;1"), STACK[1]]
-        assert profiles.match("h3", diverged) == ""
+        assert profiles.match(diverged) == ""
 
     def test_order_matters_because_tokens_are_positional(self, profiles):
         profiles.save("Exact", "h3", STACK)
-        assert profiles.match("h3", list(reversed(STACK))) == ""
+        assert profiles.match(list(reversed(STACK))) == ""
 
-    def test_a_profile_for_another_model_never_matches(self, profiles):
+    def test_a_profile_saved_under_another_model_still_matches(self, profiles):
+        # The stack is on screen, so its LoRAs are available by definition.
         profiles.save("Other", "wan22", STACK)
-        assert profiles.match("minimax_h3", STACK) == ""
+        assert profiles.match(STACK) == "Other"

@@ -34,7 +34,9 @@ thumbnail browser and a real-time strength editor.
   gets a first-frame thumbnail; a play badge swaps in a muted, looping,
   on-demand player. Nothing is fetched until you click it.
 - **Stack profiles** — save, recall, update, rename, delete, and set a default
-  per model — plus favourites, tags and a persistent thumbnail zoom.
+  per model — plus favourites, tags and a persistent thumbnail zoom. A profile
+  is never locked to the model it was saved under: only the availability of its
+  LoRAs decides whether it can be recalled.
 - **Everything WanGP already does keeps working.** Presets, `.lset` files,
   accelerator profiles, settings recovered from generated images and videos,
   queue edits and model switches all flow into the panel automatically.
@@ -108,6 +110,20 @@ value and restores it when the mode comes back.
 WanGP manages H3's phase-two Turbo LoRA itself; the plugin does not compete with
 that. LoRAs WanGP places on the accelerator side of the multiplier string are
 marked as managed and are excluded from *Disable all* and from stack profiles.
+
+### Stack profiles across models
+
+A profile stores only the user side of the LoRA stack — ids and multiplier
+tokens — and the model it happened to be saved under is recorded as provenance,
+not as a restriction. Model families that share one LoRA folder (every LTX 2
+variant, for instance) see each other's LoRAs, so recalling a profile saved on
+one variant while another is loaded is expected to work.
+
+The only rule is availability. A profile whose LoRAs are all present is applied
+in full; one the current model can supply only in part is applied as far as it
+goes, with a warning naming what was skipped, and is flagged with a ⚠ in the
+dropdown; a profile with nothing available is refused. Profiles the current
+model can apply in full are listed first.
 
 ### Security notes
 
