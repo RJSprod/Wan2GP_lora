@@ -176,13 +176,21 @@ the JSON and summary documents are rebuilt, which is how an older or hand-made
 sidecar is brought into the shape the panel reads.
 
 **Fetch all missing info** — the last item in the *Manage profiles* (`⋯`) menu —
-does the same for every LoRA the current model offers that has no catalogue yet.
-A LoRA counts as missing when it has no sidecar folder, no `summary.txt`, or no
-media; anything complete is skipped, so an already-enriched library is not
-re-hashed. The run happens in the background with progress on the status line,
-and the same menu item becomes *Stop fetching* while it is going. LoRAs Civitai
-does not have are reported as such and, since nothing on disk marks them, are
-looked up again on the next run.
+does the same for every LoRA the current model offers whose catalogue is not
+complete. The run happens in the background with progress on the status line,
+and the same menu item becomes *Stop fetching* while it is going.
+
+Completeness is judged against the Civitai record already on disk, which lists
+the media entries a LoRA is supposed to have. A folder is incomplete when it is
+absent, or is missing its `summary.txt`, its records, its trigger words, any
+media file, or any of the `media/NNN.json` prompt records — so a catalogue built
+with the images but no prompts is repaired rather than passing as finished. The
+Inspect view names what a given LoRA still lacks. Anything genuinely complete is
+skipped, so an already-enriched library is not re-hashed.
+
+LoRAs Civitai has never heard of have no folder at all, so they are reported as
+not found and looked up again on the next run; nothing on disk separates them
+from a LoRA whose catalogue has yet to be built.
 
 Two things are worth knowing. Only prompts the uploader actually published come
 down — many video LoRAs have none, and those media show without a caption. And

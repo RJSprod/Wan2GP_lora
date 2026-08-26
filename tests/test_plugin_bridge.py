@@ -484,6 +484,23 @@ class TestFetchAll:
         started, _ = self._drain(plugin, state)
         assert started["total"] == len(LORAS) - 1
 
+    def test_a_catalogue_with_images_but_no_prompts_is_picked_up(
+        self, plugin, state, library, monkeypatch
+    ):
+        """Having pictures is not the same as being complete."""
+        monkeypatch.setattr(plugin_module.civitai, "urlopen", _FakeCivitai())
+        self._drain(plugin, state)
+        os.remove(library / "a" / "media" / "001.json")
+
+        started, done = self._drain(plugin, state)
+        assert started["total"] == 1
+        assert done["fetched"] == 1
+        assert (library / "a" / "media" / "001.json").exists()
+
+        payload = serve(plugin, {"kind": "inspect", "id": "a.safetensors"}, state)
+        assert payload["media"][0]["prompt"] == "a quiet street"
+        assert payload["missing"] == []
+
     def test_nothing_to_do_reports_instead_of_starting_a_run(
         self, plugin, state, library, monkeypatch
     ):

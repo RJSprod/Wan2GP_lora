@@ -1445,6 +1445,17 @@
      for any model family Civitai knows -- there is nothing model-specific to
      configure. It can take a while on a LoRA with ten videos, so the request
      gets its own generous timeout and the button reports progress in place. */
+  function fetchNote(detail) {
+    if (!detail.has_catalogue) { return "Looks this file up on Civitai by its checksum."; }
+    var missing = detail.missing || [];
+    if (missing.length) {
+      // A catalogue with pictures but no prompts still reads as finished
+      // otherwise, so name what is actually absent.
+      return "Missing: " + missing.join(", ") + ". Fetching adds it.";
+    }
+    return "This catalogue is complete. Fetching refreshes it.";
+  }
+
   function fetchSection(overlay, id, detail) {
     var section = document.createElement("div");
     section.className = "lb-modal-section lb-fetch";
@@ -1459,10 +1470,7 @@
 
     var note = document.createElement("div");
     note.className = "lb-fetch-note";
-    note.textContent = detail.note ||
-      (detail.has_catalogue
-        ? "Adds anything missing; media already on disk is kept."
-        : "Looks this file up on Civitai by its checksum.");
+    note.textContent = detail.note || fetchNote(detail);
     section.appendChild(note);
 
     button.addEventListener("click", function () {

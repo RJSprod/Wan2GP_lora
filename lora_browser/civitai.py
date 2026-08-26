@@ -613,26 +613,69 @@ def fetch_sidecar(
 # ------------------------------------------------------------- fetch all
 
 
-def needs_fetch(lora_path: str) -> bool:
-    """True when a LoRA has no catalogue worth keeping.
+def _has_media_record(media_dir: str, index: int) -> bool:
+    """A prompt sidecar that actually carries its Civitai entry.
 
-    Cheap on purpose -- a couple of stats and a listing -- because "Fetch all"
-    asks this about every LoRA the model offers before deciding what to work on.
-    A folder a fetch has completed for has both a ``summary.txt`` and at least
-    one media file; anything short of that counts as missing, and anything
-    complete is left alone so an already-enriched library is not re-hashed.
+    Present-but-empty counts as absent: a folder built by something that wrote
+    the files without the records is the case this exists to catch.
+    """
+    try:
+        with open(os.path.join(media_dir, f"{index:03d}.json"), "r", encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        return False
+    return isinstance(record, dict) and isinstance(record.get("civitai"), dict)
 
-    A LoRA Civitai genuinely has no media for keeps answering True, and so gets
-    looked up again on the next run.  That costs one hash and one request, and
-    is the honest answer: nothing on disk distinguishes it from a LoRA whose
-    media has yet to be downloaded.
+
+def missing_parts(lora_path: str) -> list[str]:
+    """Which pieces of a LoRA's catalogue are absent; empty when it is complete.
+
+    Answered entirely from disk, because "Fetch all" asks it about every LoRA
+    the model offers before deciding what to work on.
+
+    The local Civitai record is the yardstick: it lists the media entries this
+    LoRA is supposed to have, so a folder holding the images but no prompt
+    sidecars -- the usual shape of a half-built or hand-made catalogue -- is
+    reported incomplete instead of passing as finished.  It also means a LoRA
+    Civitai has no media for is complete once fetched, rather than looking
+    perpetually empty.
+
+    A LoRA Civitai has never heard of has no folder at all, so it does keep
+    answering "catalogue" and gets looked up again on the next run.  That costs
+    one hash and one request; nothing on disk separates it from a LoRA whose
+    catalogue has yet to be built, and a marker saying otherwise would go stale
+    the day someone uploads it.
     """
     directory = cat.sidecar_dir(lora_path)
     if directory is None:
-        return True
+        return ["catalogue"]
+
+    stem = os.path.splitext(os.path.basename(lora_path))[0]
+    missing: list[str] = []
     if not os.path.isfile(os.path.join(directory, cat.SUMMARY_FILENAME)):
-        return True
-    return not cat.has_media(directory)
+        missing.append("summary")
+
+    version, _model, _combined = cat.load_records(directory, stem)
+    if not version:
+        # Nothing to check the rest against, and the record is itself what the
+        # Inspect view reads.
+        return missing + ["records"]
+
+    if trained_words(version) and not os.path.isfile(os.path.join(directory, f"{stem}.txt")):
+        missing.append("trigger words")
+
+    media_dir = os.path.join(directory, cat.MEDIA_DIRNAME)
+    expected = range(1, len(media_entries(version)) + 1)
+    if any(not existing_media(media_dir, index) for index in expected):
+        missing.append("media")
+    if any(not _has_media_record(media_dir, index) for index in expected):
+        missing.append("prompts")
+    return missing
+
+
+def needs_fetch(lora_path: str) -> bool:
+    """True when anything in a LoRA's catalogue is missing."""
+    return bool(missing_parts(lora_path))
 
 
 class BulkFetch:

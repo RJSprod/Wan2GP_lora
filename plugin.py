@@ -796,6 +796,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             "civitai_url": detail.civitai_url,
             "sha256": detail.sha256,
             "has_catalogue": cat.sidecar_dir(entry.path) is not None,
+            # Named so the view can say what an existing catalogue still lacks
+            # rather than looking finished because it has pictures.
+            "missing": civitai.missing_parts(entry.path),
             "note": detail.error,
             # Paths stay server-side; the browser asks for media by index.
             "media": [

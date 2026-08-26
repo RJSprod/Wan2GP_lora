@@ -248,27 +248,112 @@ class TestFetch:
         assert "not on disk" in report.message
 
 
-class TestNeedsFetch:
-    """What "Fetch all" counts as missing."""
+class TestMissingParts:
+    """What counts as missing, judged against the record already on disk."""
 
-    def test_a_lora_with_no_folder_needs_one(self, lora):
-        assert civitai.needs_fetch(str(lora)) is True
+    def test_a_lora_with_no_folder_needs_everything(self, lora):
+        assert civitai.missing_parts(str(lora)) == ["catalogue"]
 
-    def test_a_freshly_fetched_lora_does_not(self, lora, civitai_api):
+    def test_a_freshly_fetched_lora_is_complete(self, lora, civitai_api):
         civitai.fetch_sidecar(str(lora))
+        assert civitai.missing_parts(str(lora)) == []
         assert civitai.needs_fetch(str(lora)) is False
 
-    def test_a_folder_without_a_summary_needs_one(self, lora, civitai_api):
+    def test_a_folder_without_a_summary(self, lora, civitai_api):
         civitai.fetch_sidecar(str(lora))
         os.remove(lora.parent / lora.stem / "summary.txt")
-        assert civitai.needs_fetch(str(lora)) is True
+        assert civitai.missing_parts(str(lora)) == ["summary"]
 
-    def test_a_catalogue_with_no_media_needs_one(self, lora, civitai_api):
+    def test_media_present_but_prompts_missing(self, lora, civitai_api):
+        """The reported case: images on disk, structure built without prompts."""
         civitai.fetch_sidecar(str(lora))
         media_dir = lora.parent / lora.stem / "media"
-        for name in os.listdir(media_dir):
+        for name in ("001.json", "002.json"):
             os.remove(media_dir / name)
+
+        assert civitai.missing_parts(str(lora)) == ["prompts"]
         assert civitai.needs_fetch(str(lora)) is True
+
+    def test_a_prompt_sidecar_without_its_record_counts_as_missing(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        (lora.parent / lora.stem / "media" / "001.json").write_text(
+            json.dumps({"index": 1, "source_url": "https://image.civitai.com/x"}),
+            encoding="utf-8",
+        )
+        assert civitai.missing_parts(str(lora)) == ["prompts"]
+
+    def test_an_unreadable_prompt_sidecar_counts_as_missing(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        (lora.parent / lora.stem / "media" / "002.json").write_text("{ broken", encoding="utf-8")
+        assert civitai.missing_parts(str(lora)) == ["prompts"]
+
+    def test_one_absent_media_file_out_of_several(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        os.remove(lora.parent / lora.stem / "media" / "002.jpeg")
+        assert civitai.missing_parts(str(lora)) == ["media"]
+
+    def test_a_folder_with_no_record_at_all(self, lora):
+        side = lora.parent / lora.stem
+        (side / "media").mkdir(parents=True)
+        (side / "media" / "001.jpg").write_bytes(b"\xff\xd8\xff")
+        assert civitai.missing_parts(str(lora)) == ["summary", "records"]
+
+    def test_a_missing_trigger_words_file(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        os.remove(lora.parent / lora.stem / f"{lora.stem}.txt")
+        assert civitai.missing_parts(str(lora)) == ["trigger words"]
+
+    def test_a_lora_civitai_has_no_media_for_is_complete_once_fetched(
+        self, lora, monkeypatch
+    ):
+        """Otherwise it would be re-hashed by every single Fetch all."""
+        monkeypatch.setattr(civitai, "urlopen", FakeCivitai(version=dict(VERSION, images=[])))
+        civitai.fetch_sidecar(str(lora))
+        assert civitai.missing_parts(str(lora)) == []
+
+    def test_everything_at_once_is_reported_together(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        side = lora.parent / lora.stem
+        os.remove(side / "summary.txt")
+        os.remove(side / f"{lora.stem}.txt")
+        for name in os.listdir(side / "media"):
+            os.remove(side / "media" / name)
+        assert civitai.missing_parts(str(lora)) == [
+            "summary", "trigger words", "media", "prompts",
+        ]
+
+
+class TestToppingUpAnIncompleteCatalogue:
+    """A fetch over an existing folder must repair it, not just skip it."""
+
+    def test_prompts_are_rewritten_for_media_already_on_disk(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        media_dir = lora.parent / lora.stem / "media"
+        for name in ("001.json", "002.json"):
+            os.remove(media_dir / name)
+
+        civitai_api.urls.clear()
+        report = civitai.fetch_sidecar(str(lora))
+
+        assert report.ok is True
+        assert report.downloaded == 0          # the images were already there
+        assert report.skipped == 2
+        assert not [url for url in civitai_api.urls if "image.civitai.com" in url]
+
+        detail = cat.read_detail(str(lora))
+        assert detail.media[0].prompt == "a quiet street at night"
+        assert detail.media[1].negative_prompt == "blurry"
+        assert civitai.missing_parts(str(lora)) == []
+
+    def test_a_thinner_older_prompt_record_is_replaced(self, lora, civitai_api):
+        civitai.fetch_sidecar(str(lora))
+        (lora.parent / lora.stem / "media" / "001.json").write_text(
+            json.dumps({"index": 1, "civitai": {"type": "video"}}), encoding="utf-8"
+        )
+        assert cat.read_detail(str(lora)).media[0].prompt == ""
+
+        civitai.fetch_sidecar(str(lora))
+        assert cat.read_detail(str(lora)).media[0].prompt == "a quiet street at night"
 
 
 class TestBulkFetch:
