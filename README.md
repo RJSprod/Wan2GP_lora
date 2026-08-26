@@ -30,6 +30,9 @@ thumbnail browser and a real-time strength editor.
   near-full-screen view of that LoRA's catalogue: description, trigger words,
   and every downloaded image and video with the prompt that produced it —
   all copyable.
+- **Fetch from Civitai** inside Inspect builds that catalogue on demand for any
+  LoRA that has none, for every model family, identifying the file by its own
+  checksum.
 - **Video previews play in place.** A LoRA whose only preview is a video still
   gets a first-frame thumbnail; a play badge swaps in a muted, looping,
   on-demand player. Nothing is fetched until you click it.
@@ -136,8 +139,8 @@ model can apply in full are listed first.
 
 ## The Civitai catalogue
 
-Several features read the sidecar folders written by a Civitai enrichment script
-(`process_minimaxH3_lora.py`) that lives alongside your LoRAs:
+Civitai names, trigger words and the Inspect view all come from a sidecar folder
+named after the LoRA:
 
 ```
 <lora dir>/
@@ -146,16 +149,49 @@ Several features read the sidecar folders written by a Civitai enrichment script
   cool_lora/                  sidecar, named after the file stem
     summary.txt               name, creator, trigger words  (the search index)
     cool_lora.json            combined Civitai record       (the Inspect view)
+    modelVersion.json         raw version record
+    model.json                raw model record
+    cool_lora.txt             trigger words, one per line
     media/001.jpg 001.json    downloaded media + prompt metadata
 ```
 
 Indexing reads only `summary.txt` — a few hundred bytes — so a large library
-stays fast; the full record is parsed only when you open Inspect. LoRAs without
-a sidecar work exactly as before, just without Civitai names or Inspect.
+stays fast; the full record is parsed only when you open Inspect. Reading is
+forgiving about which of those files exist: a folder holding only the combined
+JSON, or only loose images, still fills the panel rather than going blank.
+
+### Fetching a catalogue
+
+Open Inspect on any LoRA and press **Fetch info from Civitai**. The plugin
+hashes the `.safetensors`, looks that exact file up on Civitai, and writes the
+folder above: records, trigger words, summary, every preview image and video,
+and the prompt metadata Civitai holds for each one. If there is no host preview
+yet, the first image and video are copied out beside the LoRA so the tile gets a
+thumbnail.
+
+Identification is by checksum alone, so this works for every family WanGP can
+load — MiniMax H3, the LTX 2 line, Wan — with nothing to configure per model.
+Re-fetching is additive: media already on disk is never downloaded again, while
+the JSON and summary documents are rebuilt, which is how an older or hand-made
+sidecar is brought into the shape the panel reads.
+
+Two things are worth knowing. Only prompts the uploader actually published come
+down — many video LoRAs have none, and those media show without a caption. And
+media is only ever fetched from Civitai's own hosts, with the filename chosen
+here rather than taken from the URL.
+
+### Civitai API key
+
+Public models need no key. For anything that does, either export
+`CIVITAI_API_KEY` before starting WanGP (preferred — it is never written to
+disk) or set one through *Manage profiles* (`⋯`) → *Set Civitai API key*, which
+stores it in the plugin's settings file **in plain text**. The environment
+variable always wins.
 
 ## Preferences
 
-Favourites, tags, zoom and stack profiles are stored in
+Favourites, tags, zoom, stack profiles and any Civitai API key you set are
+stored in
 `wan2gp_lora_browser.json` next to WanGP's own config file (falling back to a
 `data/` folder inside the plugin if that location cannot be discovered). Writes
 are atomic, and a corrupt file is backed up rather than crashing WanGP.
@@ -179,7 +215,8 @@ lora_browser/
   ui_payloads.py           state model, phase resolution, action application
   inventory.py             native LoRA list -> displayable entries
   thumbnails.py            preview matching, first-frame decode, cache
-  catalogue.py             read the Civitai sidecar folders
+  catalogue.py             read the Civitai sidecar folder
+  civitai.py               fetch and build that folder on demand
   metadata_store.py        favourites, tags, zoom, sort (atomic JSON)
   profile_store.py         stack profiles
 assets/                    panel CSS and JavaScript

@@ -26,6 +26,7 @@ import gradio as gr
 from shared.utils.plugins import WAN2GPPlugin
 
 from .lora_browser import catalogue as cat
+from .lora_browser import civitai
 from .lora_browser import ui_payloads as up
 from .lora_browser.inventory import build_inventory, diff_ids
 from .lora_browser.metadata_store import MetadataStore, resolve_store_path
@@ -453,6 +454,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 "profiles_incomplete": incomplete,
                 "active_profile": self._profiles.match(entries) if self._profiles else "",
                 "default_profile": self._metadata.default_profile(model_type) if self._metadata else "",
+                "civitai_key_set": bool(self._civitai_key()),
                 "zoom_px": self._metadata.zoom_px if self._metadata else 104,
                 "sort_mode": self._metadata.sort_mode if self._metadata else "name",
                 "name_mode": self._metadata.name_mode if self._metadata else "civitai",
@@ -575,6 +577,17 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         if kind == "name_mode":
             if self._metadata:
                 self._metadata.set_name_mode(action.get("value"))
+            return False
+
+        if kind == "civitai_key":
+            if self._metadata:
+                if os.environ.get("CIVITAI_API_KEY", "").strip():
+                    instance.note(
+                        "CIVITAI_API_KEY is set in the environment and takes precedence.", True
+                    )
+                    return False
+                stored = self._metadata.set_civitai_api_key(action.get("value"))
+                instance.note("Civitai API key saved." if stored else "Civitai API key cleared.")
             return False
 
         if kind == "disable_all":
@@ -739,6 +752,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         try:
             if kind == "inspect":
                 return self._serve_inspect(instance, request, state_value)
+            if kind == "fetch":
+                return self._serve_fetch(instance, request, state_value)
             if kind == "media":
                 return self._serve_catalogue_media(instance, request, state_value)
             if kind == "video":
@@ -755,13 +770,15 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         inventory = build_inventory(self._native_loras(state_value, []), lora_dir)
         return inventory.get(normalize_id(lora_id)), lora_dir
 
-    def _serve_inspect(self, instance, request, state_value) -> str:
-        entry, lora_dir = self._entry_for(state_value, request.get("id"))
-        if entry is None or not entry.path:
-            return json.dumps({"kind": "inspect", "error": "That LoRA is not in the current inventory."})
+    def _inspect_payload(self, entry) -> dict:
+        """What the Inspect view renders for one LoRA.
 
+        A LoRA with no catalogue at all still gets a payload rather than a bare
+        error: the view is also where the catalogue is fetched from, so it has
+        to be openable before there is anything to show.
+        """
         detail = cat.read_detail(entry.path)
-        return json.dumps({
+        return {
             "kind": "inspect",
             "id": entry.id,
             "name": entry.name,
@@ -774,7 +791,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             "trained_words": detail.trained_words,
             "civitai_url": detail.civitai_url,
             "sha256": detail.sha256,
-            "error": detail.error,
+            "has_catalogue": cat.sidecar_dir(entry.path) is not None,
+            "note": detail.error,
             # Paths stay server-side; the browser asks for media by index.
             "media": [
                 {
@@ -787,7 +805,50 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 }
                 for item in detail.media
             ],
+        }
+
+    def _serve_inspect(self, instance, request, state_value) -> str:
+        entry, lora_dir = self._entry_for(state_value, request.get("id"))
+        if entry is None or not entry.path:
+            return json.dumps({"kind": "inspect", "error": "That LoRA is not in the current inventory."})
+        return json.dumps(self._inspect_payload(entry))
+
+    def _civitai_key(self) -> str:
+        """The environment wins: a key exported for the session is never
+        written into the plugin's own JSON."""
+        from_env = str(os.environ.get("CIVITAI_API_KEY", "") or "").strip()
+        if from_env:
+            return from_env
+        return self._metadata.civitai_api_key if self._metadata else ""
+
+    def _serve_fetch(self, instance, request, state_value) -> str:
+        """Build or top up the Civitai catalogue folder for one LoRA.
+
+        Deliberately synchronous: it runs on an explicit click, the frontend
+        shows it as in flight, and a background job would need progress
+        plumbing that a one-LoRA fetch does not earn.
+        """
+        entry, lora_dir = self._entry_for(state_value, request.get("id"))
+        if entry is None or not entry.path:
+            return json.dumps({"kind": "fetch", "error": "That LoRA is not in the current inventory."})
+
+        report = civitai.fetch_sidecar(
+            entry.path, api_key=self._civitai_key(), lora_root=lora_dir
+        )
+        # The index is cached against the sidecar folder's mtime; a fetch that
+        # only rewrote documents inside it must not read as unchanged.
+        instance.catalogue_cache.pop(entry.id, None)
+
+        payload = self._inspect_payload(entry) if report.ok else {}
+        payload.update({
+            "kind": "fetch",
+            "id": entry.id,
+            "ok": report.ok,
+            "message": report.message,
+            "downloaded": report.downloaded,
         })
+        instance.note(report.message, not report.ok)
+        return json.dumps(payload)
 
     def _serve_catalogue_media(self, instance, request, state_value) -> str:
         entry, _ = self._entry_for(state_value, request.get("id"))

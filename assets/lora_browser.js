@@ -56,6 +56,7 @@
     valueMax: 10,
     profiles: [],
     profilesIncomplete: [],
+    civitaiKeySet: false,
     activeProfile: "",
     status: "",
     statusWarn: false,
@@ -452,6 +453,19 @@
       { label: "Delete", disabled: !selected, run: function () {
           if (!window.confirm("Delete profile '" + selected + "'?")) { return; }
           send({ type: "profile_delete", name: selected });
+        } },
+      { separator: true },
+      { label: S.civitaiKeySet ? "Civitai API key (set)..." : "Set Civitai API key...",
+        run: function () {
+          var key = window.prompt(
+            "Civitai API key, used when fetching LoRA info.\n" +
+            "Leave empty to clear it. Public models do not need one.\n" +
+            "It is stored in the plugin's settings file in plain text; " +
+            "export CIVITAI_API_KEY instead to keep it out of that file.",
+            ""
+          );
+          if (key === null) { return; }
+          send({ type: "civitai_key", value: key });
         } }
     ];
   }
@@ -506,7 +520,8 @@
   function tileMenuItems(id) {
     var item = S.byId[id] || {};
     return [
-      { label: "Inspect", disabled: !item.has_catalogue,
+      // Never disabled: with no catalogue yet, Inspect is where you fetch one.
+      { label: item.has_catalogue ? "Inspect" : "Inspect / fetch info...",
         run: function () { openInspect(id); } },
       { separator: true },
       { label: item.favorite ? "Unfavorite" : "Favorite", run: function () { send({ type: "favorite", id: id, value: !item.favorite }); } },
@@ -853,8 +868,8 @@
   /* One hidden bridge serves thumbnails, catalogue detail and media bytes, so
      requests are queued and answered strictly in order. A dropped reply must
      not wedge the queue, hence the timeout. */
-  function requestMedia(request, callback) {
-    S.mediaQueue.push({ request: request, callback: callback });
+  function requestMedia(request, callback, timeoutMs) {
+    S.mediaQueue.push({ request: request, callback: callback, timeout: timeoutMs || 30000 });
     pumpMedia();
   }
 
@@ -867,7 +882,7 @@
       return;
     }
     clickHidden(IDS.thumbBtn);
-    S.mediaTimer = setTimeout(function () { finishMedia(null); }, 30000);
+    S.mediaTimer = setTimeout(function () { finishMedia(null); }, job.timeout);
   }
 
   function finishMedia(response) {
@@ -972,9 +987,9 @@
     inspect.type = "button";
     inspect.className = "lb-btn lb-icon lb-inspect";
     inspect.textContent = "i";
-    inspect.title = "Inspect " + (row.civitai_name || row.name);
+    inspect.title = (row.has_catalogue ? "Inspect " : "Inspect / fetch info for ")
+      + (row.civitai_name || row.name);
     inspect.setAttribute("aria-label", inspect.title);
-    inspect.disabled = !row.has_catalogue;
     inspect.addEventListener("click", function () { openInspect(row.id); });
     node.appendChild(inspect);
 
@@ -1321,17 +1336,21 @@
     var side = overlay.querySelector('[data-lb="side"]');
     var media = overlay.querySelector('[data-lb="media"]');
 
+    side.innerHTML = "";
+    media.innerHTML = "";
+
+    // A hard error means the LoRA itself could not be resolved, so there is
+    // nothing to fetch for either.
     if (!detail || detail.error) {
       title.textContent = (S.byId[id] || {}).name || id;
-      side.textContent = (detail && detail.error) ||
-        "No catalogue data was found for this LoRA.";
+      side.textContent = (detail && detail.error) || "This LoRA could not be read.";
       return;
     }
 
     title.textContent = detail.civitai_name || detail.name || id;
 
-    side.innerHTML = "";
     side.appendChild(inspectFacts(detail));
+    side.appendChild(fetchSection(overlay, id, detail));
     if ((detail.trained_words || []).length) {
       side.appendChild(inspectWords(detail.trained_words));
     }
@@ -1342,17 +1361,79 @@
       side.appendChild(inspectBlock("Version notes", detail.version_description));
     }
 
-    media.innerHTML = "";
     if (!(detail.media || []).length) {
       var empty = document.createElement("div");
       empty.className = "lb-empty";
-      empty.textContent = "No media was downloaded for this LoRA.";
+      empty.textContent = detail.has_catalogue
+        ? "No media has been downloaded for this LoRA."
+        : "No catalogue folder yet. Fetch from Civitai to build one.";
       media.appendChild(empty);
       return;
     }
     detail.media.forEach(function (item) {
       media.appendChild(inspectMediaCard(id, item));
     });
+  }
+
+  /* Fetching identifies the LoRA by the SHA-256 of the file itself, so it works
+     for any model family Civitai knows -- there is nothing model-specific to
+     configure. It can take a while on a LoRA with ten videos, so the request
+     gets its own generous timeout and the button reports progress in place. */
+  function fetchSection(overlay, id, detail) {
+    var section = document.createElement("div");
+    section.className = "lb-modal-section lb-fetch";
+
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "lb-btn lb-fetch-btn";
+    button.textContent = detail.has_catalogue
+      ? "Update from Civitai"
+      : "Fetch info from Civitai";
+    section.appendChild(button);
+
+    var note = document.createElement("div");
+    note.className = "lb-fetch-note";
+    note.textContent = detail.note ||
+      (detail.has_catalogue
+        ? "Adds anything missing; media already on disk is kept."
+        : "Looks this file up on Civitai by its checksum.");
+    section.appendChild(note);
+
+    button.addEventListener("click", function () {
+      if (button.disabled) { return; }
+      button.disabled = true;
+      button.textContent = "Fetching from Civitai...";
+      note.textContent = "This can take a while for a LoRA with several videos.";
+
+      requestMedia({ kind: "fetch", id: id }, function (response) {
+        if (S.modal !== overlay) { return; }
+        if (!response) {
+          button.disabled = false;
+          button.textContent = "Fetch info from Civitai";
+          note.textContent = "The fetch did not finish in time. It may still be running.";
+          return;
+        }
+        if (!response.ok) {
+          button.disabled = false;
+          button.textContent = "Try again";
+          note.textContent = response.message || response.error || "The fetch failed.";
+          return;
+        }
+        // A new preview and a new Civitai name only reach the grid on the next
+        // payload, and the thumbnail for this tile was cached as "none".
+        delete S.thumbs[id];
+        delete S.requested[id];
+        send({ type: "ready" });
+        // Carry the outcome into the rebuilt panel; the note line is the only
+        // place it would otherwise be visible.
+        response.note = response.message || "";
+        renderInspect(overlay, id, response);
+        // Ten minutes: a LoRA with ten videos is a real download. The bridge is
+        // serialised, so nothing else is answered until this returns.
+      }, 600000);
+    });
+
+    return section;
   }
 
   function inspectFacts(detail) {
@@ -1563,6 +1644,7 @@
     S.valueMin = payload.value_min !== undefined ? payload.value_min : -10;
     S.valueMax = payload.value_max !== undefined ? payload.value_max : 10;
     S.defaultProfile = payload.default_profile || "";
+    S.civitaiKeySet = !!payload.civitai_key_set;
     if (payload.sort_mode) { S.sortMode = payload.sort_mode; }
     if (payload.name_mode) { S.nameMode = payload.name_mode; }
 

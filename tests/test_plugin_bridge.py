@@ -114,6 +114,48 @@ def act(plugin, action, state, selected, multipliers, guidance=2):
     return choices, mults, json.loads(payload)
 
 
+class _FakeCivitai:
+    """Stands in for urlopen inside lora_browser.civitai."""
+
+    VERSION = {
+        "id": 9001, "modelId": 4242, "name": "v1", "baseModel": "LTXV 2.3",
+        "trainedWords": ["trigger"],
+        "images": [{
+            "url": "https://image.civitai.com/x/1.jpeg", "type": "image",
+            "meta": {"prompt": "a quiet street"},
+        }],
+    }
+    MODEL = {"id": 4242, "name": "Live Wallpaper Style", "creator": {"username": "NRDX"}}
+
+    class _Response:
+        def __init__(self, body, content_type):
+            self._body = body
+            self.headers = {"Content-Type": content_type}
+
+        def read(self, amount=None):
+            body, self._body = self._body, b""
+            return body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def __call__(self, request, timeout=None):
+        url = request.full_url
+        if "by-hash" in url:
+            return self._Response(json.dumps(self.VERSION).encode(), "application/json")
+        if "/models/" in url:
+            return self._Response(json.dumps(self.MODEL).encode(), "application/json")
+        return self._Response(b"\xff\xd8\xff", "image/jpeg")
+
+
+def serve(plugin, request, state, state_value=None):
+    instance = plugin._instance("test")
+    return json.loads(plugin._serve_media(instance, json.dumps(request), state))
+
+
 class TestSetup:
     def test_requests_the_components_it_bridges(self):
         instance = plugin_module.LoraBrowserPlugin()
@@ -345,6 +387,83 @@ class TestProfiles:
         _, _, payload = act(plugin, {"type": "profile_save", "name": "Empty"}, state, [], "")
         assert payload["status_warn"] is True
         assert payload["profiles"] == []
+
+
+class TestCivitaiFetch:
+    """The Inspect view can build a catalogue for a LoRA that has none."""
+
+    @pytest.fixture
+    def on_disk(self, tmp_path):
+        """Make a.safetensors a real file so it can be hashed and enriched."""
+        root = tmp_path / "loras"
+        root.mkdir(exist_ok=True)
+        (root / "a.safetensors").write_bytes(b"pretend weights")
+        return root
+
+    def test_inspect_opens_for_a_lora_with_no_catalogue(self, plugin, state, on_disk):
+        payload = serve(plugin, {"kind": "inspect", "id": "a.safetensors"}, state)
+        assert payload["has_catalogue"] is False
+        assert payload["note"]              # explains there is nothing yet
+        assert "error" not in payload       # so the fetch button still renders
+
+    def test_a_fetch_builds_the_catalogue_and_returns_the_fresh_view(
+        self, plugin, state, on_disk, monkeypatch
+    ):
+        monkeypatch.setattr(plugin_module.civitai, "urlopen", _FakeCivitai())
+        payload = serve(plugin, {"kind": "fetch", "id": "a.safetensors"}, state)
+
+        assert payload["ok"] is True
+        assert payload["has_catalogue"] is True
+        assert payload["civitai_name"] == "Live Wallpaper Style"
+        assert [item["prompt"] for item in payload["media"]] == ["a quiet street"]
+        assert (on_disk / "a" / "summary.txt").exists()
+
+    def test_the_index_cache_does_not_hide_a_fresh_fetch(
+        self, plugin, state, on_disk, monkeypatch
+    ):
+        assert payload_of(plugin, state, [], "")["items"][0]["has_catalogue"] is False
+        monkeypatch.setattr(plugin_module.civitai, "urlopen", _FakeCivitai())
+        serve(plugin, {"kind": "fetch", "id": "a.safetensors"}, state)
+        item = payload_of(plugin, state, [], "")["items"][0]
+        assert item["has_catalogue"] is True
+        assert item["civitai_name"] == "Live Wallpaper Style"
+
+    def test_a_lora_wangp_does_not_offer_cannot_be_fetched(self, plugin, state, on_disk):
+        payload = serve(plugin, {"kind": "fetch", "id": "../secrets.safetensors"}, state)
+        assert payload["error"]
+
+    def test_a_failed_fetch_reports_without_claiming_success(
+        self, plugin, state, on_disk, monkeypatch
+    ):
+        def offline(*args, **kwargs):
+            raise OSError("no route to host")
+
+        monkeypatch.setattr(plugin_module.civitai, "urlopen", offline)
+        payload = serve(plugin, {"kind": "fetch", "id": "a.safetensors"}, state)
+        assert payload["ok"] is False
+        assert payload["message"]
+
+
+class TestCivitaiKey:
+    def test_a_stored_key_is_reported_but_never_sent_to_the_browser(self, plugin, state):
+        act(plugin, {"type": "civitai_key", "value": "secret-key"}, state, [], "")
+        payload = payload_of(plugin, state, [], "")
+        assert payload["civitai_key_set"] is True
+        assert "secret-key" not in json.dumps(payload)
+
+    def test_clearing_the_key(self, plugin, state):
+        act(plugin, {"type": "civitai_key", "value": "secret-key"}, state, [], "")
+        act(plugin, {"type": "civitai_key", "value": ""}, state, [], "")
+        assert payload_of(plugin, state, [], "")["civitai_key_set"] is False
+
+    def test_the_environment_wins_and_is_not_written_to_the_store(
+        self, plugin, state, monkeypatch
+    ):
+        monkeypatch.setenv("CIVITAI_API_KEY", "from-env")
+        _, _, payload = act(plugin, {"type": "civitai_key", "value": "ignored"}, state, [], "")
+        assert payload["status_warn"] is True
+        assert plugin._metadata.civitai_api_key == ""
+        assert plugin._civitai_key() == "from-env"
 
 
 class TestMediaBridge:

@@ -1,7 +1,13 @@
 """Versioned, atomically-written plugin preferences.
 
-Holds only presentation metadata — favourites, tags, zoom, stack profiles.
-Nothing here influences generation; WanGP's own state remains canonical.
+Holds only presentation metadata — favourites, tags, zoom, stack profiles, and
+the optional Civitai API key used by catalogue fetches.  Nothing here influences
+generation; WanGP's own state remains canonical.
+
+The API key is stored as written, in the same plain JSON as everything else, so
+treat this file as a credential file if you set one.  ``CIVITAI_API_KEY`` in the
+environment is read first and never written here, which is the better option on
+a shared machine.
 
 The file is written next to WanGP's ``wgp_config.json`` when the plugin can
 discover that location, so plugin state is never committed into the plugin's
@@ -46,6 +52,7 @@ def default_document() -> dict[str, Any]:
         "tags": {},
         "profiles": {},
         "default_profiles": {},
+        "civitai_api_key": "",
     }
 
 
@@ -106,6 +113,7 @@ class MetadataStore:
         document["name_mode"] = self.sanitize_choice(
             payload.get("name_mode"), NAME_MODES, DEFAULT_NAME_MODE
         )
+        document["civitai_api_key"] = str(payload.get("civitai_api_key", "") or "").strip()
         document["schema_version"] = SCHEMA_VERSION
         return document
 
@@ -179,6 +187,18 @@ class MetadataStore:
             self.data["name_mode"] = mode
             self.save()
         return mode
+
+    @property
+    def civitai_api_key(self) -> str:
+        return str(self.data.get("civitai_api_key", "") or "")
+
+    def set_civitai_api_key(self, value: Any) -> str:
+        """Store (or clear) the key. Returns it so the caller can report state."""
+        text = str(value or "").strip()[:200]
+        if text != self.civitai_api_key:
+            self.data["civitai_api_key"] = text
+            self.save()
+        return text
 
     def default_profile(self, model_key: str) -> str:
         return str(self.data.get("default_profiles", {}).get(model_key or "default", "") or "")
