@@ -550,6 +550,18 @@
   min-height: 22px !important;
   padding: 1px 8px !important;
 }
+.lb-fetch {
+  padding: 8px 0;
+  border-top: 1px solid var(--border-color-primary);
+  border-bottom: 1px solid var(--border-color-primary);
+}
+.lb-fetch-btn { align-self: flex-start; }
+.lb-fetch-btn[disabled] { opacity: 0.7; cursor: progress; }
+.lb-fetch-note {
+  font-size: var(--text-xs, 11px);
+  line-height: 1.4;
+  color: var(--body-text-color-subdued, inherit);
+}
 .lb-media-card {
   margin: 0;
   display: flex;

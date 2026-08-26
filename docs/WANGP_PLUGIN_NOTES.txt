@@ -338,11 +338,13 @@ ALWAYS RUN THE NEGATIVE TEST
     ui_payloads.py           state model, phase resolution, action application
     inventory.py             native LoRA list -> displayable entries
     thumbnails.py            preview matching, first-frame decode, cache
-    metadata_store.py        favourites, tags, zoom (atomic JSON)
+    catalogue.py             read the Civitai sidecar folder (tolerant of gaps)
+    civitai.py               fetch/build that folder on demand (stdlib urllib)
+    metadata_store.py        favourites, tags, zoom, Civitai key (atomic JSON)
     profile_store.py         stack profiles
   assets/lora_browser.css    panel styling, from Gradio theme tokens
   assets/lora_browser.js     panel frontend (mount, render, bridges, diagnose)
-  tests/                     167 tests, no WanGP or GPU required
+  tests/                     no WanGP, GPU or network required
 
   Run:  pip install pytest Pillow  &&  python -m pytest
 

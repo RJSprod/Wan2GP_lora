@@ -1,6 +1,7 @@
-"""Read the Civitai sidecar folders produced by process_minimaxH3_lora.py.
+"""Read the Civitai sidecar folder that sits beside a LoRA.
 
-That script writes, next to each ``<stem>.safetensors``:
+:mod:`.civitai` writes it, and so do the standalone enrichment scripts, next to
+each ``<stem>.safetensors``:
 
     <stem>/
         <stem>.json                  combined {modelVersion, model, sha256, ...}
@@ -11,6 +12,13 @@ That script writes, next to each ``<stem>.safetensors``:
         media/
             001.jpg | 001.mp4        downloaded Civitai media
             001.json                 {index, source_url, civitai: {...}}
+
+Reading is deliberately forgiving about which of those files exist.  Sidecars
+in the wild are partial: one script version wrote no ``summary.txt``, a folder
+copied from elsewhere may hold only the combined JSON, and a folder built by
+hand may have media and nothing else.  Every fact is therefore looked up along
+a chain -- cheap file first, raw record last -- so a partial folder still fills
+the panel instead of leaving it blank.
 
 Two different read paths on purpose:
 
@@ -142,6 +150,47 @@ def _load_json(path: str) -> Any:
         return None
 
 
+def load_records(directory: str, stem: str) -> tuple[dict, dict, dict]:
+    """``(version, model, combined)`` from whichever documents the folder has.
+
+    The combined ``<stem>.json`` is what an enrichment run writes, but a sidecar
+    may carry only the raw halves -- or a combined file with no separate halves
+    -- so both layouts are read and whichever supplies a record wins.
+    """
+    combined = _load_json(os.path.join(directory, f"{stem}.json"))
+    if not isinstance(combined, dict):
+        combined = {}
+
+    version = combined.get("modelVersion")
+    if not isinstance(version, dict):
+        version = _load_json(os.path.join(directory, "modelVersion.json"))
+    model = combined.get("model")
+    if not isinstance(model, dict):
+        model = _load_json(os.path.join(directory, "model.json"))
+
+    return (
+        version if isinstance(version, dict) else {},
+        model if isinstance(model, dict) else {},
+        combined,
+    )
+
+
+def record_facts(version: dict, model: dict) -> dict[str, str]:
+    """The four labelled facts, read out of the raw Civitai records.
+
+    ``modelVersion`` embeds a small model stub, which is what keeps the model
+    name available when only the version record was ever saved.
+    """
+    creator = model.get("creator")
+    stub = version.get("model") if isinstance(version.get("model"), dict) else {}
+    return {
+        "civitai_name": str(model.get("name", "") or stub.get("name", "") or ""),
+        "version_name": str(version.get("name", "") or ""),
+        "creator": str(creator.get("username", "") or "") if isinstance(creator, dict) else "",
+        "base_model": str(version.get("baseModel", "") or ""),
+    }
+
+
 def parse_summary(text: str) -> tuple[dict[str, str], list[str]]:
     """Pull the labelled fields and the trained-word bullets out of summary.txt."""
     fields: dict[str, str] = {}
@@ -200,10 +249,17 @@ def read_index(lora_path: str) -> CatalogueIndex:
             words = []
 
     if not fields.get("civitai_name"):
-        # summary.txt missing or older format: pay for model.json just this once.
-        model = _load_json(os.path.join(directory, "model.json"))
-        if isinstance(model, dict):
-            fields["civitai_name"] = str(model.get("name", "") or "")
+        # No usable summary.txt: pay for the raw Civitai records just this once.
+        # The caller caches the result per sidecar mtime, and any fetch writes a
+        # summary.txt that puts later reads back on the cheap path.
+        version, model, _ = load_records(directory, stem)
+        for key, value in record_facts(version, model).items():
+            if value and not fields.get(key):
+                fields[key] = value
+        if not words:
+            words = [
+                str(word) for word in version.get("trainedWords", []) or [] if str(word).strip()
+            ]
 
     return CatalogueIndex(
         civitai_name=fields.get("civitai_name", ""),
@@ -247,37 +303,23 @@ def read_detail(lora_path: str) -> CatalogueDetail:
 
     stem = os.path.splitext(os.path.basename(lora_path))[0]
 
-    combined = _load_json(os.path.join(directory, f"{stem}.json"))
-    if isinstance(combined, dict):
-        version = combined.get("modelVersion") or {}
-        model = combined.get("model") or {}
-        sha256 = str(combined.get("sha256", "") or "")
-        detection = str(combined.get("minimaxH3Detection", "") or "")
-    else:
-        version = _load_json(os.path.join(directory, "modelVersion.json")) or {}
-        model = _load_json(os.path.join(directory, "model.json")) or {}
-        sha256 = ""
-        detection = ""
+    version, model, combined = load_records(directory, stem)
+    sha256 = str(combined.get("sha256", "") or "")
+    # Older sidecars named the detection after the one family their script
+    # handled; the plugin no longer cares which family it was.
+    detection = str(combined.get("detection", "") or combined.get("minimaxH3Detection", "") or "")
 
-    if not isinstance(version, dict):
-        version = {}
-    if not isinstance(model, dict):
-        model = {}
-
-    creator = ""
-    if isinstance(model.get("creator"), dict):
-        creator = str(model["creator"].get("username", "") or "")
-
+    facts = record_facts(version, model)
     words = [str(word) for word in version.get("trainedWords", []) or [] if str(word).strip()]
     index = read_index(lora_path)
     if not words:
         words = index.trained_words
 
     detail = CatalogueDetail(
-        civitai_name=str(model.get("name", "") or index.civitai_name),
-        version_name=str(version.get("name", "") or index.version_name),
-        creator=creator or index.creator,
-        base_model=str(version.get("baseModel", "") or index.base_model),
+        civitai_name=facts["civitai_name"] or index.civitai_name,
+        version_name=facts["version_name"] or index.version_name,
+        creator=facts["creator"] or index.creator,
+        base_model=facts["base_model"] or index.base_model,
         description=strip_html(model.get("description")),
         version_description=strip_html(version.get("description")),
         trained_words=words,
@@ -296,9 +338,31 @@ def read_detail(lora_path: str) -> CatalogueDetail:
     return detail
 
 
+def _loose_media(directory: str) -> dict[int, str]:
+    """Media dropped straight into the sidecar folder, numbered by filename.
+
+    A folder assembled by hand -- or one where only the promoted previews were
+    ever copied -- has no ``media/`` at all.  Showing those beats showing an
+    empty gallery; they simply arrive without a prompt, because the ``NNN.json``
+    records that carry prompts only exist under ``media/``.
+    """
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return {}
+
+    found: dict[int, str] = {}
+    for name in names:
+        path = os.path.join(directory, name)
+        extension = os.path.splitext(name)[1].lower()
+        if extension in IMAGE_EXTENSIONS + VIDEO_EXTENSIONS and os.path.isfile(path):
+            found[len(found) + 1] = path
+    return found
+
+
 def _read_media(directory: str) -> list[MediaItem]:
     media_dir = os.path.join(directory, MEDIA_DIRNAME)
-    files = _media_files(media_dir)
+    files = _media_files(media_dir) or _loose_media(directory)
     items: list[MediaItem] = []
 
     for index in sorted(files):

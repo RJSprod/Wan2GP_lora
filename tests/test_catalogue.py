@@ -1,4 +1,4 @@
-"""Reading the Civitai sidecar folders written by process_minimaxH3_lora.py."""
+"""Reading the Civitai sidecar folder beside a LoRA, complete or partial."""
 
 import json
 import os
@@ -113,12 +113,76 @@ class TestIndex:
         index = cat.read_index(str(library / "cool_lora.safetensors"))
         assert index.trained_words == ["c00lmotion", "dramatic zoom"]
 
-    def test_falls_back_to_model_json_when_summary_is_absent(self, library):
+    def test_falls_back_to_the_combined_json_when_summary_is_absent(self, library):
+        """The common shape of a hand-made or half-built sidecar."""
         os.remove(library / "cool_lora" / "summary.txt")
+        index = cat.read_index(str(library / "cool_lora.safetensors"))
+        assert index.civitai_name == "Cool Motion LoRA"
+        assert index.version_name == "v2 Final"
+        assert index.creator == "somebody"
+        assert index.base_model == "MiniMax H3"
+        assert index.trained_words == ["c00lmotion", "dramatic zoom"]
+
+    def test_falls_back_to_model_json_when_only_the_raw_halves_exist(self, library):
+        os.remove(library / "cool_lora" / "summary.txt")
+        os.remove(library / "cool_lora" / "cool_lora.json")
         (library / "cool_lora" / "model.json").write_text(
             json.dumps({"name": "From model.json"}), encoding="utf-8"
         )
         assert cat.read_index(str(library / "cool_lora.safetensors")).civitai_name == "From model.json"
+
+    def test_the_version_model_stub_names_a_lora_with_no_model_record(self, library):
+        os.remove(library / "cool_lora" / "summary.txt")
+        (library / "cool_lora" / "cool_lora.json").write_text(json.dumps({
+            "modelVersion": {"name": "v1", "model": {"name": "Stub Name"}},
+        }), encoding="utf-8")
+        assert cat.read_index(str(library / "cool_lora.safetensors")).civitai_name == "Stub Name"
+
+    def test_a_good_summary_is_not_paid_for_twice(self, library, monkeypatch):
+        """The cheap path must stay cheap: no record parsing when summary.txt answers."""
+        monkeypatch.setattr(cat, "load_records", _explode)
+        assert cat.read_index(str(library / "cool_lora.safetensors")).civitai_name == "Cool Motion LoRA"
+
+
+def _explode(*args, **kwargs):
+    raise AssertionError("the expensive record read should not have happened")
+
+
+class TestPartialSidecars:
+    """Folders in the wild are rarely complete; none of these may go blank."""
+
+    def test_detail_reads_a_sidecar_that_has_only_the_combined_json(self, library):
+        for name in ("summary.txt", "cool_lora.txt"):
+            os.remove(library / "cool_lora" / name)
+        detail = cat.read_detail(str(library / "cool_lora.safetensors"))
+        assert detail.civitai_name == "Cool Motion LoRA"
+        assert detail.base_model == "MiniMax H3"
+        assert detail.trained_words == ["c00lmotion", "dramatic zoom"]
+        assert [item.index for item in detail.media] == [1, 2]
+
+    def test_media_dropped_straight_into_the_folder_still_renders(self, library):
+        side = library / "cool_lora"
+        for name in os.listdir(side / "media"):
+            os.remove(side / "media" / name)
+        (side / "preview.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        (side / "clip.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+        detail = cat.read_detail(str(library / "cool_lora.safetensors"))
+        assert [item.kind for item in detail.media] == ["video", "image"]
+        assert all(item.prompt == "" for item in detail.media)
+
+    def test_the_media_folder_wins_over_loose_files(self, library):
+        (library / "cool_lora" / "stray.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        detail = cat.read_detail(str(library / "cool_lora.safetensors"))
+        assert [item.index for item in detail.media] == [1, 2]
+
+    def test_a_generic_detection_key_is_read(self, library):
+        combined = json.loads((library / "cool_lora" / "cool_lora.json").read_text())
+        combined.pop("minimaxH3Detection")
+        combined["detection"] = "some other family"
+        (library / "cool_lora" / "cool_lora.json").write_text(json.dumps(combined), encoding="utf-8")
+        detail = cat.read_detail(str(library / "cool_lora.safetensors"))
+        assert detail.detection == "some other family"
 
 
 class TestDetail:
