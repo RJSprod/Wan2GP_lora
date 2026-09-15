@@ -84,7 +84,12 @@
     layoutBroken: false,
     remountQueued: false,
     dragging: false,
-    lastSentSignature: null,
+    //: The user's latest intent per control, held until the exchange settles.
+    //  Without it, the answer to an earlier tap repaints over a later one.
+    localValues: {},
+    //: One batch of edits is in flight at a time; see flushSync.
+    inFlight: false,
+    inFlightTimer: null,
     signature: "",
     rowsKey: "",
     syncTimer: null,
@@ -1090,11 +1095,13 @@
           }).join(",")
         : "-";
       return [
-        row.id, row.multiplier_kind, (row.phase_values || []).length,
+        row.id, rowName(row), row.multiplier_kind, (row.phase_values || []).length,
         row.missing ? "m" : "", row.system_managed ? "s" : "",
         phase, S.scheduleOpenById[row.id] ? "open" : "shut", shape
       ].join(":");
-    }).join("|") + "#" + S.phases.effective + "#" + S.nameMode;
+    // The step count is in here because the schedule header compares itself
+    // against it; a run length change has to reach the row.
+    }).join("|") + "#" + S.phases.effective + "#" + S.nameMode + "#" + S.steps;
   }
 
   function renderRows(force) {
@@ -1169,7 +1176,9 @@
     });
 
     if (open) {
-      node.appendChild(buildSchedule(row, phase, schedule));
+      var built = buildSchedule(row, phase, schedule);
+      node.appendChild(built.node);
+      if (built.paint) { painters.push(built.paint); }
     }
 
     node.__lbPaint = function (next) {
@@ -1179,10 +1188,22 @@
   }
 
   function currentValue(row, phase, schedule) {
+    var pending = S.localValues[baseKey(row.id, phase)];
+    if (pending !== undefined) { return pending; }
     if (schedule) { return schedule.base; }
     var values = row.phase_values || [];
     return values[phase] !== undefined ? values[phase] : 1;
   }
+
+  function regionValue(row, phase, region) {
+    var pending = S.localValues[regionKeyFor(row.id, phase, region.id)];
+    return pending !== undefined ? pending : region.strength;
+  }
+
+  /* An edit is the user's until WanGP has answered for it. Keys are per
+     control so two of them cannot overwrite each other. */
+  function baseKey(id, phase) { return id + "#" + phase; }
+  function regionKeyFor(id, phase, regionId) { return id + "#" + phase + "#" + regionId; }
 
   function buildRowTop(row, phase, schedule, open) {
     var top = document.createElement("div");
@@ -1495,6 +1516,12 @@
         readout.textContent = fmt(value);
       });
     }
+    S.localValues[baseKey(row.id, phase)] = Number(value);
+    if (linked) {
+      (row.phase_values || []).forEach(function (ignored, index) {
+        S.localValues[baseKey(row.id, index)] = Number(value);
+      });
+    }
     S.pendingValues[row.id + "#" + (linked ? "all" : phase)] = {
       type: "set_strength", id: row.id, phase: phase, value: Number(value), linked: linked
     };
@@ -1512,7 +1539,7 @@
       pending.className = "lb-empty";
       pending.textContent = "Opening schedule...";
       box.appendChild(pending);
-      return box;
+      return { node: box, paint: null };
     }
 
     box.appendChild(scheduleHead(row, phase, schedule));
@@ -1526,7 +1553,7 @@
       if (schedule.normalization_required) {
         box.appendChild(normalizeButton(row, phase, schedule));
       }
-      return box;
+      return { node: box, paint: null };
     }
 
     var selected = selectedRegion(row, phase, schedule);
@@ -1535,8 +1562,28 @@
     var timeline = buildTimeline(row, phase, schedule, selected);
     wrap.appendChild(timeline);
     box.appendChild(wrap);
-    box.appendChild(buildRegionEditor(row, phase, schedule, selected, timeline));
-    return box;
+    var editor = buildRegionEditor(row, phase, schedule, selected, timeline);
+    box.appendChild(editor.node);
+
+    // Strengths can change without any region moving, so they repaint in place
+    // rather than through a rebuild that would interrupt whoever is typing.
+    return {
+      node: box,
+      paint: function (next) {
+        var nextSchedule = scheduleOf(next, phaseOf(next));
+        if (!nextSchedule) { return; }
+        (nextSchedule.regions || []).forEach(function (region) {
+          var node = timeline.querySelector('.lb-region[data-region="' + cssEscape(region.id) + '"]');
+          var readout = node && node.querySelector("strong");
+          if (readout) { readout.textContent = fmt(regionValue(next, phase, region)); }
+        });
+        if (selected) {
+          (nextSchedule.regions || []).forEach(function (region) {
+            if (region.id === selected.id) { editor.paint(regionValue(next, phase, region)); }
+          });
+        }
+      }
+    };
   }
 
   function scheduleHead(row, phase, schedule) {
@@ -1622,9 +1669,16 @@
   function normalizeButton(row, phase, schedule) {
     var button = document.createElement("button");
     button.type = "button";
-    button.className = "lb-btn";
+    // A schedule keeps the length its token spells out, so changing the step
+    // counter afterwards can leave the two disagreeing. Re-gridding rewrites the
+    // multiplier, so it is offered here rather than done silently.
+    var mismatch = S.steps && schedule.active && schedule.slots !== S.steps;
+    button.className = "lb-btn" + (mismatch ? " lb-mismatch" : "");
     button.textContent = "Slots: " + schedule.slots + " ▾";
-    button.title = "Change how many schedule values this phase uses";
+    button.title = mismatch
+      ? "This schedule has " + schedule.slots + " values but the run is now "
+        + S.steps + " steps - tap to re-grid it"
+      : "Change how many schedule values this phase uses";
     button.addEventListener("click", function (event) {
       var rect = button.getBoundingClientRect();
       openMenu(rect.left, rect.bottom, slotMenuItems(row, phase, schedule));
@@ -1694,7 +1748,136 @@
     (schedule.regions || []).forEach(function (region) {
       timeline.appendChild(buildRegion(row, phase, schedule, region, selected));
     });
+
+    // Empty space is a target too: press and drag to draw a region, or just tap
+    // for one of the default width. Regions sit above this, so a gesture that
+    // starts here always starts in free space.
+    timeline.addEventListener("pointerdown", function (event) {
+      if (event.target.closest(".lb-region")) { return; }
+      beginDraw(event, { row: row, phase: phase, schedule: schedule, timeline: timeline, slots: slots });
+    });
+    timeline.title = "Drag across empty space to draw a region";
     return timeline;
+  }
+
+  /* ---------------------------------------------------- drawing a region */
+
+  function slotAt(timeline, clientX, slots) {
+    var rect = timeline.getBoundingClientRect();
+    if (!rect.width) { return 1; }
+    var slot = Math.floor((clientX - rect.left) / (rect.width / slots)) + 1;
+    return Math.max(1, Math.min(slots, slot));
+  }
+
+  /* The free run a slot falls in. Drawing is clipped to it, so a gesture that
+     starts in a gap cannot swallow the region next to it -- that is what
+     dragging a region is for. */
+  function freeRunAt(regions, slots, slot) {
+    var first = 1;
+    var last = slots;
+    (regions || []).forEach(function (region) {
+      if (region.end < slot && region.end + 1 > first) { first = region.end + 1; }
+      if (region.start > slot && region.start - 1 < last) { last = region.start - 1; }
+      if (region.start <= slot && slot <= region.end) { first = 0; }
+    });
+    return first === 0 || first > last ? null : { start: first, end: last };
+  }
+
+  function beginDraw(event, context) {
+    if (S.drag) { return; }
+    var anchor = slotAt(context.timeline, event.clientX, context.slots);
+    var run = freeRunAt(context.schedule.regions, context.slots, anchor);
+    if (!run) { return; }
+
+    event.preventDefault();
+    var ghost = document.createElement("div");
+    ghost.className = "lb-region lb-on lb-ghost";
+    var body = document.createElement("div");
+    body.className = "lb-region-body";
+    body.appendChild(document.createElement("strong"));
+    body.appendChild(document.createElement("span"));
+    ghost.appendChild(body);
+    context.timeline.appendChild(ghost);
+
+    S.drag = {
+      mode: "draw",
+      context: context,
+      anchor: anchor,
+      run: run,
+      ghost: ghost,
+      current: { start: anchor, end: anchor },
+      moved: false,
+      pointerId: event.pointerId
+    };
+    paintGhost();
+
+    try { context.timeline.setPointerCapture(event.pointerId); } catch (error) { /* mouse */ }
+    context.timeline.addEventListener("pointermove", onDrawMove);
+    context.timeline.addEventListener("pointerup", onDrawEnd);
+    context.timeline.addEventListener("pointercancel", onDrawCancel);
+  }
+
+  function paintGhost() {
+    var drag = S.drag;
+    if (!drag || drag.mode !== "draw") { return; }
+    var region = {
+      start: drag.current.start, end: drag.current.end,
+      strength: drag.context.schedule.base
+    };
+    placeRegion(drag.ghost, region, drag.context.slots, drag.context.schedule);
+  }
+
+  function onDrawMove(event) {
+    var drag = S.drag;
+    if (!drag || drag.mode !== "draw") { return; }
+    var slot = slotAt(drag.context.timeline, event.clientX, drag.context.slots);
+    slot = Math.max(drag.run.start, Math.min(drag.run.end, slot));
+    var next = {
+      start: Math.min(drag.anchor, slot),
+      end: Math.max(drag.anchor, slot)
+    };
+    if (next.start === drag.current.start && next.end === drag.current.end) { return; }
+    drag.current = next;
+    drag.moved = true;
+    paintGhost();
+  }
+
+  function onDrawEnd() {
+    var drag = S.drag;
+    if (!drag || drag.mode !== "draw") { return; }
+    var context = drag.context;
+    var span = drag.current;
+    var drew = drag.moved;
+    releaseDraw();
+
+    // A tap asks for a region of the default width; a drag asks for the one
+    // that was drawn. Python clips either to the free run and owns the result.
+    delete S.selectedRegionByKey[regionKey(context.row, context.phase)];
+    send({
+      type: "schedule_add_region",
+      id: context.row.id,
+      phase: context.phase,
+      start: span.start,
+      end: drew ? span.end : null
+    });
+  }
+
+  function onDrawCancel() {
+    if (!S.drag || S.drag.mode !== "draw") { return; }
+    releaseDraw();
+    renderRows(true);
+  }
+
+  function releaseDraw() {
+    var drag = S.drag;
+    if (!drag || drag.mode !== "draw") { return; }
+    var timeline = drag.context.timeline;
+    timeline.removeEventListener("pointermove", onDrawMove);
+    timeline.removeEventListener("pointerup", onDrawEnd);
+    timeline.removeEventListener("pointercancel", onDrawCancel);
+    try { timeline.releasePointerCapture(drag.pointerId); } catch (error) { /* already gone */ }
+    if (drag.ghost && drag.ghost.parentElement) { drag.ghost.remove(); }
+    S.drag = null;
   }
 
   function tickPositions(slots) {
@@ -1706,6 +1889,8 @@
   }
 
   function buildRegion(row, phase, schedule, region, selected) {
+    var shown = { id: region.id, start: region.start, end: region.end,
+                  strength: regionValue(row, phase, region) };
     var slots = Math.max(1, schedule.slots);
     var node = document.createElement("div");
     node.className = "lb-region" + (selected && selected.id === region.id ? " lb-on" : "");
@@ -1729,7 +1914,7 @@
     node.appendChild(body);
     node.appendChild(right);
 
-    placeRegion(node, region, slots, schedule);
+    placeRegion(node, shown, slots, schedule);
 
     var start = function (event, mode) {
       beginDrag(event, {
@@ -1792,6 +1977,7 @@
     context.node.classList.add("lb-on", "lb-dragging");
 
     S.drag = {
+      mode: context.mode,
       context: context,
       startX: event.clientX,
       slotPx: slotPx,
@@ -1809,7 +1995,7 @@
 
   function onDragMove(event) {
     var drag = S.drag;
-    if (!drag) { return; }
+    if (!drag || drag.mode === "draw") { return; }
     var delta = Math.round((event.clientX - drag.startX) / drag.slotPx);
     var slots = drag.context.slots;
     var origin = drag.origin;
@@ -1839,7 +2025,7 @@
 
   function onDragEnd() {
     var drag = S.drag;
-    if (!drag) { return; }
+    if (!drag || drag.mode === "draw") { return; }
     var context = drag.context;
     releaseDrag();
 
@@ -1857,14 +2043,14 @@
 
   /* An interrupted gesture is not an edit: go back to the committed state. */
   function onDragCancel() {
-    if (!S.drag) { return; }
+    if (!S.drag || S.drag.mode === "draw") { return; }
     releaseDrag();
     renderRows(true);
   }
 
   function releaseDrag() {
     var drag = S.drag;
-    if (!drag) { return; }
+    if (!drag || drag.mode === "draw") { return; }
     var node = drag.context.node;
     node.removeEventListener("pointermove", onDragMove);
     node.removeEventListener("pointerup", onDragEnd);
@@ -1904,7 +2090,7 @@
     editor.appendChild(head);
 
     var weight = buildWeightLine({
-      value: selected ? selected.strength : schedule.base,
+      value: selected ? regionValue(row, phase, selected) : schedule.base,
       label: "Selected region strength",
       disabled: !selected,
       commit: function (value) {
@@ -1914,7 +2100,8 @@
           var readout = node.querySelector("strong");
           if (readout) { readout.textContent = fmt(value); }
         }
-        S.pendingValues[row.id + "#" + phase + "#" + selected.id] = {
+        S.localValues[regionKeyFor(row.id, phase, selected.id)] = Number(value);
+        S.pendingValues[regionKeyFor(row.id, phase, selected.id)] = {
           type: "schedule_set_region_strength", id: row.id, phase: phase,
           region_id: selected.id, value: Number(value)
         };
@@ -1923,7 +2110,7 @@
       settle: flushSync
     });
     editor.appendChild(weight.node);
-    return editor;
+    return { node: editor, paint: weight.paint };
   }
 
   function pill(label) {
@@ -1950,12 +2137,34 @@
     S.syncTimer = setTimeout(flushSync, SYNC_DEBOUNCE_MS);
   }
 
+  /* One batch at a time. A second request would be built from the native state
+     the first has not written yet, so its answer would arrive later and undo the
+     newer edit -- which is exactly what made fast taps spring back. Anything
+     queued meanwhile is coalesced by key and sent when the answer lands. */
   function flushSync() {
     clearTimeout(S.syncTimer);
     var actions = Object.keys(S.pendingValues).map(function (key) { return S.pendingValues[key]; });
-    if (!actions.length) { return; }
+    if (!actions.length || S.inFlight) { return; }
+
     S.pendingValues = {};
+    S.inFlight = true;
+    // If an answer never comes, do not strand the queue forever.
+    clearTimeout(S.inFlightTimer);
+    S.inFlightTimer = setTimeout(function () {
+      S.inFlight = false;
+      flushSync();
+    }, 5000);
     send({ type: "batch", actions: actions });
+  }
+
+  function settleSync() {
+    clearTimeout(S.inFlightTimer);
+    S.inFlight = false;
+    if (Object.keys(S.pendingValues).length) {
+      flushSync();
+      return false;
+    }
+    return true;
   }
 
 
@@ -2406,9 +2615,17 @@
     if (payload.zoom_px && !S.ready) { S.applyZoom(payload.zoom_px, false); }
     else { S.applyZoom(S.zoomPx, false); }
 
+    // A payload is the answer to whatever was in flight. Once nothing is left
+    // queued, WanGP's value is the truth again and local intent is dropped;
+    // while edits are still outstanding they keep winning, so a value the user
+    // has just set does not flicker back to the one before it.
+    if (settleSync()) { S.localValues = {}; }
+
     renderHeader();
     renderGrid();
-    renderRows(true);
+    // Not forced: the row key knows when structure changed, and rebuilding on a
+    // value-only payload would take focus out of a field being typed into.
+    renderRows();
     setStatus(payload.status || "Synced to WanGP state", !!payload.status_warn);
     maybeApplyDefaultProfile();
 

@@ -958,15 +958,83 @@ class TestScheduleActions:
         assert schedule["shared"] is True
         assert schedule["slots"] == 24 and schedule["coordinate_mode"] == "global_exact"
 
-    def test_a_new_phase_specific_timeline_falls_back_to_relative_slots(self, plugin, state):
+    def test_a_new_phase_specific_timeline_uses_the_step_count_too(self, plugin, state):
+        """Same resolution as the run, but it does not claim to be steps."""
         _, _, payload = act(
             plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 1},
             state, self.LORAS, "0.8;0.5 1;1", steps=24,
         )
         schedule = self._schedule(payload, "a.safetensors", 1)
         assert schedule["shared"] is False
+        assert schedule["slots"] == 24
         assert schedule["coordinate_mode"] == "phase_relative"
         assert schedule["base"] == 0.5
+
+    def test_an_empty_timeline_follows_the_step_counter(self, plugin, state):
+        act(plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 0},
+            state, self.LORAS, "0.8;0.5 1;1", steps=30)
+        payload = payload_of(plugin, state, self.LORAS, "0.8;0.5 1;1", steps=45)
+        assert self._schedule(payload, "a.safetensors", 0)["slots"] == 45
+
+    def test_a_drawn_timeline_keeps_its_own_length(self, plugin, state):
+        """Its length is in the token; re-gridding it is an explicit choice."""
+        payload = payload_of(plugin, state, self.LORAS, "1,1,0.5,0.5;0.7 1;1", steps=30)
+        schedule = self._schedule(payload, "a.safetensors", 0)
+        assert schedule["slots"] == 4
+        assert schedule["active"] is True
+
+    def test_a_drawn_region_lands_where_it_was_drawn(self, plugin, state):
+        act(plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 0},
+            state, self.LORAS, "0.4;0.5 1;1", steps=10)
+        _, _, payload = act(
+            plugin,
+            {"type": "schedule_add_region", "id": "a.safetensors", "phase": 0,
+             "start": 3, "end": 6},
+            state, self.LORAS, "0.4;0.5 1;1", steps=10,
+        )
+        region = self._schedule(payload, "a.safetensors", 0)["regions"][0]
+        assert (region["start"], region["end"]) == (3, 6)
+        assert region["strength"] == 0.4          # the strength already set
+
+    def test_a_tap_draws_a_region_of_the_default_width(self, plugin, state):
+        act(plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 0},
+            state, self.LORAS, "0.4;0.5 1;1", steps=20)
+        _, _, payload = act(
+            plugin,
+            {"type": "schedule_add_region", "id": "a.safetensors", "phase": 0, "start": 6},
+            state, self.LORAS, "0.4;0.5 1;1", steps=20,
+        )
+        region = self._schedule(payload, "a.safetensors", 0)["regions"][0]
+        assert region["start"] == 6
+        assert 2 <= region["end"] - region["start"] + 1 <= 6
+
+    def test_drawing_stops_at_the_neighbouring_region(self, plugin, state):
+        # 1,1,0.5,0.5,1,1 -> one region at slots 3-4; drawing from slot 1 across
+        # it must stop at slot 2 rather than swallowing it.
+        _, mults, payload = act(
+            plugin,
+            {"type": "schedule_add_region", "id": "a.safetensors", "phase": 0,
+             "start": 1, "end": 5},
+            state, self.LORAS, "1,1,0.5,0.5,1,1;0.7 1;1", steps=6,
+        )
+        regions = [(r["start"], r["end"]) for r in
+                   self._schedule(payload, "a.safetensors", 0)["regions"]]
+        assert (3, 4) in regions
+        assert (1, 2) in regions
+
+    def test_drawing_on_top_of_a_region_falls_back_to_free_space(self, plugin, state):
+        _, _, payload = act(
+            plugin,
+            {"type": "schedule_add_region", "id": "a.safetensors", "phase": 0,
+             "start": 3, "end": 4},
+            state, self.LORAS, "1,1,0.5,0.5,1,1;0.7 1;1", steps=6,
+        )
+        regions = [(r["start"], r["end"]) for r in
+                   self._schedule(payload, "a.safetensors", 0)["regions"]]
+        assert (3, 4) in regions                       # the existing one is intact
+        assert len(regions) == 2
+        assert all(left[1] < right[0] or right[1] < left[0]
+                   for left in regions for right in regions if left != right)
 
     def test_an_ambiguous_multi_phase_schedule_is_read_only(self, plugin, state):
         three_phase = dict(H3_MODEL_DEF, guidance_max_phases=3, lora_multiplier_phases=3)

@@ -266,6 +266,53 @@ def free_gaps(regions: list[Region], slots: int) -> list[tuple[int, int]]:
     return [gap for gap in gaps if gap[0] <= gap[1]]
 
 
+def gap_containing(regions: list[Region], slots: int, slot: int) -> tuple[int, int] | None:
+    """The free interval ``slot`` falls in, or ``None`` if it is occupied."""
+    for gap in free_gaps(regions, slots):
+        if gap[0] <= int(slot) <= gap[1]:
+            return gap
+    return None
+
+
+def fit_region(
+    regions: list[Region],
+    slots: int,
+    start,
+    end=None,
+    width: int | None = None,
+) -> tuple[int, int] | None:
+    """Fit a span the user drew into the free run that holds its start.
+
+    Drawing stops at the neighbouring region rather than overrunning it: a
+    gesture that begins in empty space should not delete what is next to it,
+    which is the difference between drawing a region and dragging one.
+    """
+    slots = clamp_slots(slots)
+    try:
+        first = int(round(float(start)))
+    except (TypeError, ValueError):
+        return None
+    first = max(1, min(first, slots))
+
+    gap = gap_containing(regions, slots, first)
+    if gap is None:
+        return None
+
+    if end is None:
+        last = first + max(1, int(width) if width else preferred_width(slots)) - 1
+    else:
+        try:
+            last = int(round(float(end)))
+        except (TypeError, ValueError):
+            return None
+    if last < first:
+        first, last = last, first
+
+    first = max(gap[0], min(first, gap[1]))
+    last = max(first, min(last, gap[1]))
+    return (first, last)
+
+
 def find_region_slot(regions: list[Region], slots: int, width: int | None = None) -> tuple[int, int] | None:
     """Pick genuine free space for a new region.
 

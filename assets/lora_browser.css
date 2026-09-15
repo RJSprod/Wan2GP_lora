@@ -286,6 +286,11 @@
 }
 /* Remove sits apart from everything else it could be confused with. */
 .__NS__ button.lb-btn.lb-remove { margin-left: 2px; }
+/* Says "these two numbers disagree" without doing anything about it on its own. */
+.__NS__ button.lb-btn.lb-mismatch {
+  border-color: var(--border-color-accent, var(--color-accent, currentColor));
+  border-style: dashed;
+}
 
 /* ------------------------------------------------------------ phase chips */
 
@@ -489,6 +494,14 @@
   z-index: 2;
 }
 .__NS__ .lb-region.lb-dragging { cursor: grabbing; opacity: 0.92; }
+/* The region being drawn: no handles yet, and it must not eat the gesture. */
+.__NS__ .lb-region.lb-ghost {
+  pointer-events: none;
+  opacity: 0.75;
+  border-style: dashed;
+}
+/* Empty timeline space is a target, so say so. */
+.__NS__ .lb-timeline { cursor: crosshair; }
 .__NS__ .lb-region:focus-visible { outline: 2px solid var(--color-accent, Highlight); outline-offset: -3px; }
 .__NS__ .lb-region-body {
   flex: 1 1 auto;

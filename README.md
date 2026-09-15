@@ -13,6 +13,9 @@ thumbnail browser and a real-time strength editor.
   can actually use.
 - **Click to include / exclude.** A newly included LoRA starts at `1.0` on every
   editable phase.
+- **Edits stick.** Taps on `+`/`-`, slider drags and typed values are coalesced
+  and written one exchange at a time, so a fast burst lands on the value you
+  stopped at instead of springing back to an earlier one.
 - **Strength controls** with three deliberately different jobs: a `0..1` slider
   on a `0.05` grid for fast coarse setting, `±0.01` buttons for exact nudging,
   and a numeric field for exact direct entry between `-10` and `10`. Negative
@@ -21,10 +24,10 @@ thumbnail browser and a real-time strength editor.
   truth until you actually move the slider.
 - **Phase chips.** On a multi-phase model each phase is a chip showing its own
   value; tapping one chooses what the strength control and the timeline edit.
-- **Step schedules you can drag.** WanGP's comma multipliers (`1,0.8,0.4,0`) are
-  a first-class editing surface: a base strength plus regions you move, resize
-  and re-weight on an inline timeline, per phase. See
-  [Step schedules](#step-schedules).
+- **Step schedules you can draw.** WanGP's comma multipliers (`1,0.8,0.4,0`) are
+  a first-class editing surface: a base strength plus regions you draw, move,
+  resize and re-weight on an inline timeline, one slot per inference step, per
+  phase. See [Step schedules](#step-schedules).
 - **Image previews first, video previews as a still.** A LoRA with only a video
   preview gets its *first frame* decoded server-side and cached; the video itself
   is never loaded in the browser.
@@ -116,20 +119,24 @@ A comma in a WanGP multiplier makes it vary over the run. The panel edits those
 as **base strength + regions**:
 
 ```
-Step schedule   Phase 1   phase-relative • 20 schedule slots    [+ Region] [Slots: 20 ▾] [Clear phase] [Close]
+Step schedule   Phase 1   phase-relative • 30 schedule slots    [+ Region] [Slots: 30 ▾] [Clear phase] [Close]
 
-  base 0.6  ┌──────────┐              ┌────┐
-  ──────────│   0.95   │──────────────│ 0.2│────────
-            └──────────┘              └────┘
-   1     4      6    10      12   16    18   20
+  base 0.6  ┌──────────┐                    ┌────┐
+  ──────────│   0.95   │────────────────────│ 0.2│────────
+            └──────────┘                    └────┘
+   1    4    7    10   13   16   19   22   25   28   30
 ```
 
 - Everything not covered by a region is the **base**, and the row's normal
   strength control edits that base. Moving it never flattens the schedule: your
   regions keep their own strengths.
-- `+ Region` places one in genuine free space — after the last region, else the
-  first hole that fits, else the largest — and refuses when the timeline is full
-  rather than creating an overlap.
+- **Draw a region by dragging across empty timeline space**, or tap once for one
+  of the default width. A new region starts at the strength the row already had,
+  so drawing one changes nothing until you move it. Drawing stops at the
+  neighbouring region rather than overrunning it — dragging is for that.
+- `+ Region` does the same without aiming: the free tail, else the first hole
+  that fits, else the largest. Either way a full timeline is refused rather than
+  overlapped.
 - Drag a region's body to move it, its edges to resize it. Bounds snap to whole
   slots, and on drop the dragged region wins: a partial overlap shrinks its
   neighbour, dropping inside one splits it, covering one deletes it.
@@ -139,11 +146,19 @@ Step schedule   Phase 1   phase-relative • 20 schedule slots    [+ Region] [Sl
 - Schedule state is **per phase**. Phase 1 and phase 2 have independent regions,
   and linking phase values moves both bases without copying regions between them.
 
+**A new timeline has one slot per inference step**, so its resolution matches the
+run you configured, and it keeps following the step counter until you draw
+something on it. After that the slot count lives in the multiplier itself, so
+changing the step count leaves the two disagreeing; the panel says so on the
+`Slots:` button and re-grids on request rather than rewriting your schedule
+behind you.
+
 **Slot numbers say what they are.** A comma-only token spans the whole run, so
-when `num_inference_steps` is known and the timeline has one slot per step, slots
-are labelled as real steps. A phase-specific schedule is expanded inside a phase
-interval that depends on runtime model switching, which the plugin cannot see —
-those timelines say *phase-relative* rather than inventing global step numbers.
+when the timeline has one slot per step those slots really are steps and are
+labelled that way. A phase-specific schedule is expanded inside a phase interval
+that depends on runtime model switching, which the plugin cannot see — those
+timelines say *phase-relative* rather than inventing global step numbers, even
+when they have one slot per step.
 
 **Opening a timeline writes nothing.** A schedule that works out to one value
 everywhere is emitted as that single value, so opening the panel — or adding a
