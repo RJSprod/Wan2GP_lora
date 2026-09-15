@@ -100,6 +100,13 @@ class TestReconstruct:
         assert schedule.normalization_required is True
         assert str(sch.MAX_SLOTS) in schedule.reason
 
+    def test_a_list_too_long_to_edit_is_still_held_whole(self):
+        """Its length is what may be dragged, not what may be kept."""
+        values = [1.0] * 150 + [0.25] * 150
+        schedule = sch.reconstruct_schedule(values)
+        assert schedule.slots == 300
+        assert sch.compile_schedule(schedule) == values
+
 
 class TestPlacement:
     def test_empty_timeline_starts_at_the_beginning(self):
@@ -250,6 +257,12 @@ class TestNormalisation:
         rebuilt = sch.normalize_schedule(schedule, 20)
         assert rebuilt.editable is True
         assert rebuilt.normalization_required is False
+
+    def test_regridding_a_long_schedule_keeps_its_whole_shape(self):
+        """Nothing beyond what a timeline could draw may be quietly dropped."""
+        schedule = sch.reconstruct_schedule([1.0] * 150 + [0.25] * 150)
+        rebuilt = sch.normalize_schedule(schedule, 20)
+        assert sch.compile_schedule(rebuilt) == [1.0] * 10 + [0.25] * 10
 
     def test_slot_counts_are_clamped(self):
         assert sch.clamp_slots(0) == sch.MIN_SLOTS

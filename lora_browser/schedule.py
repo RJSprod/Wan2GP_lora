@@ -24,9 +24,15 @@ from .utils import is_finite_number
 
 #: A schedule always has at least one slot (that is just a scalar), and the
 #: upper bound keeps an imported 500-value list from being offered for
-#: slot-by-slot editing on a phone.
+#: slot-by-slot editing on a phone.  It bounds what may be *edited*, not what
+#: may be held: a longer imported list is kept at its own length so that
+#: preserving it, and re-gridding it later, stay lossless.
 MIN_SLOTS = 1
 MAX_SLOTS = 120
+
+#: Ceiling on any schedule length at all, so a nonsense slot count cannot ask
+#: for a list nothing would ever run.
+HARD_MAX_SLOTS = 4096
 
 #: Used when no better resolution is available: no ``num_inference_steps`` and
 #: no phase boundaries to derive a length from.
@@ -98,11 +104,21 @@ class PhaseSchedule:
 
 
 def clamp_slots(slots) -> int:
+    """A slot count the timeline may be edited at."""
     try:
         number = int(slots)
     except (TypeError, ValueError):
         return DEFAULT_SLOTS
     return max(MIN_SLOTS, min(MAX_SLOTS, number))
+
+
+def held_slots(slots) -> int:
+    """A slot count a schedule may be *held* at, editable or not."""
+    try:
+        number = int(slots)
+    except (TypeError, ValueError):
+        return DEFAULT_SLOTS
+    return max(MIN_SLOTS, min(HARD_MAX_SLOTS, number))
 
 
 def preferred_width(slots: int) -> int:
@@ -143,7 +159,7 @@ def compile_schedule(schedule: PhaseSchedule) -> list[float]:
     regions still gets a deterministic result -- but committed region sets are
     validated to be disjoint, so that case only arises mid-gesture.
     """
-    slots = clamp_slots(schedule.slots)
+    slots = held_slots(schedule.slots)
     values = [float(schedule.base)] * slots
     for region in sort_regions(schedule.regions):
         start = max(1, int(region.start))
@@ -210,7 +226,7 @@ def reconstruct_schedule(
 
     schedule = PhaseSchedule(
         base=base,
-        slots=max(MIN_SLOTS, min(MAX_SLOTS, len(numbers))) if slots is None else total,
+        slots=held_slots(len(numbers)) if slots is None else total,
         regions=regions,
         selected_region_id=regions[0].id if regions else None,
         source_values=list(numbers),
@@ -374,7 +390,7 @@ def clamp_region(
 
 def validate_regions(regions: list[Region], slots: int) -> None:
     """Raise unless ``regions`` could be committed as-is."""
-    slots = clamp_slots(slots)
+    slots = held_slots(slots)
     previous: Region | None = None
     for region in sort_regions(regions):
         if int(region.start) < 1 or int(region.end) > slots:
@@ -409,7 +425,12 @@ def normalize_values(values: list[float], target_slots: int) -> list[float]:
 
 
 def normalize_schedule(schedule: PhaseSchedule, target_slots: int) -> PhaseSchedule:
-    """Re-grid a schedule to ``target_slots``, keeping what it currently means."""
+    """Re-grid a schedule to ``target_slots``, keeping what it currently means.
+
+    Resampled from the whole schedule, including the part beyond what a
+    timeline would show: an imported list too long to edit must not lose its
+    tail by being re-gridded.
+    """
     target = clamp_slots(target_slots)
     values = normalize_values(compile_schedule(schedule), target)
     rebuilt = reconstruct_schedule(values, raw=schedule.source_raw, slots=target)

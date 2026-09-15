@@ -465,9 +465,10 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 # applied over newer settings.
                 instance.restore_snapshot = None
 
+            catalogue = self._catalogue_index(instance, inventory)
             rows = up.build_active_rows(
-                inventory, stack, phases, instance.phase_memory, catalogue=None,
-                schedules=instance.schedules, context=context,
+                inventory, stack, phases, instance.phase_memory, catalogue,
+                instance.schedules, context,
             )
             missing = [row for row in rows if row["missing"]]
             if missing and not status:
@@ -475,7 +476,6 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 status = f"{len(missing)} selected LoRA(s) missing locally: {names}"
                 warn = True
 
-            catalogue = self._catalogue_index(instance, inventory)
             complete, incomplete = (
                 self._profiles.partition(inventory.ids) if self._profiles else ([], [])
             )
@@ -488,10 +488,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                     inventory, stack, phases, self._metadata, model_type,
                     instance.phase_memory, catalogue,
                 ),
-                "active": up.build_active_rows(
-                    inventory, stack, phases, instance.phase_memory, catalogue,
-                    instance.schedules, context,
-                ),
+                "active": rows,
                 "profiles": complete + incomplete,
                 # Named so the dropdown can flag a profile this model can only
                 # apply in part -- it is still selectable.

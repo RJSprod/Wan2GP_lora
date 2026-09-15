@@ -448,7 +448,7 @@ def schedule_payload(
     """
     return {
         "base": round(float(schedule.base), VALUE_DECIMALS),
-        "slots": sch.clamp_slots(schedule.slots),
+        "slots": sch.held_slots(schedule.slots),
         "coordinate_mode": coordinate_mode(schedule, shared=shared, phases=phases, context=context),
         "steps": int(context.steps) if context else 0,
         "regions": [
@@ -489,7 +489,7 @@ def coordinate_mode(
     if not schedule.editable:
         return COORD_NORMALIZED_READONLY
     steps = int(context.steps) if context else 0
-    if shared and steps and sch.clamp_slots(schedule.slots) == steps:
+    if shared and steps and sch.held_slots(schedule.slots) == steps:
         return COORD_GLOBAL_EXACT
     if context and context.boundaries_known and steps:
         return COORD_GLOBAL_EXACT
