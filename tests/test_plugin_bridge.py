@@ -101,17 +101,21 @@ def state():
     return {"model_type": "minimax_h3", "loras": list(LORAS)}
 
 
-def payload_of(plugin, state, selected, multipliers, guidance=2):
+def payload_of(plugin, state, selected, multipliers, guidance=2, steps=None):
     instance = plugin._instance("test")
-    return json.loads(plugin._build_payload(instance, state, selected, multipliers, guidance))
+    return json.loads(plugin._build_payload(instance, state, selected, multipliers, guidance, steps))
 
 
-def act(plugin, action, state, selected, multipliers, guidance=2):
+def act(plugin, action, state, selected, multipliers, guidance=2, steps=None):
     instance = plugin._instance("test")
     choices, mults, payload = plugin._apply_action(
-        instance, json.dumps(action), state, selected, multipliers, guidance
+        instance, json.dumps(action), state, selected, multipliers, guidance, steps
     )
     return choices, mults, json.loads(payload)
+
+
+def row_of(payload, lora_id):
+    return next(row for row in payload["active"] if row["id"] == lora_id)
 
 
 class _FakeCivitai:
@@ -753,3 +757,271 @@ class TestModelChange:
         assert instance.restore_snapshot is None
         assert instance.inventory_ids == []
         assert instance.phase_memory == {}
+
+
+class TestScheduleActions:
+    """The timeline's action contract, end to end through the bridge."""
+
+    LORAS = ["a.safetensors", "b.safetensors"]
+
+    def _schedule(self, payload, lora_id, phase=0):
+        return row_of(payload, lora_id)["phase_schedules"][phase]
+
+    def test_an_imported_schedule_is_offered_as_regions(self, plugin, state):
+        payload = payload_of(plugin, state, self.LORAS, "1,0.8,0.4,0;0.7,0.5,0.2,0 1;1")
+        row = row_of(payload, "a.safetensors")
+        assert row["multiplier_kind"] == "scheduled"
+        assert row["phase_values"] == [1.0, 0.7]
+        first = row["phase_schedules"][0]
+        assert first["base"] == 1.0
+        assert [(r["start"], r["end"], r["strength"]) for r in first["regions"]] == [
+            (2, 2, 0.8), (3, 3, 0.4), (4, 4, 0.0)
+        ]
+        second = row["phase_schedules"][1]
+        assert second["base"] == 0.7
+        assert len(second["regions"]) == 3
+
+    def test_rendering_an_imported_schedule_never_rewrites_it(self, plugin, state):
+        raw = "1.0,0.80,0.400;0.7,0.5"
+        for _ in range(3):
+            payload = payload_of(plugin, state, self.LORAS, raw + " 1;1")
+            assert row_of(payload, "a.safetensors")["multiplier_raw"] == raw
+        # No native write happened at all: the action returns no component update.
+        choices, mults, _ = act(plugin, {"type": "ready"}, state, self.LORAS, raw + " 1;1")
+        assert "value" not in choices and "value" not in mults
+
+    def test_opening_a_schedule_does_not_change_the_native_token(self, plugin, state):
+        choices, mults, payload = act(
+            plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 0},
+            state, self.LORAS, "0.71;1.23 1;1",
+        )
+        assert "value" not in mults
+        schedule = self._schedule(payload, "a.safetensors", 0)
+        assert schedule["base"] == 0.71
+        assert schedule["regions"] == []
+        # Not yet part of what WanGP is told.
+        assert schedule["active"] is False
+
+    def test_a_region_only_reaches_wangp_once_it_differs_from_the_base(self, plugin, state):
+        act(plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 0},
+            state, self.LORAS, "0.71;1.23 1;1")
+        _, mults, payload = act(
+            plugin, {"type": "schedule_add_region", "id": "a.safetensors", "phase": 0},
+            state, self.LORAS, "0.71;1.23 1;1",
+        )
+        assert "value" not in mults
+        schedule = self._schedule(payload, "a.safetensors", 0)
+        assert len(schedule["regions"]) == 1
+        region = schedule["regions"][0]
+        assert region["strength"] == 0.71
+        assert schedule["selected_region_id"] == region["id"]
+
+        _, mults, payload = act(
+            plugin,
+            {"type": "schedule_set_region_strength", "id": "a.safetensors", "phase": 0,
+             "region_id": region["id"], "value": 0.25},
+            state, self.LORAS, "0.71;1.23 1;1",
+        )
+        token = mults["value"].split()[0]
+        assert token.startswith("0.25,0.25,0.25,0.25,0.71")
+        assert token.endswith(";1.23")
+
+    def test_a_base_edit_under_a_schedule_keeps_the_regions(self, plugin, state):
+        _, mults, payload = act(
+            plugin, {"type": "set_strength", "id": "a.safetensors", "phase": 0, "value": 0.9},
+            state, self.LORAS, "1,0.8,0.4,0;0.7,0.5,0.2,0 1;1",
+        )
+        assert mults["value"].split()[0] == "0.9,0.8,0.4,0;0.7,0.5,0.2,0"
+        schedule = self._schedule(payload, "a.safetensors", 0)
+        assert schedule["base"] == 0.9
+        assert len(schedule["regions"]) == 3
+
+    def test_only_the_selected_phase_is_touched(self, plugin, state):
+        _, mults, _ = act(
+            plugin, {"type": "schedule_set_base", "id": "a.safetensors", "phase": 1, "value": 0.6},
+            state, self.LORAS, "1,0.8;0.7,0.5 1;1",
+        )
+        assert mults["value"].split()[0] == "1,0.8;0.6,0.5"
+
+    def test_clear_phase_returns_one_phase_to_its_base(self, plugin, state):
+        _, mults, payload = act(
+            plugin, {"type": "schedule_clear_phase", "id": "a.safetensors", "phase": 0},
+            state, self.LORAS, "1,0.8,0.4;0.7,0.5,0.2 1;1",
+        )
+        assert mults["value"].split()[0] == "1;0.7,0.5,0.2"
+        # Phase 2 still has its own schedule.
+        assert self._schedule(payload, "a.safetensors", 1)["active"] is True
+        assert self._schedule(payload, "a.safetensors", 0) is None
+
+    def test_a_move_is_committed_with_collisions_resolved(self, plugin, state):
+        payload = payload_of(plugin, state, self.LORAS, "1,1,0.5,0.5,0.5,1,0.2,0.2 1;1")
+        schedule = self._schedule(payload, "a.safetensors", 0)
+        assert [(r["id"], r["start"], r["end"]) for r in schedule["regions"]] == [
+            ("r1", 3, 5), ("r2", 7, 8)
+        ]
+        _, mults, payload = act(
+            plugin,
+            {"type": "schedule_commit_region", "id": "a.safetensors", "phase": 0,
+             "region_id": "r1", "start": 5, "end": 7, "keep_width": True},
+            state, self.LORAS, "1,1,0.5,0.5,0.5,1,0.2,0.2 1;1",
+        )
+        assert mults["value"].split()[0] == "1,1,1,1,0.5,0.5,0.5,0.2"
+        assert [(r["id"], r["start"], r["end"]) for r in
+                self._schedule(payload, "a.safetensors", 0)["regions"]] == [("r1", 5, 7), ("r2", 8, 8)]
+
+    def test_a_drag_beyond_the_end_is_clamped_not_rejected(self, plugin, state):
+        _, mults, _ = act(
+            plugin,
+            {"type": "schedule_commit_region", "id": "a.safetensors", "phase": 0,
+             "region_id": "r1", "start": 7, "end": 12, "keep_width": True},
+            state, self.LORAS, "1,0.4,0.4,1 1;1",
+        )
+        # Four slots, two-wide region: it can only reach 3-4.
+        assert mults["value"].split()[0] == "1,1,0.4,0.4"
+
+    def test_deleting_a_region_keeps_the_rest(self, plugin, state):
+        _, mults, payload = act(
+            plugin,
+            {"type": "schedule_delete_region", "id": "a.safetensors", "phase": 0, "region_id": "r1"},
+            state, self.LORAS, "1,0.5,1,0.2 1;1",
+        )
+        assert mults["value"].split()[0] == "1,1,1,0.2"
+        regions = self._schedule(payload, "a.safetensors", 0)["regions"]
+        assert [(r["start"], r["end"]) for r in regions] == [(4, 4)]
+
+    def test_a_full_timeline_refuses_instead_of_overlapping(self, plugin, state):
+        # Stretch the only region across the whole timeline, then ask for another.
+        act(plugin,
+            {"type": "schedule_commit_region", "id": "a.safetensors", "phase": 0,
+             "region_id": "r1", "start": 1, "end": 3},
+            state, self.LORAS, "1,0.4,0.4 1;1")
+        _, mults, payload = act(
+            plugin, {"type": "schedule_add_region", "id": "a.safetensors", "phase": 0},
+            state, self.LORAS, "0.4;0.4 1;1",
+        )
+        assert "value" not in mults
+        assert payload["status_warn"] is True
+        assert "full" in payload["status"]
+        # The stretched region is still there, and still means one flat value.
+        schedule = self._schedule(payload, "a.safetensors", 0)
+        assert [(r["start"], r["end"]) for r in schedule["regions"]] == [(1, 3)]
+
+    def test_a_shared_timeline_survives_compiling_flat(self, plugin, state):
+        """A schedule that works out to one value collapses in the token only."""
+        _, mults, payload = act(
+            plugin,
+            {"type": "schedule_commit_region", "id": "a.safetensors", "phase": 0,
+             "region_id": "r1", "start": 1, "end": 3},
+            state, self.LORAS, "1,0.4,0.4 1;1",
+        )
+        assert mults["value"].split()[0] == "0.4;0.4"
+        schedule = self._schedule(payload, "a.safetensors", 0)
+        assert schedule["shared"] is True
+        assert schedule["slots"] == 3
+        assert [(r["start"], r["end"]) for r in schedule["regions"]] == [(1, 3)]
+        assert schedule["active"] is False
+
+    def test_region_ids_survive_a_round_trip(self, plugin, state):
+        multipliers = "1,0.5,1,0.2 1;1"
+        first = payload_of(plugin, state, self.LORAS, multipliers)
+        ids = [r["id"] for r in self._schedule(first, "a.safetensors", 0)["regions"]]
+        again = payload_of(plugin, state, self.LORAS, multipliers)
+        assert [r["id"] for r in self._schedule(again, "a.safetensors", 0)["regions"]] == ids
+
+    def test_a_shared_schedule_may_claim_exact_global_steps(self, plugin, state):
+        values = ",".join(["0.8"] * 29 + ["0.2"])
+        payload = payload_of(plugin, state, self.LORAS, values + " 1;1", steps=30)
+        schedule = self._schedule(payload, "a.safetensors", 0)
+        assert schedule["shared"] is True
+        assert schedule["slots"] == 30
+        assert schedule["coordinate_mode"] == "global_exact"
+        assert payload["steps"] == 30
+
+    def test_a_phase_specific_schedule_never_claims_global_steps(self, plugin, state):
+        payload = payload_of(plugin, state, self.LORAS, "1,0.8;0.7,0.5 1;1", steps=30)
+        assert self._schedule(payload, "a.safetensors", 0)["coordinate_mode"] == "phase_relative"
+        assert payload["phase_boundaries_known"] is False
+
+    def test_a_shared_schedule_at_a_coarser_resolution_stays_relative(self, plugin, state):
+        payload = payload_of(plugin, state, self.LORAS, "1,0.8,0.4 1;1", steps=30)
+        assert self._schedule(payload, "a.safetensors", 0)["coordinate_mode"] == "phase_relative"
+
+    def test_a_new_shared_timeline_uses_the_step_count(self, plugin, state):
+        # A one-phase model: a comma list can only mean the whole run, so the
+        # timeline is one slot per inference step.
+        plugin.get_model_def = lambda model_type: {"guidance_max_phases": 1}
+        _, _, payload = act(
+            plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 0},
+            state, self.LORAS, "0.8 1", guidance=1, steps=24,
+        )
+        schedule = self._schedule(payload, "a.safetensors", 0)
+        assert schedule["shared"] is True
+        assert schedule["slots"] == 24 and schedule["coordinate_mode"] == "global_exact"
+
+    def test_a_new_phase_specific_timeline_falls_back_to_relative_slots(self, plugin, state):
+        _, _, payload = act(
+            plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 1},
+            state, self.LORAS, "0.8;0.5 1;1", steps=24,
+        )
+        schedule = self._schedule(payload, "a.safetensors", 1)
+        assert schedule["shared"] is False
+        assert schedule["coordinate_mode"] == "phase_relative"
+        assert schedule["base"] == 0.5
+
+    def test_an_ambiguous_multi_phase_schedule_is_read_only(self, plugin, state):
+        three_phase = dict(H3_MODEL_DEF, guidance_max_phases=3, lora_multiplier_phases=3)
+        plugin.get_model_def = lambda model_type: three_phase
+        payload = payload_of(plugin, state, self.LORAS, "0.9,0.8;1,1 1", guidance=3)
+        row = row_of(payload, "a.safetensors")
+        assert row["multiplier_kind"] == "advanced"
+        assert row["advanced_preserved"] is True
+        assert "3-phase" in row["schedule_reason"]
+
+        # And an edit to it is refused with an explanation, not applied.
+        _, mults, payload = act(
+            plugin, {"type": "schedule_add_region", "id": "a.safetensors", "phase": 0},
+            state, self.LORAS, "0.9,0.8;1,1 1", guidance=3,
+        )
+        assert "value" not in mults
+        assert payload["status_warn"] is True
+
+    def test_normalising_is_explicit_and_rewrites_the_token(self, plugin, state):
+        _, mults, payload = act(
+            plugin,
+            {"type": "schedule_normalize", "id": "a.safetensors", "phase": 0, "slots": 8},
+            state, self.LORAS, "1,0.5 1;1",
+        )
+        assert mults["value"].split()[0] == "1,1,1,1,0.5,0.5,0.5,0.5"
+        assert self._schedule(payload, "a.safetensors", 0)["slots"] == 8
+
+    def test_a_schedule_survives_a_model_switch_that_keeps_the_capacity(self, plugin, state):
+        multipliers = "1,0.5,0.2 1;1"
+        payload = payload_of(plugin, state, self.LORAS, multipliers, guidance=1)
+        row = row_of(payload, "a.safetensors")
+        assert row["multiplier_kind"] == "scheduled"
+        assert len(row["phase_schedules"]) == 1
+
+    def test_schedules_are_dropped_when_the_lora_leaves_the_stack(self, plugin, state):
+        instance = plugin._instance("test")
+        payload_of(plugin, state, self.LORAS, "1,0.5,0.2 1;1")
+        assert instance.schedules
+        payload_of(plugin, state, ["b.safetensors"], "1;1")
+        assert not [key for key in instance.schedules if key[0] == "a.safetensors"]
+
+    def test_a_profile_round_trips_a_scheduled_token(self, plugin, state):
+        act(plugin, {"type": "profile_save", "name": "sched"}, state, self.LORAS,
+            "1,0.8,0.4;0.7 1;1")
+        _, mults, _ = act(plugin, {"type": "profile_recall", "name": "sched"}, state, [], "")
+        assert mults["value"].split()[0] == "1,0.8,0.4;0.7"
+
+    def test_disable_all_and_restore_keep_a_schedule(self, plugin, state):
+        act(plugin, {"type": "disable_all"}, state, self.LORAS, "1,0.8,0.4;0.7 1;1")
+        _, mults, _ = act(plugin, {"type": "restore"}, state, [], "")
+        assert mults["value"].split()[0] == "1,0.8,0.4;0.7"
+
+    def test_the_slider_grid_and_precision_are_published(self, plugin, state):
+        payload = payload_of(plugin, state, [], "")
+        assert payload["slider_step"] == 0.05
+        assert payload["nudge_step"] == 0.01
+        assert payload["value_decimals"] == 4
+        assert payload["schedule_slot_limits"]["max"] >= 30

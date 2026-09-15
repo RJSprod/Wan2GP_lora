@@ -3,6 +3,7 @@
 import pytest
 
 from lora_browser import multiplier_codec as codec
+from lora_browser import schedule as sch
 from lora_browser import ui_payloads as up
 from lora_browser.inventory import build_inventory
 
@@ -137,19 +138,26 @@ class TestAdvancedPreservation:
 
     def test_normalising_never_rewrites_an_advanced_token(self, inventory):
         phases = up.resolve_phases(H3_MODEL_DEF, 2)
-        stack = up.Stack.from_native(["b.safetensors"], "0.5,0.9")
+        stack = up.Stack.from_native(["b.safetensors"], "0.5:0.9")
         up.normalize_stack_tokens(stack, phases, {})
-        assert stack.tokens == ["0.5,0.9"]
+        assert stack.tokens == ["0.5:0.9"]
+
+    def test_normalising_never_rewrites_a_scheduled_token(self, inventory):
+        """An imported schedule is rendered, not re-serialised."""
+        phases = up.resolve_phases(H3_MODEL_DEF, 2)
+        stack = up.Stack.from_native(["b.safetensors"], "0.50,0.90")
+        up.normalize_stack_tokens(stack, phases, {})
+        assert stack.tokens == ["0.50,0.90"]
 
     def test_sliders_refuse_to_edit_an_advanced_token(self, inventory):
         phases = up.resolve_phases(H3_MODEL_DEF, 2)
-        stack = up.Stack.from_native(["b.safetensors"], "0.5,0.9")
+        stack = up.Stack.from_native(["b.safetensors"], "0.5:0.9")
         assert up.set_phase_value(stack, "b.safetensors", 0, 0.7, phases, {}) is False
-        assert stack.tokens == ["0.5,0.9"]
+        assert stack.tokens == ["0.5:0.9"]
 
     def test_explicit_conversion_replaces_the_schedule(self, inventory):
         phases = up.resolve_phases(H3_MODEL_DEF, 2)
-        stack = up.Stack.from_native(["b.safetensors"], "0.5,0.9")
+        stack = up.Stack.from_native(["b.safetensors"], "0.5:0.9")
         assert up.convert_to_simple(stack, "b.safetensors", phases) is True
         assert stack.tokens == ["1;1"]
 
@@ -167,10 +175,13 @@ class TestAdvancedPreservation:
 
     def test_advanced_rows_are_flagged_for_the_editor(self, inventory):
         phases = up.resolve_phases(H3_MODEL_DEF, 2)
-        fields = up.multiplier_fields("0.5,0.9", phases, "b.safetensors")
+        fields = up.multiplier_fields("0.5:0.9", phases, "b.safetensors")
         assert fields["multiplier_kind"] == codec.ADVANCED
         assert fields["phase_values"] == []
-        assert fields["multiplier_raw"] == "0.5,0.9"
+        assert fields["multiplier_raw"] == "0.5:0.9"
+        assert fields["advanced_preserved"] is True
+        assert fields["phase_schedules"] == []
+        assert fields["schedule_reason"]
 
 
 class TestPhaseModeSwitching:
@@ -259,11 +270,14 @@ class TestStrengthEditing:
             up.set_phase_value(stack, "a.safetensors", 0, value, phases, {})
             assert float(stack.tokens[0]) == value
 
-    def test_values_are_rounded_to_two_decimals(self, inventory):
+    def test_direct_entry_keeps_four_decimals(self, inventory):
+        """Two decimals would quietly round a deliberate 0.125 to 0.13."""
         phases = up.resolve_phases(SINGLE_PHASE_MODEL_DEF, 1)
         stack = up.Stack.from_native(["a.safetensors"], "1")
         up.set_phase_value(stack, "a.safetensors", 0, 0.123456, phases, {})
-        assert stack.tokens == ["0.12"]
+        assert stack.tokens == ["0.1235"]
+        up.set_phase_value(stack, "a.safetensors", 0, 0.125, phases, {})
+        assert stack.tokens == ["0.125"]
 
 
 class TestRowsAndItems:
@@ -298,3 +312,131 @@ class TestSignature:
 
     def test_comments_do_not_change_the_signature(self):
         assert up.stack_signature(["a"], "# note\n1") == up.stack_signature(["a"], "1")
+
+
+class TestScheduleStateModel:
+    """Per-phase schedule state, and the rules that keep it honest."""
+
+    def setup_method(self):
+        self.phases = up.resolve_phases(H3_MODEL_DEF, 2)
+        self.context = up.ScheduleContext(steps=30)
+        self.schedules = {}
+        self.memory = {}
+
+    def _stack(self, multipliers, ids=("a.safetensors",)):
+        stack = up.Stack.from_native(list(ids), multipliers)
+        up.sync_schedules(stack, self.phases, self.schedules, self.context)
+        return stack
+
+    def test_each_phase_owns_its_own_regions(self):
+        stack = self._stack("1,0.8,0.4;0.7,0.7,0.2")
+        first = self.schedules[("a.safetensors", 0)]
+        second = self.schedules[("a.safetensors", 1)]
+        assert [(r.start, r.end) for r in first.regions] == [(2, 2), (3, 3)]
+        assert [(r.start, r.end) for r in second.regions] == [(3, 3)]
+
+        up.schedule_delete_region(
+            stack, "a.safetensors", 0, first.regions[0].id,
+            self.phases, self.memory, self.schedules, self.context,
+        )
+        assert [(r.start, r.end) for r in self.schedules[("a.safetensors", 1)].regions] == [(3, 3)]
+        assert stack.tokens[0] == "1,1,0.4;0.7,0.7,0.2"
+
+    def test_reopening_a_schedule_does_not_reset_it(self):
+        stack = self._stack("0.6;0.9")
+        up.schedule_enable(stack, "a.safetensors", 0, self.phases, self.memory, self.schedules, self.context)
+        up.schedule_add_region(stack, "a.safetensors", 0, self.phases, self.memory, self.schedules, self.context)
+        before = [(r.id, r.start, r.end) for r in self.schedules[("a.safetensors", 0)].regions]
+
+        # Collapsing is a view-only act; the panel re-opens onto the same data.
+        up.sync_schedules(stack, self.phases, self.schedules, self.context)
+        up.schedule_enable(stack, "a.safetensors", 0, self.phases, self.memory, self.schedules, self.context)
+        assert [(r.id, r.start, r.end) for r in self.schedules[("a.safetensors", 0)].regions] == before
+
+    def test_linked_edits_move_bases_and_never_copy_regions(self):
+        stack = self._stack("1,0.8,0.4;0.5")
+        up.schedule_set_base(
+            stack, "a.safetensors", 0, 0.9, self.phases, self.memory,
+            self.schedules, self.context, linked=True,
+        )
+        # Both phases took the new value; phase 1 kept its schedule, phase 2
+        # stayed a plain scalar rather than inheriting regions.
+        assert stack.tokens[0] == "0.9,0.8,0.4;0.9"
+        assert ("a.safetensors", 1) not in self.schedules
+
+    def test_an_edit_to_one_phase_leaves_a_hidden_phase_alone(self):
+        one = up.resolve_phases(H3_MODEL_DEF, 1)
+        stack = up.Stack.from_native(["a.safetensors"], "1,0.8,0.4;0.65")
+        up.sync_schedules(stack, one, self.schedules, self.context)
+        up.schedule_set_base(
+            stack, "a.safetensors", 0, 0.5, one, self.memory, self.schedules, self.context
+        )
+        assert stack.tokens[0] == "0.5,0.8,0.4;0.65"
+
+    def test_switching_phase_chips_rewrites_nothing(self):
+        stack = self._stack("1.0,0.80;0.7")
+        for phase in (0, 1, 0):
+            up.multiplier_fields(
+                stack.tokens[0], self.phases, "a.safetensors", self.memory,
+                self.schedules, self.context,
+            )
+        assert stack.tokens[0] == "1.0,0.80;0.7"
+
+    def test_an_imported_schedule_starts_clean_and_remembers_its_source(self):
+        self._stack("1,0.5,0.2;0.4")
+        schedule = self.schedules[("a.safetensors", 0)]
+        assert schedule.dirty is False
+        assert schedule.source_values == [1, 0.5, 0.2]
+        assert schedule.source_raw == "1,0.5,0.2;0.4"
+
+    def test_a_material_edit_marks_the_schedule_dirty(self):
+        stack = self._stack("1,0.5,0.2;0.4")
+        up.schedule_set_base(
+            stack, "a.safetensors", 0, 0.9, self.phases, self.memory, self.schedules, self.context
+        )
+        assert self.schedules[("a.safetensors", 0)].dirty is True
+
+    def test_editing_a_scheduled_lora_leaves_its_neighbours_alone(self):
+        stack = self._stack("1,0.5 0.5:0.9 0.8;0.8", ids=("a.safetensors", "b.safetensors", "c.safetensors"))
+        up.set_phase_value(
+            stack, "c.safetensors", 0, 0.3, self.phases, self.memory, schedules=self.schedules
+        )
+        assert stack.tokens == ["1,0.5", "0.5:0.9", "0.3;0.8"]
+
+    def test_a_read_only_token_refuses_schedule_actions(self):
+        stack = self._stack("0.5:0.9")
+        for call in (
+            lambda: up.schedule_enable(
+                stack, "a.safetensors", 0, self.phases, self.memory, self.schedules, self.context
+            ),
+            lambda: up.schedule_add_region(
+                stack, "a.safetensors", 0, self.phases, self.memory, self.schedules, self.context
+            ),
+        ):
+            with pytest.raises(sch.ScheduleError):
+                call()
+        assert stack.tokens == ["0.5:0.9"]
+
+    def test_a_missing_region_is_reported_not_guessed(self):
+        stack = self._stack("1,0.5,0.2")
+        with pytest.raises(sch.ScheduleError):
+            up.schedule_commit_region(
+                stack, "a.safetensors", 0, "nope", 1, 2,
+                self.phases, self.memory, self.schedules, self.context,
+            )
+
+    def test_coordinate_mode_says_phase_relative_without_a_step_count(self):
+        stack = self._stack("1,0.5,0.2")
+        fields = up.multiplier_fields(
+            stack.tokens[0], self.phases, "a.safetensors", self.memory,
+            self.schedules, up.ScheduleContext(steps=0),
+        )
+        assert fields["phase_schedules"][0]["coordinate_mode"] == up.COORD_PHASE_RELATIVE
+
+    def test_browser_tiles_do_not_carry_region_data(self):
+        stack = self._stack("1,0.5,0.2")
+        fields = up.multiplier_fields(
+            stack.tokens[0], self.phases, "a.safetensors", self.memory,
+            self.schedules, self.context, with_schedules=False,
+        )
+        assert fields["phase_schedules"] == []

@@ -16,9 +16,23 @@ this module mirrors, in the order the native parser applies them:
   A token with *more* parts than the phase count is rejected by WanGP, so this
   codec never emits one.
 
-Tokens that use ``,`` or ``:`` are "advanced": the simple slider UI cannot
-represent them as one number per phase, so they are carried through verbatim
-and only ever replaced on an explicit user conversion.
+Tokens are classified three ways:
+
+* ``SIMPLE`` -- one scalar per phase, editable by the sliders.
+* ``SCHEDULED`` -- ``,`` separated step values whose phase structure the editor
+  can map safely, so the timeline can edit them.
+* ``ADVANCED`` -- ``:`` branch syntax, malformed values, or a phase structure
+  this plugin refuses to guess at.  Carried through verbatim and only ever
+  replaced on an explicit user conversion.
+
+The phase structure of a scheduled token is what decides between the last two.
+A comma-only token is time-only: WanGP spreads it across the whole inference
+run regardless of phases, so it is one *shared* schedule.  A token that
+declares exactly as many ``;`` parts as the model's phase capacity maps one
+list per phase.  Anything in between -- two expressions for a three-phase
+model, say -- expands according to ``model_switch_phase`` inside WanGP's own
+parser, which this plugin does not replicate: those tokens stay ADVANCED and
+read-only rather than being re-serialised from a guess.
 """
 
 from __future__ import annotations
@@ -28,6 +42,7 @@ from dataclasses import dataclass, field
 from .utils import format_number, is_finite_number
 
 SIMPLE = "simple"
+SCHEDULED = "scheduled"
 ADVANCED = "advanced"
 
 DEFAULT_TOKEN = "1"
@@ -62,6 +77,37 @@ class TokenInfo:
     #: and ``"0.8;0.8"`` mean the same thing to WanGP but not to the editor: only
     #: the second one states a phase 2, so only it may overwrite a remembered value.
     declared: list[float] = field(default_factory=list)
+    #: Set for ``SCHEDULED`` tokens; ``None`` otherwise.
+    schedule: "ScheduledToken | None" = None
+    #: Why an ``ADVANCED`` token is read-only, phrased for the panel.
+    reason: str = ""
+
+
+@dataclass
+class ScheduledToken:
+    """A comma-scheduled token whose phase structure the editor can map.
+
+    ``phase_values`` holds one value list per *declared* phase, exactly as the
+    token spelled them out -- no padding, so nothing is invented.  ``shared`` is
+    the comma-only case: a single list that WanGP spreads across the whole run
+    rather than inside one phase.
+    """
+
+    raw: str
+    phase_values: list[list[float]] = field(default_factory=list)
+    shared: bool = False
+    declared_phase_count: int = 0
+    editable: bool = True
+    reason: str = ""
+
+    def values_for(self, phase: int) -> list[float]:
+        """The value list that drives ``phase``, or ``[]`` if it has none."""
+        if self.shared:
+            return list(self.phase_values[0]) if self.phase_values else []
+        index = int(phase)
+        if 0 <= index < len(self.phase_values):
+            return list(self.phase_values[index])
+        return []
 
 
 def strip_comments(text: str) -> str:
@@ -97,17 +143,27 @@ def align_tokens(tokens: list[str], count: int) -> list[str]:
     return aligned
 
 
-def classify(raw: str, phases: int) -> TokenInfo:
-    """Decide whether ``raw`` is editable by the simple sliders."""
+def classify(raw: str, phases: int, model_switch_phase: int | None = None) -> TokenInfo:
+    """Decide how ``raw`` may be edited: sliders, timeline, or not at all.
+
+    ``model_switch_phase`` is accepted because it is what WanGP's own parser
+    consults to expand an under-declared multi-phase token.  The plugin does not
+    reimplement that expansion, so the argument only ever makes classification
+    *more* conservative; it is recorded in the reason text.
+    """
     token = str(raw or "").strip() or DEFAULT_TOKEN
     phases = max(1, int(phases or 1))
 
-    if "," in token or ":" in token:
-        return TokenInfo(raw=token, kind=ADVANCED)
+    if ":" in token:
+        # Branch syntax. WanGP understands it; the visual editor does not.
+        return TokenInfo(raw=token, kind=ADVANCED, reason="Uses ':' branch syntax.")
+
+    if "," in token:
+        return _classify_scheduled(token, phases, model_switch_phase)
 
     parts = [part.strip() for part in token.split(";")]
     if not parts or not all(is_finite_number(part) for part in parts):
-        return TokenInfo(raw=token, kind=ADVANCED)
+        return TokenInfo(raw=token, kind=ADVANCED, reason="Not a list of numbers.")
 
     numbers = [float(part) for part in parts]
     visible = numbers[:phases]
@@ -120,6 +176,81 @@ def classify(raw: str, phases: int) -> TokenInfo:
         values=visible,
         overflow=numbers[phases:],
         declared=numbers,
+    )
+
+
+def _classify_scheduled(token: str, phases: int, model_switch_phase: int | None) -> TokenInfo:
+    """Classify a comma token, refusing any phase mapping that is a guess."""
+    parts = [part.strip() for part in token.split(";")]
+    lists: list[list[float]] = []
+    for part in parts:
+        entries = [entry.strip() for entry in part.split(",")]
+        if not entries or not all(is_finite_number(entry) for entry in entries):
+            return TokenInfo(raw=token, kind=ADVANCED, reason="Not a list of numbers.")
+        lists.append([float(entry) for entry in entries])
+
+    declared = len(lists)
+    shared = declared == 1
+
+    if declared > phases:
+        return TokenInfo(
+            raw=token,
+            kind=ADVANCED,
+            reason=(
+                f"Declares {declared} phases; this model accepts {phases}. "
+                "Kept exactly as imported."
+            ),
+        )
+
+    if not shared and declared != phases:
+        # WanGP expands this using model_switch_phase; guessing which phase each
+        # list lands in could silently change what renders.
+        hint = "" if model_switch_phase is None else f" (model_switch_phase={model_switch_phase})"
+        return TokenInfo(
+            raw=token,
+            kind=ADVANCED,
+            reason=(
+                f"Declares {declared} phase schedules for a {phases}-phase model{hint}; "
+                "WanGP decides how those expand, so it is kept exactly as imported."
+            ),
+        )
+
+    return TokenInfo(
+        raw=token,
+        kind=SCHEDULED,
+        schedule=ScheduledToken(
+            raw=token,
+            phase_values=lists,
+            shared=shared,
+            declared_phase_count=declared,
+            editable=True,
+        ),
+    )
+
+
+def parse_schedule(raw: str, phases: int, model_switch_phase: int | None = None) -> ScheduledToken | None:
+    """The scheduled view of ``raw``, or ``None`` when it is not one.
+
+    Parsing never mutates the token: the returned object carries ``raw`` so a
+    caller that makes no edit can put the original back byte-for-byte.
+    """
+    info = classify(raw, phases, model_switch_phase)
+    return info.schedule if info.kind == SCHEDULED else None
+
+
+def build_schedule(phase_values: list[list[float]], shared: bool = False) -> str:
+    """Serialise value lists phase-major: ``,`` inside a phase, ``;`` between.
+
+    ``shared=True`` emits only the first list, i.e. a comma-only token that
+    WanGP spreads across the whole run instead of inside one phase.
+    """
+    lists = [list(values) for values in phase_values if list(values)]
+    if not lists:
+        return DEFAULT_TOKEN
+    if shared:
+        lists = lists[:1]
+    return ";".join(
+        ",".join(format_number(value) for value in values) for values in lists
     )
 
 
