@@ -51,9 +51,13 @@
     zoomPx: 104,
     sliderMin: 0,
     sliderMax: 1,
-    sliderStep: 0.01,
+    sliderStep: 0.05,
+    nudgeStep: 0.01,
     valueMin: -10,
     valueMax: 10,
+    valueDecimals: 4,
+    steps: 0,
+    slotLimits: { min: 1, max: 120, default: 20 },
     profiles: [],
     profilesIncomplete: [],
     civitaiKeySet: false,
@@ -66,6 +70,14 @@
     requested: {},
     pendingThumbs: [],
     linked: {},
+    // View state, not data: which phase chip is selected, whether a row's
+    // timeline is expanded, and which region is highlighted. Losing any of it
+    // costs a click; it never costs a schedule.
+    selectedPhaseById: {},
+    scheduleOpenById: {},
+    selectedRegionByKey: {},
+    //: Transient pointer state for a region drag; never anything canonical.
+    drag: null,
     ready: false,
     mounted: false,
     forceNative: false,
@@ -547,6 +559,9 @@
 
     el.grid.addEventListener("keydown", function (event) {
       if (event.key !== "Enter" && event.key !== " ") { return; }
+      // A tile's own buttons (Inspect, play) handle their own keys; reaching
+      // them with the keyboard must not also toggle the LoRA.
+      if (event.target.closest("button")) { return; }
       var tile = event.target.closest(".lb-tile");
       if (!tile) { return; }
       event.preventDefault();
@@ -757,9 +772,26 @@
       var star = document.createElement("span");
       star.className = "lb-star";
       star.textContent = "\u2605";
+      star.title = "Favourite";
       badges.appendChild(star);
     }
     tile.appendChild(badges);
+
+    // The tile's own action is Inspect, not Favorite: it is the one thing worth
+    // a dedicated target, and Favorite stays in the Inspector and context menu.
+    var inspect = document.createElement("button");
+    inspect.type = "button";
+    inspect.className = "lb-btn lb-tile-inspect";
+    inspect.textContent = "i";
+    inspect.title = (item.has_catalogue ? "Inspect " : "Inspect / fetch info for ")
+      + displayName(item);
+    inspect.setAttribute("aria-label", inspect.title);
+    inspect.addEventListener("click", function (event) {
+      event.stopPropagation();          // inspect, do not toggle the LoRA
+      event.preventDefault();
+      openInspect(item.id);
+    });
+    tile.appendChild(inspect);
 
     // A tile whose preview is a video gets a play control. The still frame
     // stays the thumbnail; the video itself is only fetched on click.
@@ -869,8 +901,12 @@
     var tileHeight = tiles[0].getBoundingClientRect().height || S.zoomPx;
     var rowCount = Math.ceil(tiles.length / columns);
     var visibleRows = Math.min(rowCount, MAX_VISIBLE_ROWS);
-    var padding = 12;
-    var height = visibleRows * tileHeight + (visibleRows - 1) * gap + padding;
+    // The height is set on the box, so its own padding and border have to be in
+    // it -- measured, not assumed, because a host stylesheet decides both.
+    var wrapStyles = window.getComputedStyle(el.gridWrap);
+    var chrome = (parseFloat(wrapStyles.paddingTop) || 0) + (parseFloat(wrapStyles.paddingBottom) || 0) +
+      (parseFloat(wrapStyles.borderTopWidth) || 0) + (parseFloat(wrapStyles.borderBottomWidth) || 0);
+    var height = visibleRows * tileHeight + (visibleRows - 1) * gap + chrome;
 
     el.gridWrap.style.height = Math.ceil(height) + "px";
     el.gridWrap.style.maxHeight = Math.ceil(height) + "px";
@@ -998,16 +1034,73 @@
 
   /* ------------------------------------------------------ active rows */
 
+  /* One active row is:
+   *
+   *   [i] LoRA name                        [Schedule v]  [x]
+   *   [Phase 1 0.71] [Phase 2 1.23] [Independent]
+   *   [-]  ----------- slider -----------  [0.71]  [+]
+   *   (optionally, an inline step-schedule timeline underneath)
+   *
+   * Selected phase and expansion are view state held here; regions and bases
+   * are canonical state that Python validates.  Collapsing a schedule is a
+   * view change only -- it never deletes one. */
+
+  function phaseOf(row) {
+    var count = Math.max(1, (row.phase_values || []).length);
+    var phase = S.selectedPhaseById[row.id];
+    if (phase === undefined || phase < 0 || phase >= count) { phase = 0; }
+    return phase;
+  }
+
+  function scheduleOf(row, phase) {
+    var list = row.phase_schedules || [];
+    var index = row.schedule_shared ? 0 : phase;
+    return list[index] || null;
+  }
+
+  function regionKey(row, phase) {
+    return row.id + ":" + (row.schedule_shared ? "shared" : phase);
+  }
+
+  /* The payload's selection wins whenever the local one has gone stale, which
+     is how a freshly added region arrives already selected. */
+  function selectedRegion(row, phase, schedule) {
+    if (!schedule) { return null; }
+    var regions = schedule.regions || [];
+    var wanted = S.selectedRegionByKey[regionKey(row, phase)];
+    var found = null;
+    regions.forEach(function (region) {
+      if (region.id === wanted) { found = region; }
+    });
+    if (found) { return found; }
+    regions.forEach(function (region) {
+      if (region.id === schedule.selected_region_id) { found = region; }
+    });
+    return found || regions[0] || null;
+  }
+
   function rowsKey() {
     return S.rows.map(function (row) {
-      return row.id + ":" + row.multiplier_kind + ":" + (row.phase_values || []).length + ":" + (row.missing ? "m" : "") + (row.system_managed ? "s" : "");
-    }).join("|") + "#" + S.phases.effective;
+      var phase = phaseOf(row);
+      var schedule = scheduleOf(row, phase);
+      var shape = schedule
+        ? schedule.slots + "/" + schedule.editable + "/" +
+          (schedule.regions || []).map(function (region) {
+            return region.id + "@" + region.start + "-" + region.end;
+          }).join(",")
+        : "-";
+      return [
+        row.id, row.multiplier_kind, (row.phase_values || []).length,
+        row.missing ? "m" : "", row.system_managed ? "s" : "",
+        phase, S.scheduleOpenById[row.id] ? "open" : "shut", shape
+      ].join(":");
+    }).join("|") + "#" + S.phases.effective + "#" + S.nameMode;
   }
 
   function renderRows(force) {
     if (!el.rows) { return; }
-    // Never rebuild the DOM under a pointer that is dragging a slider.
-    if (S.dragging) { return; }
+    // Never rebuild the DOM under a pointer that is dragging something.
+    if (S.dragging || S.drag) { return; }
 
     var key = rowsKey();
     if (!force && key === S.rowsKey) {
@@ -1029,16 +1122,13 @@
     }
   }
 
+  /* Repaint values without touching structure, for payloads that only moved a
+     number (and so must not steal focus or interrupt a gesture). */
   function updateRowValues() {
     S.rows.forEach(function (row) {
       var node = el.rows.querySelector('.lb-row[data-id="' + cssEscape(row.id) + '"]');
-      if (!node) { return; }
-      (row.phase_values || []).forEach(function (value, index) {
-        var range = node.querySelector('input[type="range"][data-phase="' + index + '"]');
-        var number = node.querySelector('input[type="number"][data-phase="' + index + '"]');
-        if (range && document.activeElement !== range) { syncSliderState(range, value); }
-        if (number && document.activeElement !== number) { number.value = fmt(value); }
-      });
+      if (!node || !node.__lbPaint) { return; }
+      node.__lbPaint(row);
     });
   }
 
@@ -1047,8 +1137,58 @@
     node.className = "lb-row" + (row.missing ? " lb-missing" : "");
     node.dataset.id = row.id;
 
-    // The name is truncated so the strength controls get the width; the full
-    // name lives in the tooltip and the Inspect view.
+    var phase = phaseOf(row);
+    var schedule = scheduleOf(row, phase);
+    var open = !!S.scheduleOpenById[row.id];
+
+    node.appendChild(buildRowTop(row, phase, schedule, open));
+
+    if (row.multiplier_kind === "advanced") {
+      node.appendChild(buildPreserved(row));
+      return node;
+    }
+
+    var painters = [];
+    if ((row.phase_values || []).length > 1) {
+      var strip = buildPhaseStrip(row, phase);
+      node.appendChild(strip.node);
+      painters.push(strip.paint);
+    }
+
+    var weight = buildWeightLine({
+      value: currentValue(row, phase, schedule),
+      label: (row.name + " " + (S.phaseLabels[phase] || "strength")).trim(),
+      commit: function (value) { commitBase(row, phase, value); },
+      settle: flushSync
+    });
+    weight.node.classList.add("lb-weight-main");
+    node.appendChild(weight.node);
+    painters.push(function (next) {
+      var nextPhase = phaseOf(next);
+      weight.paint(currentValue(next, nextPhase, scheduleOf(next, nextPhase)));
+    });
+
+    if (open) {
+      node.appendChild(buildSchedule(row, phase, schedule));
+    }
+
+    node.__lbPaint = function (next) {
+      painters.forEach(function (paint) { paint(next); });
+    };
+    return node;
+  }
+
+  function currentValue(row, phase, schedule) {
+    if (schedule) { return schedule.base; }
+    var values = row.phase_values || [];
+    return values[phase] !== undefined ? values[phase] : 1;
+  }
+
+  function buildRowTop(row, phase, schedule, open) {
+    var top = document.createElement("div");
+    top.className = "lb-row-top";
+
+    // Inspector first: one tap from every row to the full record.
     var inspect = document.createElement("button");
     inspect.type = "button";
     inspect.className = "lb-btn lb-icon lb-inspect";
@@ -1057,46 +1197,740 @@
       + (row.civitai_name || row.name);
     inspect.setAttribute("aria-label", inspect.title);
     inspect.addEventListener("click", function () { openInspect(row.id); });
-    node.appendChild(inspect);
+    top.appendChild(inspect);
 
+    // The name truncates before the controls do; the full one is in the tooltip.
     var name = document.createElement("div");
     name.className = "lb-row-name";
     name.textContent = rowName(row);
     name.title = [row.civitai_name, row.name].filter(Boolean).join("\n");
     if (row.system_managed) { name.appendChild(note("WanGP-managed")); }
     if (row.missing) { name.appendChild(note("Missing locally")); }
-    node.appendChild(name);
+    if (row.multiplier_kind === "scheduled") { name.appendChild(note("Scheduled")); }
+    top.appendChild(name);
 
-    if (row.multiplier_kind === "advanced") {
-      var advanced = document.createElement("code");
-      advanced.className = "lb-advanced";
-      advanced.title = "Advanced step schedule, preserved as-is";
-      advanced.textContent = row.multiplier_raw;
-      node.appendChild(advanced);
-
-      var convert = document.createElement("button");
-      convert.type = "button";
-      convert.className = "lb-btn";
-      convert.textContent = "Use sliders";
-      convert.title = "Replace this schedule with a simple multiplier";
-      convert.addEventListener("click", function () {
-        if (!window.confirm("Replace the advanced schedule '" + row.multiplier_raw + "' with a simple multiplier?")) { return; }
-        send({ type: "convert_simple", id: row.id });
+    if (row.multiplier_kind !== "advanced") {
+      var toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "lb-btn lb-schedule-toggle" + (open ? " lb-on" : "");
+      toggle.textContent = "Schedule " + (open ? "▴" : "▾");
+      toggle.title = open
+        ? "Hide the step schedule (it is kept)"
+        : "Show the step schedule for the selected phase";
+      toggle.setAttribute("aria-expanded", open ? "true" : "false");
+      toggle.addEventListener("click", function () {
+        var next = !S.scheduleOpenById[row.id];
+        S.scheduleOpenById[row.id] = next;
+        // Opening a phase that has no schedule yet asks Python for one; it
+        // creates the timeline without writing anything to WanGP.
+        if (next && !scheduleOf(row, phase)) {
+          send({ type: "schedule_enable", id: row.id, phase: phase });
+          return;
+        }
+        renderRows(true);
       });
-      node.appendChild(convert);
-    } else {
-      node.appendChild(buildPhases(row));
+      top.appendChild(toggle);
     }
 
+    // Remove stays isolated at the far edge so it is never hit by accident.
     var remove = document.createElement("button");
     remove.type = "button";
-    remove.className = "lb-btn lb-icon";
-    remove.textContent = "\u00D7";
+    remove.className = "lb-btn lb-icon lb-remove";
+    remove.textContent = "×";
     remove.title = "Remove " + row.name;
     remove.setAttribute("aria-label", "Remove " + row.name);
     remove.addEventListener("click", function () { send({ type: "remove", id: row.id }); });
-    node.appendChild(remove);
+    top.appendChild(remove);
+    return top;
+  }
+
+  /* A multiplier this editor will not rewrite: branch syntax, or a phase
+     structure only WanGP's own parser can expand. */
+  function buildPreserved(row) {
+    var wrap = document.createElement("div");
+    wrap.className = "lb-preserved";
+
+    var raw = document.createElement("code");
+    raw.className = "lb-advanced";
+    raw.title = "Preserved exactly as imported";
+    raw.textContent = row.multiplier_raw;
+    wrap.appendChild(raw);
+
+    if (row.schedule_reason) {
+      var why = document.createElement("div");
+      why.className = "lb-preserved-note";
+      why.textContent = row.schedule_reason;
+      wrap.appendChild(why);
+    }
+
+    var convert = document.createElement("button");
+    convert.type = "button";
+    convert.className = "lb-btn";
+    convert.textContent = "Use sliders";
+    convert.title = "Replace this multiplier with a simple one";
+    convert.addEventListener("click", function () {
+      if (!window.confirm("Replace the multiplier '" + row.multiplier_raw + "' with a simple one?")) { return; }
+      send({ type: "convert_simple", id: row.id });
+    });
+    wrap.appendChild(convert);
+    return wrap;
+  }
+
+  /* Phase chips: every effective phase, its current value, and which one the
+     strength control and timeline are editing. */
+  function buildPhaseStrip(row, phase) {
+    var strip = document.createElement("div");
+    strip.className = "lb-phase-strip";
+    var values = row.phase_values || [];
+    var chipValues = [];
+
+    values.forEach(function (value, index) {
+      var chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "lb-chip" + (index === phase ? " lb-on" : "");
+      chip.setAttribute("aria-pressed", index === phase ? "true" : "false");
+      chip.appendChild(document.createTextNode((S.phaseLabels[index] || ("Phase " + (index + 1))) + " "));
+      var readout = document.createElement("strong");
+      readout.textContent = fmt(scheduleOf(row, index) ? scheduleOf(row, index).base : value);
+      chip.appendChild(readout);
+      if (scheduleOf(row, index) && scheduleOf(row, index).active) {
+        var mark = document.createElement("span");
+        mark.className = "lb-chip-mark";
+        mark.textContent = "∿";        // this phase carries a schedule
+        mark.title = "Scheduled";
+        chip.appendChild(mark);
+      }
+      chip.title = "Edit " + (S.phaseLabels[index] || ("phase " + (index + 1)));
+      chip.addEventListener("click", function () {
+        if (S.selectedPhaseById[row.id] === index) { return; }
+        S.selectedPhaseById[row.id] = index;
+        // Switching chips is a view change: it must not rewrite a token.
+        if (S.scheduleOpenById[row.id] && !scheduleOf(row, index)) {
+          send({ type: "schedule_enable", id: row.id, phase: index });
+          return;
+        }
+        renderRows(true);
+      });
+      strip.appendChild(chip);
+      chipValues.push(readout);
+    });
+
+    if (row.schedule_shared && values.length > 1) {
+      var sharedNote = document.createElement("span");
+      sharedNote.className = "lb-chip lb-chip-static";
+      sharedNote.textContent = "≡ Shared schedule";
+      sharedNote.title = "One comma schedule spans the whole run, so every phase uses it";
+      strip.appendChild(sharedNote);
+    } else if (values.length > 1) {
+      var linked = !!S.linked[row.id];
+      var link = document.createElement("button");
+      link.type = "button";
+      link.className = "lb-chip" + (linked ? " lb-on" : "");
+      link.textContent = linked ? "⚭ Linked" : "⚮ Independent";
+      link.title = linked
+        ? "One value for every phase - schedules stay separate"
+        : "Each phase keeps its own value";
+      link.setAttribute("aria-pressed", linked ? "true" : "false");
+      link.addEventListener("click", function () {
+        S.linked[row.id] = !S.linked[row.id];
+        renderRows(true);
+      });
+      strip.appendChild(link);
+    }
+
+    return {
+      node: strip,
+      paint: function (next) {
+        (next.phase_values || []).forEach(function (value, index) {
+          if (!chipValues[index]) { return; }
+          var schedule = scheduleOf(next, index);
+          chipValues[index].textContent = fmt(schedule ? schedule.base : value);
+        });
+      }
+    };
+  }
+
+  /* ------------------------------------------------- strength controls */
+
+  /* [-] slider [number] [+], with three deliberately different semantics:
+   *   slider  - coarse, 0..1 on a 0.05 grid,
+   *   +/-     - exact, 0.01 a tap, not confined to the slider's window,
+   *   number  - exact direct entry, never quantised.
+   * A value the slider cannot show is not rewritten: the thumb clamps and the
+   * number keeps the truth until the slider is actually moved. */
+  function buildWeightLine(options) {
+    var line = document.createElement("div");
+    line.className = "lb-weight";
+    var accepted = Number(options.value);
+    if (!isFinite(accepted)) { accepted = 1; }
+
+    var down = stepButton("−", "Decrease by " + fmt(S.nudgeStep));
+    var range = document.createElement("input");
+    range.type = "range";
+    range.min = String(S.sliderMin);
+    range.max = String(S.sliderMax);
+    range.step = String(S.sliderStep);
+    range.setAttribute("aria-label", options.label || "Strength");
+
+    var number = document.createElement("input");
+    number.type = "number";
+    number.step = String(S.nudgeStep);
+    number.min = String(S.valueMin);
+    number.max = String(S.valueMax);
+    number.className = "lb-number";
+    number.setAttribute("aria-label", (options.label || "Strength") + " value");
+
+    var up = stepButton("+", "Increase by " + fmt(S.nudgeStep));
+
+    function paint(value) {
+      var next = Number(value);
+      if (!isFinite(next)) { return; }
+      accepted = next;
+      if (document.activeElement !== number) { number.value = fmt(next); }
+      syncSliderState(range, next);
+    }
+
+    function apply(value) {
+      paint(value);
+      if (options.commit) { options.commit(value); }
+    }
+
+    function nudgeBy(delta) {
+      var next = round4(accepted + delta);
+      if (next < S.valueMin || next > S.valueMax) { return; }
+      apply(next);
+      if (options.settle) { options.settle(); }
+    }
+
+    down.addEventListener("click", function () { nudgeBy(-S.nudgeStep); });
+    up.addEventListener("click", function () { nudgeBy(S.nudgeStep); });
+
+    range.addEventListener("pointerdown", function () { S.dragging = true; });
+    range.addEventListener("input", function () { apply(Number(range.value)); });
+    var settle = function () {
+      S.dragging = false;
+      if (options.settle) { options.settle(); }
+    };
+    range.addEventListener("change", settle);
+    range.addEventListener("pointerup", settle);
+    range.addEventListener("pointercancel", settle);
+
+    // Typing is not committed until the field settles: partial input like "-"
+    // or "1.5e" would otherwise be pushed to WanGP mid-keystroke.
+    number.addEventListener("input", function () { syncSliderState(range, number.value); });
+    var applyTyped = function () {
+      var value = Number(number.value);
+      if (number.value.trim() === "" || !isFinite(value) ||
+          value < S.valueMin || value > S.valueMax) {
+        number.value = fmt(accepted);
+        syncSliderState(range, accepted);
+        setStatus("Strength must be between " + fmt(S.valueMin) + " and " + fmt(S.valueMax) + ".", true);
+        return;
+      }
+      apply(round4(value));
+      if (options.settle) { options.settle(); }
+    };
+    number.addEventListener("change", applyTyped);
+    number.addEventListener("blur", applyTyped);
+    number.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") { event.preventDefault(); applyTyped(); }
+    });
+
+    if (options.disabled) {
+      [down, range, number, up].forEach(function (control) { control.disabled = true; });
+    }
+
+    line.appendChild(down);
+    line.appendChild(range);
+    line.appendChild(number);
+    line.appendChild(up);
+    paint(accepted);
+    return { node: line, paint: paint, number: number, range: range };
+  }
+
+  function stepButton(glyph, title) {
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "lb-btn lb-step";
+    button.textContent = glyph;
+    button.title = title;
+    button.setAttribute("aria-label", title);
+    return button;
+  }
+
+  function round4(value) {
+    return Math.round(Number(value) * 10000) / 10000;
+  }
+
+  function clampToSlider(value) {
+    var number = Number(value);
+    if (!isFinite(number)) { return S.sliderMin; }
+    return Math.min(S.sliderMax, Math.max(S.sliderMin, number));
+  }
+
+  /* The slider covers 0..1 on a coarse grid. A value outside it, or between
+     grid stops, is still valid: the thumb goes to the nearest place it can and
+     says so, and the number field keeps the exact value. */
+  function syncSliderState(range, rawValue) {
+    var value = Number(rawValue);
+    if (!isFinite(value)) { return; }
+    var outside = value < S.sliderMin || value > S.sliderMax;
+    range.value = String(clampToSlider(value));
+    var offGrid = Math.abs(Number(range.value) - value) > 1e-9;
+    range.classList.toggle("lb-out-of-range", outside);
+    range.title = outside
+      ? "Exact value " + fmt(value) + " is outside the slider range; the number field holds it"
+      : offGrid
+        ? "Exact value " + fmt(value) + "; the slider moves in steps of " + fmt(S.sliderStep)
+        : "";
+  }
+
+  /* Record an edit locally and schedule the native write. The row is never
+     rebuilt from here, so a drag keeps its pointer capture. */
+  function commitBase(row, phase, value) {
+    var linked = !!S.linked[row.id] && !row.schedule_shared;
+    var node = el.rows.querySelector('.lb-row[data-id="' + cssEscape(row.id) + '"]');
+    if (linked && node) {
+      node.querySelectorAll(".lb-phase-strip .lb-chip strong").forEach(function (readout) {
+        readout.textContent = fmt(value);
+      });
+    }
+    S.pendingValues[row.id + "#" + (linked ? "all" : phase)] = {
+      type: "set_strength", id: row.id, phase: phase, value: Number(value), linked: linked
+    };
+    scheduleSync();
+  }
+
+  /* ------------------------------------------------------- timeline */
+
+  function buildSchedule(row, phase, schedule) {
+    var box = document.createElement("div");
+    box.className = "lb-schedule";
+    if (!schedule) {
+      box.appendChild(scheduleHead(row, phase, null));
+      var pending = document.createElement("div");
+      pending.className = "lb-empty";
+      pending.textContent = "Opening schedule...";
+      box.appendChild(pending);
+      return box;
+    }
+
+    box.appendChild(scheduleHead(row, phase, schedule));
+
+    if (!schedule.editable) {
+      var locked = document.createElement("div");
+      locked.className = "lb-preserved-note";
+      locked.textContent = schedule.reason ||
+        "This schedule is preserved exactly as imported and is read-only.";
+      box.appendChild(locked);
+      if (schedule.normalization_required) {
+        box.appendChild(normalizeButton(row, phase, schedule));
+      }
+      return box;
+    }
+
+    var selected = selectedRegion(row, phase, schedule);
+    var wrap = document.createElement("div");
+    wrap.className = "lb-timeline-wrap";
+    var timeline = buildTimeline(row, phase, schedule, selected);
+    wrap.appendChild(timeline);
+    box.appendChild(wrap);
+    box.appendChild(buildRegionEditor(row, phase, schedule, selected, timeline));
+    return box;
+  }
+
+  function scheduleHead(row, phase, schedule) {
+    var head = document.createElement("div");
+    head.className = "lb-sched-head";
+
+    var titles = document.createElement("div");
+    titles.className = "lb-sched-titles";
+    var title = document.createElement("strong");
+    title.textContent = "Step schedule";
+    titles.appendChild(title);
+    if ((row.phase_values || []).length > 1 && !row.schedule_shared) {
+      titles.appendChild(pill(S.phaseLabels[phase] || ("Phase " + (phase + 1))));
+    }
+    if (schedule) { titles.appendChild(pill(coordinateLabel(schedule))); }
+    head.appendChild(titles);
+
+    var actions = document.createElement("div");
+    actions.className = "lb-actions";
+
+    if (schedule && schedule.editable) {
+      var add = document.createElement("button");
+      add.type = "button";
+      add.className = "lb-btn lb-on";
+      add.textContent = "+ Region";
+      add.title = "Add a region in the next free part of the timeline";
+      add.addEventListener("click", function () {
+        // Let Python's choice of region be the selected one.
+        delete S.selectedRegionByKey[regionKey(row, phase)];
+        send({ type: "schedule_add_region", id: row.id, phase: phase });
+      });
+      actions.appendChild(add);
+      actions.appendChild(normalizeButton(row, phase, schedule));
+
+      var clear = document.createElement("button");
+      clear.type = "button";
+      clear.className = "lb-btn";
+      clear.textContent = "Clear phase";
+      clear.title = row.schedule_shared
+        ? "Remove this schedule and keep its base strength"
+        : "Remove only this phase's schedule and keep its base strength";
+      clear.addEventListener("click", function () {
+        if ((schedule.regions || []).length &&
+            !window.confirm("Remove this schedule and keep " + fmt(schedule.base) + " as the strength?")) {
+          return;
+        }
+        delete S.selectedRegionByKey[regionKey(row, phase)];
+        S.scheduleOpenById[row.id] = false;
+        send({ type: "schedule_clear_phase", id: row.id, phase: phase });
+      });
+      actions.appendChild(clear);
+    }
+
+    var close = document.createElement("button");
+    close.type = "button";
+    close.className = "lb-btn";
+    close.textContent = "Close";
+    close.title = "Collapse the timeline - the schedule is kept";
+    close.addEventListener("click", function () {
+      S.scheduleOpenById[row.id] = false;
+      renderRows(true);
+    });
+    actions.appendChild(close);
+    head.appendChild(actions);
+    return head;
+  }
+
+  function coordinateLabel(schedule) {
+    var slots = schedule.slots;
+    if (schedule.coordinate_mode === "global_exact") {
+      return slots + " global steps";
+    }
+    if (schedule.coordinate_mode === "normalized_readonly") {
+      return "read-only • " + slots + " values";
+    }
+    return (schedule.shared ? "spread over the run • " : "phase-relative • ")
+      + slots + " schedule slots";
+  }
+
+  /* Resolution is a product decision, so it is offered rather than applied:
+     re-gridding rewrites the native token, and nothing else here does that
+     without being asked. */
+  function normalizeButton(row, phase, schedule) {
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "lb-btn";
+    button.textContent = "Slots: " + schedule.slots + " ▾";
+    button.title = "Change how many schedule values this phase uses";
+    button.addEventListener("click", function (event) {
+      var rect = button.getBoundingClientRect();
+      openMenu(rect.left, rect.bottom, slotMenuItems(row, phase, schedule));
+      event.stopPropagation();
+    });
+    return button;
+  }
+
+  function slotMenuItems(row, phase, schedule) {
+    var limits = S.slotLimits || { min: 1, max: 120, default: 20 };
+    var options = [];
+    var seen = {};
+    [S.steps, 8, 10, 12, 16, 20, 30, 40].forEach(function (value) {
+      var slots = Math.round(Number(value));
+      if (!slots || slots < limits.min || slots > limits.max || seen[slots]) { return; }
+      seen[slots] = true;
+      options.push(slots);
+    });
+    options.sort(function (left, right) { return left - right; });
+
+    var items = options.map(function (slots) {
+      var label = slots + " slots";
+      if (slots === S.steps) { label += "  (one per step)"; }
+      if (slots === schedule.slots) { label = "✓ " + label; }
+      return {
+        label: label,
+        run: function () {
+          if (slots === schedule.slots) { return; }
+          setStatus("Re-gridding this schedule to " + slots + " values...");
+          send({ type: "schedule_normalize", id: row.id, phase: phase, slots: slots });
+        }
+      };
+    });
+    items.unshift({
+      label: "Re-grid the schedule - this rewrites the multiplier",
+      disabled: true,
+      run: function () { /* heading */ }
+    });
+    return items;
+  }
+
+  function buildTimeline(row, phase, schedule, selected) {
+    var slots = Math.max(1, schedule.slots);
+    var timeline = document.createElement("div");
+    timeline.className = "lb-timeline";
+    timeline.dataset.slots = String(slots);
+
+    var ticks = tickPositions(slots);
+    ticks.forEach(function (slot) {
+      var line = document.createElement("div");
+      line.className = "lb-gridline";
+      line.style.left = ((slot - 1) / slots * 100) + "%";
+      timeline.appendChild(line);
+
+      var tick = document.createElement("div");
+      tick.className = "lb-tick";
+      tick.style.left = ((slot - 0.5) / slots * 100) + "%";
+      tick.textContent = String(slot);
+      timeline.appendChild(tick);
+    });
+
+    var baseLine = document.createElement("div");
+    baseLine.className = "lb-baseline";
+    baseLine.textContent = "base " + fmt(schedule.base);
+    timeline.appendChild(baseLine);
+
+    (schedule.regions || []).forEach(function (region) {
+      timeline.appendChild(buildRegion(row, phase, schedule, region, selected));
+    });
+    return timeline;
+  }
+
+  function tickPositions(slots) {
+    var step = Math.max(1, Math.round(slots / 10));
+    var ticks = [];
+    for (var slot = 1; slot <= slots; slot += step) { ticks.push(slot); }
+    if (ticks[ticks.length - 1] !== slots) { ticks.push(slots); }
+    return ticks;
+  }
+
+  function buildRegion(row, phase, schedule, region, selected) {
+    var slots = Math.max(1, schedule.slots);
+    var node = document.createElement("div");
+    node.className = "lb-region" + (selected && selected.id === region.id ? " lb-on" : "");
+    node.dataset.region = region.id;
+    node.tabIndex = 0;
+    node.setAttribute("role", "button");
+
+    var left = document.createElement("div");
+    left.className = "lb-handle lb-handle-left";
+    left.textContent = "⋮";
+    var body = document.createElement("div");
+    body.className = "lb-region-body";
+    var strength = document.createElement("strong");
+    var span = document.createElement("span");
+    body.appendChild(strength);
+    body.appendChild(span);
+    var right = document.createElement("div");
+    right.className = "lb-handle lb-handle-right";
+    right.textContent = "⋮";
+    node.appendChild(left);
+    node.appendChild(body);
+    node.appendChild(right);
+
+    placeRegion(node, region, slots, schedule);
+
+    var start = function (event, mode) {
+      beginDrag(event, {
+        row: row, phase: phase, schedule: schedule, region: region,
+        node: node, mode: mode, slots: slots
+      });
+    };
+    node.addEventListener("pointerdown", function (event) {
+      if (event.target === left || event.target === right) { return; }
+      start(event, "move");
+    });
+    left.addEventListener("pointerdown", function (event) { start(event, "left"); });
+    right.addEventListener("pointerdown", function (event) { start(event, "right"); });
+
+    node.addEventListener("click", function () { selectRegion(row, phase, region.id); });
+    node.addEventListener("keydown", function (event) {
+      if (event.key !== "Enter" && event.key !== " ") { return; }
+      event.preventDefault();
+      selectRegion(row, phase, region.id);
+    });
     return node;
+  }
+
+  function placeRegion(node, region, slots, schedule) {
+    node.style.left = ((region.start - 1) / slots * 100) + "%";
+    node.style.width = ((region.end - region.start + 1) / slots * 100) + "%";
+    var strength = node.querySelector("strong");
+    var span = node.querySelector(".lb-region-body span");
+    if (strength) { strength.textContent = fmt(region.strength); }
+    if (span) { span.textContent = rangeLabel(region, schedule); }
+    node.setAttribute("aria-label", rangeLabel(region, schedule) + " at " + fmt(region.strength));
+  }
+
+  function rangeLabel(region, schedule) {
+    var step = schedule && schedule.coordinate_mode === "global_exact";
+    if (region.start === region.end) { return (step ? "Step " : "Slot ") + region.start; }
+    return (step ? "Steps " : "Slots ") + region.start + "–" + region.end;
+  }
+
+  function selectRegion(row, phase, regionId) {
+    if (S.selectedRegionByKey[regionKey(row, phase)] === regionId) { return; }
+    S.selectedRegionByKey[regionKey(row, phase)] = regionId;
+    renderRows(true);
+  }
+
+  /* Pointer Events with capture, so a drag survives leaving the element and
+     works the same with a mouse, a pen or a thumb. Only the dragged region's
+     styles change until the pointer is released. */
+  function beginDrag(event, context) {
+    if (S.drag) { return; }
+    event.preventDefault();
+    event.stopPropagation();
+
+    var timeline = context.node.parentElement;
+    var rect = timeline.getBoundingClientRect();
+    var slotPx = rect.width / context.slots;
+    if (!isFinite(slotPx) || slotPx <= 0) { return; }
+
+    S.selectedRegionByKey[regionKey(context.row, context.phase)] = context.region.id;
+    context.node.classList.add("lb-on", "lb-dragging");
+
+    S.drag = {
+      context: context,
+      startX: event.clientX,
+      slotPx: slotPx,
+      origin: { start: context.region.start, end: context.region.end },
+      current: { start: context.region.start, end: context.region.end },
+      moved: false,
+      pointerId: event.pointerId
+    };
+
+    try { context.node.setPointerCapture(event.pointerId); } catch (error) { /* mouse fallback */ }
+    context.node.addEventListener("pointermove", onDragMove);
+    context.node.addEventListener("pointerup", onDragEnd);
+    context.node.addEventListener("pointercancel", onDragCancel);
+  }
+
+  function onDragMove(event) {
+    var drag = S.drag;
+    if (!drag) { return; }
+    var delta = Math.round((event.clientX - drag.startX) / drag.slotPx);
+    var slots = drag.context.slots;
+    var origin = drag.origin;
+    var next;
+
+    if (drag.context.mode === "move") {
+      var width = origin.end - origin.start + 1;
+      var first = Math.max(1, Math.min(slots - width + 1, origin.start + delta));
+      next = { start: first, end: first + width - 1 };
+    } else if (drag.context.mode === "left") {
+      next = { start: Math.max(1, Math.min(origin.end, origin.start + delta)), end: origin.end };
+    } else {
+      next = { start: origin.start, end: Math.max(origin.start, Math.min(slots, origin.end + delta)) };
+    }
+
+    if (next.start === drag.current.start && next.end === drag.current.end) { return; }
+    drag.current = next;
+    drag.moved = true;
+
+    // Preview only: the canonical bounds are whatever Python returns.
+    var preview = { start: next.start, end: next.end, strength: drag.context.region.strength };
+    placeRegion(drag.context.node, preview, slots, drag.context.schedule);
+    var readout = drag.context.node.closest(".lb-schedule");
+    readout = readout && readout.querySelector('[data-lb="region-range"]');
+    if (readout) { readout.textContent = rangeLabel(preview, drag.context.schedule); }
+  }
+
+  function onDragEnd() {
+    var drag = S.drag;
+    if (!drag) { return; }
+    var context = drag.context;
+    releaseDrag();
+
+    if (!drag.moved) { renderRows(true); return; }
+    send({
+      type: "schedule_commit_region",
+      id: context.row.id,
+      phase: context.phase,
+      region_id: context.region.id,
+      start: drag.current.start,
+      end: drag.current.end,
+      keep_width: context.mode === "move"
+    });
+  }
+
+  /* An interrupted gesture is not an edit: go back to the committed state. */
+  function onDragCancel() {
+    if (!S.drag) { return; }
+    releaseDrag();
+    renderRows(true);
+  }
+
+  function releaseDrag() {
+    var drag = S.drag;
+    if (!drag) { return; }
+    var node = drag.context.node;
+    node.removeEventListener("pointermove", onDragMove);
+    node.removeEventListener("pointerup", onDragEnd);
+    node.removeEventListener("pointercancel", onDragCancel);
+    try { node.releasePointerCapture(drag.pointerId); } catch (error) { /* already gone */ }
+    node.classList.remove("lb-dragging");
+    S.drag = null;
+  }
+
+  function buildRegionEditor(row, phase, schedule, selected, timeline) {
+    var editor = document.createElement("div");
+    editor.className = "lb-region-editor";
+
+    var head = document.createElement("div");
+    head.className = "lb-region-head";
+    var title = document.createElement("strong");
+    title.textContent = "Selected region";
+    head.appendChild(title);
+
+    // Compact and read-only on purpose: start/end are dragged, not typed.
+    var range = pill(selected ? rangeLabel(selected, schedule) : "No region selected");
+    range.dataset.lb = "region-range";
+    head.appendChild(range);
+
+    var remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "lb-btn";
+    remove.textContent = "Delete";
+    remove.disabled = !selected;
+    remove.title = "Delete the selected region";
+    remove.addEventListener("click", function () {
+      if (!selected) { return; }
+      delete S.selectedRegionByKey[regionKey(row, phase)];
+      send({ type: "schedule_delete_region", id: row.id, phase: phase, region_id: selected.id });
+    });
+    head.appendChild(remove);
+    editor.appendChild(head);
+
+    var weight = buildWeightLine({
+      value: selected ? selected.strength : schedule.base,
+      label: "Selected region strength",
+      disabled: !selected,
+      commit: function (value) {
+        if (!selected) { return; }
+        var node = timeline.querySelector('.lb-region[data-region="' + cssEscape(selected.id) + '"]');
+        if (node) {
+          var readout = node.querySelector("strong");
+          if (readout) { readout.textContent = fmt(value); }
+        }
+        S.pendingValues[row.id + "#" + phase + "#" + selected.id] = {
+          type: "schedule_set_region_strength", id: row.id, phase: phase,
+          region_id: selected.id, value: Number(value)
+        };
+        scheduleSync();
+      },
+      settle: flushSync
+    });
+    editor.appendChild(weight.node);
+    return editor;
+  }
+
+  function pill(label) {
+    var span = document.createElement("span");
+    span.className = "lb-pill";
+    span.textContent = label;
+    return span;
   }
 
   function rowName(row) {
@@ -1111,183 +1945,6 @@
     return span;
   }
 
-  function buildPhases(row) {
-    var wrap = document.createElement("div");
-    wrap.className = "lb-phases";
-    var values = row.phase_values || [];
-
-    if (values.length > 1) {
-      var link = document.createElement("button");
-      link.type = "button";
-      link.className = "lb-btn lb-icon";
-      var linked = !!S.linked[row.id];
-      link.textContent = linked ? "\u26AD" : "\u26AE";
-      link.title = linked ? "Phases linked" : "Phases independent";
-      link.setAttribute("aria-pressed", linked ? "true" : "false");
-      link.addEventListener("click", function () {
-        S.linked[row.id] = !S.linked[row.id];
-        renderRows(true);
-      });
-      wrap.appendChild(link);
-    }
-
-    values.forEach(function (value, index) {
-      var phase = document.createElement("div");
-      phase.className = "lb-phase";
-
-      var label = document.createElement("label");
-      var fieldId = "lb-" + INSTANCE + "-" + index + "-" + Math.random().toString(36).slice(2, 8);
-      label.textContent = S.phaseLabels[index] || ("Phase " + (index + 1));
-      label.htmlFor = fieldId;
-      phase.appendChild(label);
-
-      var range = document.createElement("input");
-      range.type = "range";
-      range.dataset.phase = String(index);
-      range.min = String(S.sliderMin);
-      range.max = String(S.sliderMax);
-      range.step = String(S.sliderStep);
-      range.value = String(clampToSlider(value));
-      range.setAttribute("aria-label", (row.name + " " + (S.phaseLabels[index] || "")).trim());
-
-      var number = document.createElement("input");
-      number.type = "number";
-      number.id = fieldId;
-      number.dataset.phase = String(index);
-      number.step = "0.01";
-      number.min = String(S.valueMin);
-      number.max = String(S.valueMax);
-      number.value = fmt(value);
-
-      // Full-height stepper buttons: easier to hit than the native spinners,
-      // and they must not change the row height.
-      var down = stepButton("\u2212", "Decrease by 0.01");
-      var up = stepButton("+", "Increase by 0.01");
-      down.addEventListener("click", function () { nudge(row, index, range, number, -0.01); });
-      up.addEventListener("click", function () { nudge(row, index, range, number, 0.01); });
-
-      wirePhaseInputs(row, index, range, number);
-      phase.appendChild(range);
-      phase.appendChild(down);
-      phase.appendChild(number);
-      phase.appendChild(up);
-      syncSliderState(range, number.value);
-      wrap.appendChild(phase);
-    });
-    return wrap;
-  }
-
-  function stepButton(glyph, title) {
-    var button = document.createElement("button");
-    button.type = "button";
-    button.className = "lb-btn lb-step";
-    button.textContent = glyph;
-    button.title = title;
-    button.setAttribute("aria-label", title);
-    return button;
-  }
-
-  function clampToSlider(value) {
-    var number = Number(value);
-    if (!isFinite(number)) { return S.sliderMin; }
-    return Math.min(S.sliderMax, Math.max(S.sliderMin, number));
-  }
-
-  /* The slider only covers 0..1. Outside that the value is still valid, so the
-     numeric field keeps it and the slider disables itself rather than
-     pretending to represent a number it cannot reach. */
-  function syncSliderState(range, rawValue) {
-    var number = Number(rawValue);
-    var outside = !isFinite(number) || number < S.sliderMin || number > S.sliderMax;
-    range.disabled = outside;
-    range.classList.toggle("lb-out-of-range", outside);
-    range.title = outside
-      ? "Value is outside the slider range; edit it in the number field"
-      : "";
-    if (!outside) { range.value = String(number); }
-  }
-
-  function nudge(row, index, range, number, delta) {
-    var current = Number(number.value);
-    if (!isFinite(current)) { current = 1; }
-    var next = Math.round((current + delta) * 100) / 100;
-    if (next < S.valueMin || next > S.valueMax) { return; }
-    number.value = fmt(next);
-    syncSliderState(range, next);
-    commitValue(row, index, next, range, number);
-    flushSync();
-  }
-
-  /* Record a value locally and schedule the native sync. The row DOM is never
-     rebuilt here, so a drag keeps its pointer capture. */
-  function commitValue(row, index, value, range, number) {
-    var linked = !!S.linked[row.id];
-    if (linked) {
-      var parent = range.closest(".lb-phases");
-      parent.querySelectorAll('input[type="range"]').forEach(function (other) {
-        other.value = String(clampToSlider(value));
-        syncSliderState(other, value);
-      });
-      parent.querySelectorAll('input[type="number"]').forEach(function (other) {
-        other.value = fmt(value);
-      });
-    }
-    S.pendingValues[row.id + "#" + (linked ? "all" : index)] = {
-      type: "set_strength", id: row.id, phase: index, value: Number(value), linked: linked
-    };
-    scheduleSync();
-  }
-
-  function wirePhaseInputs(row, index, range, number) {
-    // Remember the last accepted value so an out-of-range entry can be undone.
-    var accepted = Number(number.value);
-
-    range.addEventListener("pointerdown", function () { S.dragging = true; });
-    range.addEventListener("input", function () {
-      var value = Number(range.value);
-      number.value = fmt(value);
-      accepted = value;
-      commitValue(row, index, value, range, number);
-    });
-    var settle = function () {
-      S.dragging = false;
-      flushSync();
-    };
-    range.addEventListener("change", settle);
-    range.addEventListener("pointerup", settle);
-    range.addEventListener("pointercancel", settle);
-
-    // Typing is not committed until the field settles: partial input like "-"
-    // or "1.5e" would otherwise be pushed to WanGP mid-keystroke.
-    number.addEventListener("input", function () {
-      syncSliderState(range, number.value);
-    });
-
-    var applyTyped = function () {
-      var value = Number(number.value);
-      if (number.value.trim() === "" || !isFinite(value) ||
-          value < S.valueMin || value > S.valueMax) {
-        // Out of bounds or unparseable: restore the previous value.
-        number.value = fmt(accepted);
-        syncSliderState(range, accepted);
-        setStatus("Strength must be between " + fmt(S.valueMin) + " and " + fmt(S.valueMax) + ".", true);
-        return;
-      }
-      value = Math.round(value * 100) / 100;
-      number.value = fmt(value);
-      accepted = value;
-      syncSliderState(range, value);
-      commitValue(row, index, value, range, number);
-      flushSync();
-    };
-
-    number.addEventListener("change", applyTyped);
-    number.addEventListener("blur", applyTyped);
-    number.addEventListener("keydown", function (event) {
-      if (event.key === "Enter") { event.preventDefault(); applyTyped(); }
-    });
-  }
-
   function scheduleSync() {
     clearTimeout(S.syncTimer);
     S.syncTimer = setTimeout(flushSync, SYNC_DEBOUNCE_MS);
@@ -1300,6 +1957,7 @@
     S.pendingValues = {};
     send({ type: "batch", actions: actions });
   }
+
 
   /* ------------------------------------------------------ context menu */
 
@@ -1714,9 +2372,13 @@
     S.signature = payload.signature || "";
     S.sliderMin = payload.slider_min !== undefined ? payload.slider_min : 0;
     S.sliderMax = payload.slider_max !== undefined ? payload.slider_max : 1;
-    S.sliderStep = payload.slider_step || 0.01;
+    S.sliderStep = payload.slider_step || 0.05;
+    S.nudgeStep = payload.nudge_step || 0.01;
     S.valueMin = payload.value_min !== undefined ? payload.value_min : -10;
     S.valueMax = payload.value_max !== undefined ? payload.value_max : 10;
+    S.valueDecimals = payload.value_decimals || 4;
+    S.steps = payload.steps || 0;
+    if (payload.schedule_slot_limits) { S.slotLimits = payload.schedule_slot_limits; }
     S.defaultProfile = payload.default_profile || "";
     S.civitaiKeySet = !!payload.civitai_key_set;
     if (payload.sort_mode) { S.sortMode = payload.sort_mode; }
@@ -1728,6 +2390,9 @@
       S.requested = {};
       S.pendingThumbs = [];
       S.linked = {};
+      S.selectedPhaseById = {};
+      S.scheduleOpenById = {};
+      S.selectedRegionByKey = {};
       S.playingTile = null;
       closeInspect();
     }
