@@ -13,10 +13,18 @@ thumbnail browser and a real-time strength editor.
   can actually use.
 - **Click to include / exclude.** A newly included LoRA starts at `1.0` on every
   editable phase.
-- **Strength controls** per guidance phase: a `0..1` slider for the common case,
-  `±0.01` stepper buttons, and a numeric field accepting `-10.00` to `10.00`.
-  Negative multipliers work. Outside `0..1` the slider disables itself rather
-  than misrepresenting the value, and an out-of-range entry reverts on blur.
+- **Strength controls** with three deliberately different jobs: a `0..1` slider
+  on a `0.05` grid for fast coarse setting, `±0.01` buttons for exact nudging,
+  and a numeric field for exact direct entry between `-10` and `10`. Negative
+  multipliers work. A value the slider cannot represent is never rewritten to
+  fit it — the thumb goes to the nearest place it can and the number keeps the
+  truth until you actually move the slider.
+- **Phase chips.** On a multi-phase model each phase is a chip showing its own
+  value; tapping one chooses what the strength control and the timeline edit.
+- **Step schedules you can drag.** WanGP's comma multipliers (`1,0.8,0.4,0`) are
+  a first-class editing surface: a base strength plus regions you move, resize
+  and re-weight on an inline timeline, per phase. See
+  [Step schedules](#step-schedules).
 - **Image previews first, video previews as a still.** A LoRA with only a video
   preview gets its *first frame* decoded server-side and cached; the video itself
   is never loaded in the browser.
@@ -26,8 +34,8 @@ thumbnail browser and a real-time strength editor.
   target one field.
 - **Civitai names.** When a LoRA has a catalogue folder beside it, its Civitai
   name is shown instead of the raw filename. Toggle with the `Aa` button.
-- **Inspect** (right-click a tile, or the `i` button on an active row) opens a
-  near-full-screen view of that LoRA's catalogue: description, trigger words,
+- **Inspect** (the `i` button on any tile or active row, or right-click a tile)
+  opens a near-full-screen view of that LoRA's catalogue: description, trigger words,
   and every downloaded image and video with the prompt that produced it —
   all copyable.
 - **Fetch from Civitai** inside Inspect builds that catalogue on demand for any
@@ -79,19 +87,73 @@ its syntax:
 
 | Syntax | Meaning | Editor behaviour |
 | --- | --- | --- |
-| `0.8` | one multiplier | slider |
-| `0.4;0.9` | per guidance phase | one slider per visible phase |
-| `1,0.5,0.25` | step/time varying schedule | shown read-only, preserved verbatim |
-| `0.5:0.9` | LoRA multiplier branches | shown read-only, preserved verbatim |
+| `0.8` | one multiplier | strength control |
+| `0.4;0.9` | per guidance phase | one phase chip each |
+| `1,0.5,0.25` | step/time varying schedule | editable timeline, spread over the whole run |
+| `1,0.8;0.7,0.5` | a schedule inside each phase | one editable timeline per phase |
+| `1;0.7,0.5,0.2` | scalar phase + scheduled phase | phase 1 is a number, phase 2 a timeline |
+| `0.5:0.9` | LoRA multiplier branches | preserved verbatim, read-only |
+| `0.9,0.8;1,1` on a 3-phase model | ambiguous phase expansion | preserved verbatim, read-only |
 | `1 1\|0.8` | accelerator boundary | LoRAs left of the bar are marked *WanGP-managed* |
 
-Schedules the simple sliders cannot represent are **never silently flattened**.
-They round-trip byte for byte, and replacing one with a plain multiplier takes an
-explicit confirmation.
+Anything the editor will not edit is **never silently flattened**. It round-trips
+byte for byte, the panel says why it is read-only, and replacing it with a plain
+multiplier takes an explicit confirmation.
+
+The last read-only case is deliberate. A token that declares fewer `;` parts than
+the model's phase capacity is expanded by WanGP's own parser using
+`model_switch_phase`, and this plugin does not replicate that logic — so rather
+than re-serialising such a token from a guess about which phase each list lands
+in, it is kept exactly as imported.
 
 Strengths are stored against a stable LoRA identity (the relative path WanGP
 itself uses), never against a row index — so removing the middle LoRA of a stack
 cannot shift another LoRA's multiplier onto the wrong file.
+
+### Step schedules
+
+A comma in a WanGP multiplier makes it vary over the run. The panel edits those
+as **base strength + regions**:
+
+```
+Step schedule   Phase 1   phase-relative • 20 schedule slots    [+ Region] [Slots: 20 ▾] [Clear phase] [Close]
+
+  base 0.6  ┌──────────┐              ┌────┐
+  ──────────│   0.95   │──────────────│ 0.2│────────
+            └──────────┘              └────┘
+   1     4      6    10      12   16    18   20
+```
+
+- Everything not covered by a region is the **base**, and the row's normal
+  strength control edits that base. Moving it never flattens the schedule: your
+  regions keep their own strengths.
+- `+ Region` places one in genuine free space — after the last region, else the
+  first hole that fits, else the largest — and refuses when the timeline is full
+  rather than creating an overlap.
+- Drag a region's body to move it, its edges to resize it. Bounds snap to whole
+  slots, and on drop the dragged region wins: a partial overlap shrinks its
+  neighbour, dropping inside one splits it, covering one deletes it.
+- **Close** collapses the timeline and keeps the schedule. **Clear phase**
+  removes the schedule for the selected phase only, keeping its base as a plain
+  multiplier.
+- Schedule state is **per phase**. Phase 1 and phase 2 have independent regions,
+  and linking phase values moves both bases without copying regions between them.
+
+**Slot numbers say what they are.** A comma-only token spans the whole run, so
+when `num_inference_steps` is known and the timeline has one slot per step, slots
+are labelled as real steps. A phase-specific schedule is expanded inside a phase
+interval that depends on runtime model switching, which the plugin cannot see —
+those timelines say *phase-relative* rather than inventing global step numbers.
+
+**Opening a timeline writes nothing.** A schedule that works out to one value
+everywhere is emitted as that single value, so opening the panel — or adding a
+region and not yet changing its strength — leaves the native multiplier exactly
+as it was. An imported schedule is likewise rendered, never re-serialised, until
+you make a material edit.
+
+`Slots:` re-grids a schedule to a different resolution. It is the one control
+here that rewrites an imported multiplier, which is why it is an explicit choice
+rather than something that happens on load.
 
 ### Phases
 
@@ -221,14 +283,26 @@ python -m pytest
 ```
 
 The test suite covers the parts that can be reasoned about without a running
-WanGP: multiplier parsing and serialisation, state reconciliation, phase
-switching, preview matching and caching, profile and metadata persistence, and
-the JSON bridge in `plugin.py` (against stubbed WanGP/Gradio modules).
+WanGP: multiplier parsing and serialisation, schedule compilation, region
+placement and collision resolution, state reconciliation, phase switching,
+preview matching and caching, profile and metadata persistence, and the JSON
+bridge in `plugin.py` (against stubbed WanGP/Gradio modules).
+
+The panel itself is also tested in a real browser, against that same Python
+bridge rather than a mock of it — the grid's three-row cap, the weight controls,
+and region dragging are all things only layout and pointer events can answer.
+Those tests skip unless Playwright and a Chromium build are present:
+
+```bash
+pip install playwright && playwright install chromium
+python -m pytest tests/test_panel_browser.py
+```
 
 ```
 plugin.py                  WanGP lifecycle, component wiring, JSON bridge
 lora_browser/
   multiplier_codec.py      parse/serialise loras_multipliers
+  schedule.py              region model: compile, reconstruct, place, collide
   ui_payloads.py           state model, phase resolution, action application
   inventory.py             native LoRA list -> displayable entries
   thumbnails.py            preview matching, first-frame decode, cache
@@ -239,6 +313,22 @@ lora_browser/
 assets/                    panel CSS and JavaScript
 ```
 
+### Decisions worth knowing
+
+Four things the design spec leaves to implementation, settled here:
+
+- **Numeric precision.** Direct entry keeps four decimals — the same precision
+  the serialiser emits — rather than the two the editor used to round to. An
+  untouched imported token is not rewritten at all, whatever its precision.
+- **Linked phases.** Linking moves the *base* of every visible phase. It never
+  copies regions between phases; schedules stay independent.
+- **Irregular imported schedules.** Edited at their own native resolution. A list
+  too long to drag usefully is preserved and shown read-only, with an explicit
+  re-grid offered; nothing is ever re-gridded on load.
+- **Multi-phase coordinates.** Phase-relative by default. Exact global step
+  numbers are claimed only for a schedule that really does span the whole run at
+  one slot per step.
+
 ## Status and compatibility
 
 Built against **WanGP 12.642** — the plugin API, `refresh_lora_list`,
@@ -248,9 +338,11 @@ against that source. Every WanGP global is read through a guarded lookup, so a
 build that renames or drops one degrades gracefully rather than breaking the
 tab.
 
-The automated suite runs without WanGP; the in-app acceptance pass (installing
+The automated suite runs without WanGP, and the browser tests drive the real
+panel against the real Python bridge. The in-app acceptance pass — installing
 from GitHub into a live WanGP instance and walking the checklist in the design
-spec) still needs to be done on a machine with WanGP running.
+spec against actual generations — still needs to be done on a machine with WanGP
+running.
 
 ## Licence
 

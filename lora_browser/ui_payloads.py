@@ -12,22 +12,42 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import multiplier_codec as codec
+from . import schedule as sch
 from .inventory import Inventory
 from .utils import format_number, is_finite_number, normalize_id
 
 PHASE_2_TILING_GUIDANCE_VALUE = "2~"
 
-#: The slider covers the common 0..1 range at 0.01 steps. Values outside it are
-#: entered in the numeric field, which accepts the full supported range; the
-#: slider disables itself rather than silently clamping a value it cannot show.
+#: The slider is the coarse control: it covers 0..1 on a 0.05 grid, which is
+#: what a thumb can actually hit. It never rewrites a value it cannot represent
+#: -- an imported 0.71 keeps its thumb near 0.70 and stays 0.71 until the slider
+#: is actually moved, and an imported 1.23 pins the thumb at 1.00 and stays 1.23.
 SLIDER_MIN = 0.0
 SLIDER_MAX = 1.0
-SLIDER_STEP = 0.01
+SLIDER_STEP = 0.05
+
+#: The +/- buttons step the exact value, and are not confined to the slider's
+#: 0..1 window.
+NUDGE_STEP = 0.01
 
 #: Hard bounds for the numeric field. Negative multipliers are legitimate
 #: (they invert a LoRA's effect) and WanGP does not cap the upper end either.
 VALUE_MIN = -10.0
 VALUE_MAX = 10.0
+
+#: Direct numeric entry keeps this many decimals. Two would quietly round a
+#: deliberate 0.125 to 0.13; four is the same precision the serialiser emits.
+VALUE_DECIMALS = 4
+
+#: How schedule slot numbers may be labelled.
+#:
+#: ``GLOBAL_EXACT``  - the timeline really is inference steps 1..N.
+#: ``PHASE_RELATIVE`` - slots inside one phase, whose global step numbers depend
+#:                      on runtime phase boundaries the plugin cannot see.
+#: ``NORMALIZED_READONLY`` - preserved, but not offered for dragging.
+COORD_GLOBAL_EXACT = "global_exact"
+COORD_PHASE_RELATIVE = "phase_relative"
+COORD_NORMALIZED_READONLY = "normalized_readonly"
 
 #: Field separator used only inside the canonical fingerprint below.
 _SIGNATURE_SEP = "\x1f"
@@ -87,6 +107,40 @@ def resolve_phases(model_def: dict | None, guidance_phases_value: Any) -> PhaseC
     return PhaseConfig(capacity=capacity, effective=max(1, min(capacity, guidance_count or 1)))
 
 
+@dataclass(frozen=True)
+class ScheduleContext:
+    """What the editor knows about schedule time coordinates.
+
+    ``steps`` is WanGP's ``num_inference_steps`` when the plugin could obtain
+    the component, else 0.  ``boundaries_known`` stays False in v2: a
+    phase-specific schedule is expanded inside a runtime phase interval that
+    depends on model switching and guidance, and labelling slots with global
+    step numbers the plugin cannot verify would be a lie.
+    """
+
+    steps: int = 0
+    boundaries_known: bool = False
+
+    @classmethod
+    def from_native(cls, steps_value: Any) -> "ScheduleContext":
+        try:
+            steps = int(float(steps_value))
+        except (TypeError, ValueError):
+            steps = 0
+        return cls(steps=max(0, steps))
+
+    def default_slots(self, shared: bool) -> int:
+        """Timeline length for a freshly opened schedule.
+
+        A shared schedule spans the whole run, so when the step count is known
+        one slot per step is both honest and exactly what the user sees in the
+        step counter.  A phase-specific schedule has no such anchor.
+        """
+        if shared and self.steps:
+            return sch.clamp_slots(self.steps)
+        return sch.DEFAULT_SLOTS
+
+
 def phase_labels(phases: int) -> list[str]:
     """Generic labels only -- mislabelling a phase is worse than not naming it."""
     return ["Strength"] if phases <= 1 else [f"Phase {index + 1}" for index in range(phases)]
@@ -100,7 +154,7 @@ def sanitize_value(value: Any, fallback: float = 1.0) -> float:
     """
     if not is_finite_number(value):
         return fallback
-    number = round(float(value), 2)
+    number = round(float(value), VALUE_DECIMALS)
     if number < VALUE_MIN or number > VALUE_MAX:
         return fallback
     return number
@@ -220,7 +274,11 @@ def build_items(
             "mtime": entry.mtime,
         }
         if position >= 0:
-            item.update(multiplier_fields(stack.tokens[position], phases, entry.id, memory))
+            item.update(
+                multiplier_fields(
+                    stack.tokens[position], phases, entry.id, memory, with_schedules=False
+                )
+            )
         items.append(item)
     return items
 
@@ -231,10 +289,13 @@ def build_active_rows(
     phases: PhaseConfig,
     memory: dict[str, list[float]] | None = None,
     catalogue: dict[str, Any] | None = None,
+    schedules: dict[tuple[str, int], sch.PhaseSchedule] | None = None,
+    context: ScheduleContext | None = None,
 ) -> list[dict[str, Any]]:
     """Editable rows, in native order, including LoRAs missing from disk."""
     memory = memory or {}
     catalogue = catalogue or {}
+    schedules = schedules if schedules is not None else {}
     rows = []
     for position, lora_id in enumerate(stack.ids):
         entry = inventory.get(lora_id)
@@ -249,7 +310,11 @@ def build_active_rows(
             "system_managed": stack.is_system(position),
             "missing": entry is None,
         }
-        row.update(multiplier_fields(stack.tokens[position], phases, lora_id, memory))
+        row.update(
+            multiplier_fields(
+                stack.tokens[position], phases, lora_id, memory, schedules, context
+            )
+        )
         rows.append(row)
     return rows
 
@@ -259,10 +324,19 @@ def multiplier_fields(
     phases: PhaseConfig,
     lora_id: str,
     memory: dict[str, list[float]] | None = None,
+    schedules: dict[tuple[str, int], sch.PhaseSchedule] | None = None,
+    context: ScheduleContext | None = None,
+    with_schedules: bool = True,
 ) -> dict[str, Any]:
-    """Editor fields for one token: sliders when simple, raw text when not."""
+    """Editor fields for one token: sliders, timeline, or preserved raw text.
+
+    ``with_schedules`` is off for browser tiles, which only need to know that a
+    LoRA is active -- sending every tile a region list would bloat the payload
+    for nothing.
+    """
     memory = memory if memory is not None else {}
     info = codec.classify(raw, phases.capacity)
+
     if info.kind == codec.ADVANCED:
         return {
             "multiplier_raw": info.raw,
@@ -270,20 +344,156 @@ def multiplier_fields(
             "phase_values": [],
             "hidden_values": [],
             "linked": False,
+            "phase_schedules": [],
+            "schedule_shared": False,
+            "schedule_reason": info.reason,
+            "advanced_preserved": True,
         }
+
+    if info.kind == codec.SCHEDULED:
+        return _scheduled_fields(info, phases, lora_id, schedules or {}, context, with_schedules)
 
     values = full_values(info, phases, lora_id, memory)
     visible = values[: phases.effective]
     return {
         "multiplier_raw": info.raw,
         "multiplier_kind": codec.SIMPLE,
-        "phase_values": [round(value, 4) for value in visible],
-        "hidden_values": [round(value, 4) for value in values[phases.effective:]],
+        "phase_values": [round(value, VALUE_DECIMALS) for value in visible],
+        "hidden_values": [round(value, VALUE_DECIMALS) for value in values[phases.effective:]],
         # Linking is a UI preference the user sets, never inferred from the
         # values happening to be equal -- otherwise a freshly added LoRA (1;1)
         # would start linked and dragging phase 1 would silently move phase 2.
         "linked": False,
+        # A scalar phase can still have an *open* timeline: the editor holds the
+        # schedule until the first region makes it real, so opening the panel
+        # cannot change what WanGP renders.
+        "phase_schedules": (
+            _visible_schedules(
+                lora_id, phases, schedules or {}, context,
+                shared=token_is_shared(info, phases, lora_id, schedules),
+            )
+            if with_schedules else []
+        ),
+        "schedule_shared": token_is_shared(info, phases, lora_id, schedules),
+        "schedule_reason": "",
+        "advanced_preserved": False,
     }
+
+
+def _scheduled_fields(
+    info: codec.TokenInfo,
+    phases: PhaseConfig,
+    lora_id: str,
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None,
+    with_schedules: bool,
+) -> dict[str, Any]:
+    """Row fields for a token the timeline can edit."""
+    token = info.schedule
+    shared = token.shared
+    bases = []
+    for phase in range(phases.capacity):
+        stored = schedules.get(schedule_key(lora_id, phase, shared))
+        if stored is not None:
+            bases.append(float(stored.base))
+            continue
+        values = token.values_for(phase)
+        bases.append(float(values[0]) if values else 1.0)
+
+    return {
+        "multiplier_raw": info.raw,
+        "multiplier_kind": codec.SCHEDULED,
+        "phase_values": [round(value, VALUE_DECIMALS) for value in bases[: phases.effective]],
+        "hidden_values": [round(value, VALUE_DECIMALS) for value in bases[phases.effective:]],
+        "linked": False,
+        "phase_schedules": (
+            _visible_schedules(lora_id, phases, schedules, context, shared=shared)
+            if with_schedules else []
+        ),
+        "schedule_shared": shared,
+        "schedule_reason": "",
+        "advanced_preserved": False,
+    }
+
+
+def _visible_schedules(
+    lora_id: str,
+    phases: PhaseConfig,
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None,
+    shared: bool,
+) -> list[dict[str, Any] | None]:
+    """One entry per editable phase: its schedule payload, or ``None``."""
+    result: list[dict[str, Any] | None] = []
+    for phase in range(max(1, phases.effective)):
+        stored = schedules.get(schedule_key(lora_id, phase, shared))
+        result.append(
+            schedule_payload(stored, shared=shared, phases=phases, context=context)
+            if stored is not None else None
+        )
+    return result
+
+
+def schedule_payload(
+    schedule: sch.PhaseSchedule,
+    *,
+    shared: bool,
+    phases: PhaseConfig,
+    context: ScheduleContext | None,
+) -> dict[str, Any]:
+    """One phase's schedule, as the frontend consumes it.
+
+    Region ids travel with it; they are an editor concept and never appear in
+    the native token.
+    """
+    return {
+        "base": round(float(schedule.base), VALUE_DECIMALS),
+        "slots": sch.held_slots(schedule.slots),
+        "coordinate_mode": coordinate_mode(schedule, shared=shared, phases=phases, context=context),
+        "steps": int(context.steps) if context else 0,
+        "regions": [
+            {
+                "id": region.id,
+                "start": int(region.start),
+                "end": int(region.end),
+                "strength": round(float(region.strength), VALUE_DECIMALS),
+            }
+            for region in sch.sort_regions(schedule.regions)
+        ],
+        "selected_region_id": schedule.selected_region_id,
+        "editable": bool(schedule.editable),
+        "normalization_required": bool(schedule.normalization_required),
+        "dirty": bool(schedule.dirty),
+        "shared": bool(shared),
+        # True once the native token actually carries comma syntax for it; an
+        # open-but-empty schedule is not yet part of what WanGP is told.
+        "active": sch.is_materialized(schedule),
+        "reason": schedule.reason,
+    }
+
+
+def coordinate_mode(
+    schedule: sch.PhaseSchedule,
+    *,
+    shared: bool,
+    phases: PhaseConfig,
+    context: ScheduleContext | None,
+) -> str:
+    """Decide what slot numbers may claim to be.
+
+    Exact global steps are only claimed for a schedule that really does span the
+    whole run at one slot per step.  Everything else says so: guessing phase
+    boundaries from equal percentages would mislabel every model whose switch
+    point is not exactly halfway.
+    """
+    if not schedule.editable:
+        return COORD_NORMALIZED_READONLY
+    steps = int(context.steps) if context else 0
+    if shared and steps and sch.held_slots(schedule.slots) == steps:
+        return COORD_GLOBAL_EXACT
+    if context and context.boundaries_known and steps:
+        return COORD_GLOBAL_EXACT
+    return COORD_PHASE_RELATIVE
 
 
 def full_values(
@@ -349,18 +559,34 @@ def set_phase_value(
     phases: PhaseConfig,
     memory: dict[str, list[float]],
     linked: bool = False,
+    schedules: dict[tuple[str, int], sch.PhaseSchedule] | None = None,
 ) -> bool:
-    """Write one slider back into the token, leaving hidden phases untouched.
+    """Write one strength edit back into the token.
 
-    Editing a LoRA whose token is an advanced schedule is refused here; the
-    frontend has to ask for an explicit conversion first, so a comma-based
-    schedule is never flattened by an accidental drag.
+    Which thing it writes depends on the selected phase:
+
+    * an unscheduled phase -> the plain scalar,
+    * a scheduled phase -> that schedule's *base*, leaving its regions in place.
+
+    The second rule is what keeps the strength control and the timeline from
+    contradicting each other; flattening the schedule back to a scalar because
+    a slider moved would throw away the user's regions.
+
+    Editing a LoRA whose token is advanced is refused: the frontend has to ask
+    for an explicit conversion first, so branch syntax is never flattened by an
+    accidental drag.
     """
     position = stack.index_of(lora_id)
     if position < 0:
         return False
 
     info = codec.classify(stack.tokens[position], phases.capacity)
+    if info.kind == codec.SCHEDULED or (
+        info.kind == codec.SIMPLE and schedules and _has_schedule(lora_id, phases, schedules)
+    ):
+        if schedules is None:
+            return False
+        return _set_base(stack, info, lora_id, phase, value, phases, memory, schedules, linked)
     if info.kind != codec.SIMPLE:
         return False
 
@@ -387,6 +613,531 @@ def convert_to_simple(stack: "Stack", lora_id: str, phases: PhaseConfig) -> bool
         return False
     stack.tokens[position] = codec.default_token(phases.capacity)
     return True
+
+
+# --------------------------------------------------------------- schedules
+#
+# Native tokens stay the truth.  Regions are the editor's decomposition of one
+# phase's value list, held per media-generator tab and re-derived from the token
+# whenever the two disagree -- so a preset, an .lset import or a queue edit can
+# never leave the timeline showing something WanGP is not going to render.
+
+#: Phase index used for a shared (comma-only) schedule, which belongs to no
+#: single phase.
+SHARED_PHASE = -1
+
+
+def schedule_key(lora_id: str, phase: Any, shared: bool) -> tuple[str, int]:
+    """Editor-state key for one phase's schedule."""
+    try:
+        index = int(phase)
+    except (TypeError, ValueError):
+        index = 0
+    return (normalize_id(lora_id), SHARED_PHASE if shared else max(0, index))
+
+
+def token_is_shared(
+    info: codec.TokenInfo,
+    phases: PhaseConfig,
+    lora_id: str = "",
+    schedules: dict[tuple[str, int], sch.PhaseSchedule] | None = None,
+) -> bool:
+    """Whether this LoRA's schedule spans the run rather than one phase.
+
+    An existing comma-only token is shared by definition.  A token with no
+    schedule yet becomes shared only on a single-phase model, where a comma list
+    cannot mean anything else.
+
+    A shared timeline whose regions currently work out flat collapses back to a
+    scalar in the token, so the token alone would say "not shared" and the
+    editor would lose the timeline.  An already-open shared schedule therefore
+    keeps its answer.
+    """
+    if info.kind == codec.SCHEDULED and info.schedule is not None:
+        return info.schedule.shared
+    if lora_id and schedules and schedule_key(lora_id, 0, True) in schedules:
+        return True
+    return phases.capacity <= 1
+
+
+def sync_schedules(
+    stack: "Stack",
+    phases: PhaseConfig,
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None = None,
+) -> None:
+    """Reconcile held region state with the native tokens.
+
+    Kept when the stored regions still compile to exactly the values in the
+    token -- that is what makes region ids stable across a round trip -- and
+    rebuilt from the token otherwise.  Nothing here writes to the token: an
+    imported schedule is rendered, never re-serialised.
+    """
+    live: set[tuple[str, int]] = set()
+
+    for position, lora_id in enumerate(stack.ids):
+        info = codec.classify(stack.tokens[position], phases.capacity)
+        if info.kind == codec.ADVANCED:
+            continue
+
+        shared = token_is_shared(info, phases, lora_id, schedules)
+        for phase in range(1 if shared else phases.capacity):
+            key = schedule_key(lora_id, phase, shared)
+            values = _phase_values(info, phases, lora_id, phase)
+            stored = schedules.get(key)
+
+            if stored is not None and _tracks(stored, values):
+                live.add(key)
+                continue
+
+            if len(values) > 1:
+                # The token carries a schedule this editor state does not match:
+                # WanGP is the truth, so derive the timeline from the token.
+                live.add(key)
+                schedules[key] = sch.reconstruct_schedule(values, raw=info.raw)
+
+    for key in [key for key in schedules if key not in live]:
+        del schedules[key]
+
+
+def _phase_values(info: codec.TokenInfo, phases: PhaseConfig, lora_id: str, phase: int) -> list[float]:
+    """The native value list driving one phase, without inventing anything."""
+    if info.kind == codec.SCHEDULED and info.schedule is not None:
+        return info.schedule.values_for(phase)
+    if info.kind == codec.SIMPLE and info.values:
+        index = min(max(0, int(phase)), len(info.values) - 1)
+        return [float(info.values[index])]
+    return []
+
+
+def _tracks(schedule: sch.PhaseSchedule, values: list[float]) -> bool:
+    """True when ``schedule`` still says exactly what the token says.
+
+    Compared against what the schedule would *emit*, so a timeline that is open
+    but not yet doing anything keeps its slot count and regions instead of being
+    rebuilt from the scalar it currently compiles to.
+    """
+    emitted = sch.native_values(schedule)
+    if len(emitted) != len(values):
+        return False
+    return all(_close(left, right) for left, right in zip(emitted, values))
+
+
+def _close(left: float, right: float) -> bool:
+    return abs(float(left) - float(right)) <= 1e-9
+
+
+def _has_schedule(
+    lora_id: str, phases: PhaseConfig, schedules: dict[tuple[str, int], sch.PhaseSchedule]
+) -> bool:
+    if schedule_key(lora_id, 0, True) in schedules:
+        return True
+    return any(schedule_key(lora_id, phase, False) in schedules for phase in range(phases.capacity))
+
+
+@dataclass
+class _Target:
+    """Everything an edit needs about one (LoRA, phase) schedule."""
+
+    info: codec.TokenInfo
+    key: tuple[str, int]
+    schedule: sch.PhaseSchedule
+    lists: list[list[float]]
+    index: int
+    shared: bool
+
+
+def _resolve(
+    stack: "Stack",
+    lora_id: str,
+    phase: Any,
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None,
+    create: bool = False,
+) -> _Target:
+    """Locate one phase's schedule, raising a message the panel can show."""
+    position = stack.index_of(lora_id)
+    if position < 0:
+        raise sch.ScheduleError("That LoRA is not active.")
+
+    info = codec.classify(stack.tokens[position], phases.capacity)
+    if info.kind == codec.ADVANCED:
+        raise sch.ScheduleError(
+            info.reason or "This multiplier is preserved as imported and is not editable here."
+        )
+
+    shared = token_is_shared(info, phases, lora_id, schedules)
+    index = 0 if shared else max(0, int(phase or 0))
+    if index >= phases.capacity:
+        raise sch.ScheduleError("That phase does not exist for this model.")
+
+    key = schedule_key(lora_id, index, shared)
+    schedule = schedules.get(key)
+    if schedule is None:
+        if not create:
+            raise sch.ScheduleError("No schedule is open for that phase.")
+        values = _phase_values(info, phases, lora_id, index)
+        base = float(values[0]) if values else 1.0
+        schedule = sch.PhaseSchedule(
+            base=base,
+            slots=(context or ScheduleContext()).default_slots(shared),
+            regions=[],
+        )
+        schedules[key] = schedule
+
+    if not schedule.editable:
+        raise sch.ScheduleError(
+            schedule.reason or "This schedule is preserved as imported and is read-only."
+        )
+
+    lists = _token_lists(info, phases, lora_id, memory, schedules, shared)
+    return _Target(info=info, key=key, schedule=schedule, lists=lists, index=index, shared=shared)
+
+
+def _token_lists(
+    info: codec.TokenInfo,
+    phases: PhaseConfig,
+    lora_id: str,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    shared: bool,
+) -> list[list[float]]:
+    """Every phase's value list, ready to be re-serialised.
+
+    Phases the current guidance mode hides are included exactly as the token
+    spelled them, so editing phase 1 cannot drop a phase 2 the user tuned.
+    """
+    if shared:
+        values = _phase_values(info, phases, lora_id, 0)
+        return [list(values) if values else [1.0]]
+
+    if info.kind == codec.SCHEDULED and info.schedule is not None:
+        lists = [list(values) for values in info.schedule.phase_values]
+        while len(lists) < phases.capacity:
+            lists.append(list(lists[-1]) if lists else [1.0])
+        return lists[: phases.capacity]
+
+    scalars = full_values(info, phases, lora_id, memory)
+    return [[value] for value in scalars]
+
+
+def _commit(
+    stack: "Stack",
+    lora_id: str,
+    target: _Target,
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+) -> bool:
+    """Serialise the edited phase back into the native token."""
+    target.schedule.dirty = True
+    lists = [list(values) for values in target.lists]
+    lists[target.index] = sch.native_values(target.schedule)
+
+    if target.shared:
+        lists = lists[:1]
+
+    if all(len(values) <= 1 for values in lists):
+        scalars = [values[0] if values else 1.0 for values in lists]
+        if target.shared and phases.capacity > 1:
+            # A shared scalar is simply a scalar; pad it the way a simple token
+            # is padded so the rest of the editor sees one value per phase.
+            scalars = codec.rescale_values(scalars, phases.capacity, memory.get(lora_id))
+        token = codec.build_token(scalars, phases.capacity)
+        memory[normalize_id(lora_id)] = list(scalars)
+    else:
+        token = codec.build_schedule(lists, shared=target.shared)
+
+    changed = stack.token_for(lora_id) != token
+    stack.set_token(lora_id, token)
+    return changed
+
+
+def _set_base(
+    stack: "Stack",
+    info: codec.TokenInfo,
+    lora_id: str,
+    phase: Any,
+    value: Any,
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    linked: bool,
+) -> bool:
+    """Strength edit on a LoRA that has at least one schedule.
+
+    Linking moves the *base* of every visible phase, as the user asked.  It
+    never copies regions between phases: schedules stay independent unless the
+    user explicitly asks for one to be duplicated.
+    """
+    shared = token_is_shared(info, phases, lora_id, schedules)
+    targets = range(phases.effective) if (linked and phases.effective > 1 and not shared) else [int(phase or 0)]
+    changed = False
+
+    for index in targets:
+        try:
+            target = _resolve(stack, lora_id, index, phases, memory, schedules, None, create=False)
+        except sch.ScheduleError:
+            # An unscheduled phase keeps its plain scalar behaviour.
+            changed = _set_scalar_phase(stack, lora_id, index, value, phases, memory, schedules) or changed
+            continue
+        target.schedule.base = sanitize_value(value, target.schedule.base)
+        changed = _commit(stack, lora_id, target, phases, memory) or changed
+
+    return changed
+
+
+def _set_scalar_phase(
+    stack: "Stack",
+    lora_id: str,
+    phase: int,
+    value: Any,
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule] | None = None,
+) -> bool:
+    """Set one unscheduled phase of a token whose other phases are scheduled."""
+    position = stack.index_of(lora_id)
+    if position < 0:
+        return False
+    info = codec.classify(stack.tokens[position], phases.capacity)
+    if info.kind == codec.ADVANCED:
+        return False
+
+    shared = token_is_shared(info, phases, lora_id, schedules)
+    lists = _token_lists(info, phases, lora_id, memory, schedules or {}, shared)
+    index = max(0, min(int(phase), len(lists) - 1))
+    if len(lists[index]) > 1:
+        return False
+    number = sanitize_value(value, lists[index][0] if lists[index] else 1.0)
+    lists[index] = [number]
+
+    if all(len(values) <= 1 for values in lists):
+        scalars = [values[0] for values in lists]
+        token = codec.build_token(scalars, phases.capacity)
+        memory[normalize_id(lora_id)] = list(scalars)
+    else:
+        token = codec.build_schedule(lists, shared=shared)
+
+    changed = stack.tokens[position] != token
+    stack.tokens[position] = token
+    return changed
+
+
+def schedule_enable(
+    stack: "Stack",
+    lora_id: str,
+    phase: Any,
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None = None,
+) -> bool:
+    """Open a timeline for one phase, starting from its current strength.
+
+    Nothing is written to WanGP: the schedule has no regions yet, so it means
+    exactly the scalar it came from.  That is what makes opening the panel safe.
+    """
+    _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=True)
+    return False
+
+
+def schedule_set_base(
+    stack: "Stack",
+    lora_id: str,
+    phase: Any,
+    value: Any,
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None = None,
+    linked: bool = False,
+) -> bool:
+    """Move the base under a schedule, keeping every region's own strength."""
+    target = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=True)
+    target.schedule.base = sanitize_value(value, target.schedule.base)
+    changed = _commit(stack, lora_id, target, phases, memory)
+
+    if linked and phases.effective > 1 and not target.shared:
+        for index in range(phases.effective):
+            if index == target.index:
+                continue
+            try:
+                other = _resolve(stack, lora_id, index, phases, memory, schedules, context, create=False)
+            except sch.ScheduleError:
+                changed = _set_scalar_phase(stack, lora_id, index, value, phases, memory, schedules) or changed
+                continue
+            other.schedule.base = sanitize_value(value, other.schedule.base)
+            changed = _commit(stack, lora_id, other, phases, memory) or changed
+    return changed
+
+
+def schedule_add_region(
+    stack: "Stack",
+    lora_id: str,
+    phase: Any,
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None = None,
+) -> bool:
+    """Add one region in genuine free space, at the schedule's base strength.
+
+    Refused rather than overlapped when the timeline is full: creating a region
+    on top of another and letting collision resolution sort it out would delete
+    someone's work as a side effect of a single tap.
+    """
+    target = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=True)
+    schedule = target.schedule
+    span = sch.find_region_slot(schedule.regions, schedule.slots)
+    if span is None:
+        raise sch.ScheduleError("The schedule is full - delete or shrink a region first.")
+
+    region = sch.Region(
+        id=sch.next_region_id(schedule.regions),
+        start=span[0],
+        end=span[1],
+        strength=sanitize_value(schedule.base, 1.0),
+    )
+    schedule.regions = sch.sort_regions(schedule.regions + [region])
+    schedule.selected_region_id = region.id
+    sch.validate_regions(schedule.regions, schedule.slots)
+    return _commit(stack, lora_id, target, phases, memory)
+
+
+def schedule_commit_region(
+    stack: "Stack",
+    lora_id: str,
+    phase: Any,
+    region_id: str,
+    start: Any,
+    end: Any,
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None = None,
+    keep_width: bool = False,
+) -> bool:
+    """Accept the final bounds of a move or resize and settle the collisions.
+
+    The frontend sends where the region ended up, not how it got there: the
+    gesture is presentation, the bounds are the contract.
+    """
+    target = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=False)
+    schedule = target.schedule
+    region = schedule.region(region_id)
+    if region is None:
+        raise sch.ScheduleError("That region no longer exists.")
+
+    first, last = sch.clamp_region(
+        start, end, schedule.slots, keep_width=keep_width, width=region.width
+    )
+    winner = sch.Region(id=region.id, start=first, end=last, strength=region.strength)
+    schedule.regions = sch.resolve_collision(schedule.regions, winner)
+    schedule.selected_region_id = winner.id
+    sch.validate_regions(schedule.regions, schedule.slots)
+    return _commit(stack, lora_id, target, phases, memory)
+
+
+def schedule_set_region_strength(
+    stack: "Stack",
+    lora_id: str,
+    phase: Any,
+    region_id: str,
+    value: Any,
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None = None,
+) -> bool:
+    target = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=False)
+    region = target.schedule.region(region_id)
+    if region is None:
+        raise sch.ScheduleError("That region no longer exists.")
+    region.strength = sanitize_value(value, region.strength)
+    target.schedule.selected_region_id = region.id
+    return _commit(stack, lora_id, target, phases, memory)
+
+
+def schedule_delete_region(
+    stack: "Stack",
+    lora_id: str,
+    phase: Any,
+    region_id: str,
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None = None,
+) -> bool:
+    target = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=False)
+    schedule = target.schedule
+    if schedule.region(region_id) is None:
+        raise sch.ScheduleError("That region no longer exists.")
+    schedule.regions = [region for region in schedule.regions if region.id != str(region_id)]
+    schedule.selected_region_id = schedule.regions[0].id if schedule.regions else None
+    return _commit(stack, lora_id, target, phases, memory)
+
+
+def schedule_clear_phase(
+    stack: "Stack",
+    lora_id: str,
+    phase: Any,
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None = None,
+) -> bool:
+    """Return one phase to its schedule base, leaving other phases alone.
+
+    Deliberately different from closing the panel, which only collapses it.
+    """
+    target = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=False)
+    target.schedule.regions = []
+    target.schedule.selected_region_id = None
+    changed = _commit(stack, lora_id, target, phases, memory)
+    schedules.pop(target.key, None)
+    return changed
+
+
+def schedule_normalize(
+    stack: "Stack",
+    lora_id: str,
+    phase: Any,
+    slots: Any,
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None = None,
+) -> bool:
+    """Re-grid one schedule onto a different number of slots.
+
+    Only ever from an explicit user action: silently regridding an imported
+    schedule would change what WanGP renders without anyone asking.
+    """
+    position = stack.index_of(lora_id)
+    if position < 0:
+        raise sch.ScheduleError("That LoRA is not active.")
+    info = codec.classify(stack.tokens[position], phases.capacity)
+    if info.kind == codec.ADVANCED:
+        raise sch.ScheduleError(
+            info.reason or "This multiplier is preserved as imported and is not editable here."
+        )
+
+    shared = token_is_shared(info, phases, lora_id, schedules)
+    index = 0 if shared else max(0, int(phase or 0))
+    key = schedule_key(lora_id, index, shared)
+    existing = schedules.get(key)
+    if existing is None:
+        raise sch.ScheduleError("No schedule is open for that phase.")
+
+    target_slots = sch.clamp_slots(slots)
+    if target_slots == sch.clamp_slots(existing.slots) and existing.editable:
+        return False
+
+    schedules[key] = sch.normalize_schedule(existing, target_slots)
+    target = _resolve(stack, lora_id, index, phases, memory, schedules, context, create=False)
+    return _commit(stack, lora_id, target, phases, memory)
 
 
 def stack_signature(selected, multipliers: str) -> str:

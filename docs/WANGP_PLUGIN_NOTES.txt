@@ -211,6 +211,22 @@ WHY IT TOOK FOUR ROUNDS
         its last value, so "0.8" == "0.8;0.8".
       - A token with MORE parts than the phase count is REJECTED by WanGP.
 
+    SCHEDULE GRAMMAR IS PHASE-MAJOR
+      In "1,0.8,0.4,0;0.7,0.5,0.2,0" the ';' is the outer separator: phase 1 is
+      scheduled 1 -> 0.8 -> 0.4 -> 0 and phase 2 is scheduled separately. Emit
+      it the other way round and the values land in the wrong phases.
+
+      A comma-only token (no ';') is TIME-ONLY: WanGP spreads it across the
+      whole run regardless of phases, so it is one schedule shared by every
+      phase, not phase 1's schedule.
+
+      A token that declares FEWER ';' parts than the phase capacity - two
+      expressions for a three-phase model, say - is expanded by WanGP using
+      model_switch_phase. The "repeat the last value" rule that holds for
+      scalars is NOT a safe substitute for scheduled lists. This plugin does not
+      replicate that expansion: such tokens are classified ADVANCED and kept
+      byte-for-byte rather than re-serialised from a guess.
+
     CRITICAL SERIALIZATION GOTCHA
       preparse_loras_multipliers() does:
           loras_multipliers.replace("|", " ").strip().split(" ")
@@ -335,6 +351,8 @@ ALWAYS RUN THE NEGATIVE TEST
   plugin.py                  WanGP lifecycle, component wiring, JSON bridge only
   lora_browser/
     multiplier_codec.py      parse/serialise loras_multipliers  (heavily tested)
+    schedule.py              step-schedule regions: compile, reconstruct,
+                             place, resolve collisions (pure, heavily tested)
     ui_payloads.py           state model, phase resolution, action application
     inventory.py             native LoRA list -> displayable entries
     thumbnails.py            preview matching, first-frame decode, cache
@@ -351,6 +369,13 @@ ALWAYS RUN THE NEGATIVE TEST
   Keep parsing, reconciliation and persistence OUT of plugin.py. Everything in
   lora_browser/ is pure and testable; that is why multiplier corruption bugs
   were caught by unit tests while every rendering bug needed a real browser.
+
+  tests/test_panel_browser.py closes that gap: it serves the real assets to
+  headless Chromium over the real _build_payload/_apply_action pair (WanGP and
+  Gradio stubbed exactly as the bridge tests stub them) and drives the panel
+  with real pointer events. It skips without Playwright/Chromium. Layout rules
+  like the three-row cap and gesture rules like region dragging can only be
+  checked there - both were wrong in ways no unit test could see.
 
   Placeholder markers to be aware of: assets/*.js and *.css contain __INST__,
   __NS__, __ROOT__ etc. which plugin.py substitutes per instance at build time.

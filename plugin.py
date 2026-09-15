@@ -27,6 +27,7 @@ from shared.utils.plugins import WAN2GPPlugin
 
 from .lora_browser import catalogue as cat
 from .lora_browser import civitai
+from .lora_browser import schedule as sch
 from .lora_browser import ui_payloads as up
 from .lora_browser.inventory import build_inventory, diff_ids
 from .lora_browser.metadata_store import MetadataStore, resolve_store_path
@@ -90,6 +91,10 @@ class InstanceState:
         #: every LoRA on every payload would be wasteful; the sidecar only
         #: changes when the enrichment script runs again.
         self.catalogue_cache: dict[str, tuple[float, Any]] = {}
+        #: (lora id, phase) -> PhaseSchedule. The editor's region decomposition
+        #: of a scheduled multiplier; re-derived from the native token whenever
+        #: the two disagree, so WanGP stays the truth.
+        self.schedules: dict[tuple[str, int], Any] = {}
 
     def next_revision(self) -> int:
         self.revision += 1
@@ -125,7 +130,13 @@ class LoraBrowserPlugin(WAN2GPPlugin):
     def setup_ui(self) -> None:
         # Component names are the local variable names in wgp.py's
         # generate_media_tab; the plugin manager resolves them from that scope.
-        for component in ("loras_choices", "loras_multipliers", "guidance_phases", "state", "lset_name", "main"):
+        # num_inference_steps is optional: it only decides whether a shared
+        # schedule may label its slots with real step numbers, so a WanGP build
+        # that does not expose it still gets a working timeline.
+        for component in (
+            "loras_choices", "loras_multipliers", "guidance_phases", "state",
+            "lset_name", "main", "num_inference_steps",
+        ):
             self.request_component(component)
 
         # Optional globals: names have moved between WanGP builds, so every
@@ -163,6 +174,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             instance.inventory_ids = []
             instance.phase_memory.clear()
             instance.catalogue_cache.clear()
+            instance.schedules.clear()
             instance.restore_snapshot = None
             instance.next_revision()
 
@@ -237,6 +249,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         main = components["main"]
         guidance_phases = components.get("guidance_phases")
         lset_name = components.get("lset_name")
+        num_inference_steps = components.get("num_inference_steps")
 
         instance_id = getattr(loras_multipliers, "_id", id(loras_multipliers))
         instance = self._instance(instance_id)
@@ -271,15 +284,32 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         for placeholder, value in ids.items():
             script = script.replace(placeholder, value)
 
+        # Gradio passes inputs positionally, and either optional component may be
+        # absent in a given WanGP build, so the tail is unpacked by name.
         sync_inputs = [state, loras_choices, loras_multipliers]
+        optional: list[str] = []
         if guidance_phases is not None:
             sync_inputs.append(guidance_phases)
+            optional.append("guidance")
+        if num_inference_steps is not None:
+            sync_inputs.append(num_inference_steps)
+            optional.append("steps")
 
-        def sync(state_value, selected, multipliers, guidance=None):
-            return self._build_payload(instance, state_value, selected, multipliers, guidance)
+        def unpack(extra):
+            values = {"guidance": None, "steps": None}
+            for name, value in zip(optional, extra):
+                values[name] = value
+            return values["guidance"], values["steps"]
 
-        def act(action_json, state_value, selected, multipliers, guidance=None):
-            return self._apply_action(instance, action_json, state_value, selected, multipliers, guidance)
+        def sync(state_value, selected, multipliers, *extra):
+            guidance, steps = unpack(extra)
+            return self._build_payload(instance, state_value, selected, multipliers, guidance, steps)
+
+        def act(action_json, state_value, selected, multipliers, *extra):
+            guidance, steps = unpack(extra)
+            return self._apply_action(
+                instance, action_json, state_value, selected, multipliers, guidance, steps
+            )
 
         def serve_media(request_json, state_value):
             return self._serve_media(instance, request_json, state_value)
@@ -320,7 +350,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         # Native -> plugin. Component change events are the common trigger, so
         # presets, .lset files, imported media settings, accelerator profiles
         # and queue edits all resynchronise without being special-cased.
-        watched = [loras_choices, loras_multipliers] + ([guidance_phases] if guidance_phases is not None else [])
+        watched = [loras_choices, loras_multipliers]
+        watched += [component for component in (guidance_phases, num_inference_steps) if component is not None]
         for component in watched:
             if hasattr(component, "change"):
                 component.change(fn=sync, inputs=sync_inputs, outputs=[payload_box], show_progress="hidden")
@@ -400,24 +431,30 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             index[entry.id] = record
         return index
 
-    def _context(self, instance: InstanceState, state_value, selected, multipliers, guidance):
+    def _context(self, instance: InstanceState, state_value, selected, multipliers, guidance, steps=None):
         model_type = self._model_type(state_value)
         model_def = self._model_def(model_type)
         phases = up.resolve_phases(model_def, guidance)
         lora_dir = self._lora_dir(model_type)
         inventory = build_inventory(self._native_loras(state_value, selected), lora_dir)
         stack = up.Stack.from_native(selected, multipliers)
+        context = up.ScheduleContext.from_native(steps)
 
         instance.model_key = model_type
         instance.lora_dir = lora_dir
         instance.inventory_ids = inventory.ids
         up.remember_hidden_phases(stack, phases, instance.phase_memory)
-        return model_type, inventory, stack, phases
+        # Bring the region editor back in line with the native tokens before
+        # anything reads or writes them.
+        up.sync_schedules(stack, phases, instance.schedules, context)
+        return model_type, inventory, stack, phases, context
 
-    def _build_payload(self, instance: InstanceState, state_value, selected, multipliers, guidance) -> str:
+    def _build_payload(
+        self, instance: InstanceState, state_value, selected, multipliers, guidance, steps=None
+    ) -> str:
         try:
-            model_type, inventory, stack, phases = self._context(
-                instance, state_value, selected, multipliers, guidance
+            model_type, inventory, stack, phases, context = self._context(
+                instance, state_value, selected, multipliers, guidance, steps
             )
             status, warn = instance.take_status()
 
@@ -428,13 +465,17 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 # applied over newer settings.
                 instance.restore_snapshot = None
 
-            missing = [row for row in up.build_active_rows(inventory, stack, phases, instance.phase_memory) if row["missing"]]
+            catalogue = self._catalogue_index(instance, inventory)
+            rows = up.build_active_rows(
+                inventory, stack, phases, instance.phase_memory, catalogue,
+                instance.schedules, context,
+            )
+            missing = [row for row in rows if row["missing"]]
             if missing and not status:
                 names = ", ".join(row["name"] for row in missing[:3])
                 status = f"{len(missing)} selected LoRA(s) missing locally: {names}"
                 warn = True
 
-            catalogue = self._catalogue_index(instance, inventory)
             complete, incomplete = (
                 self._profiles.partition(inventory.ids) if self._profiles else ([], [])
             )
@@ -447,9 +488,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                     inventory, stack, phases, self._metadata, model_type,
                     instance.phase_memory, catalogue,
                 ),
-                "active": up.build_active_rows(
-                    inventory, stack, phases, instance.phase_memory, catalogue,
-                ),
+                "active": rows,
                 "profiles": complete + incomplete,
                 # Named so the dropdown can flag a profile this model can only
                 # apply in part -- it is still selectable.
@@ -463,8 +502,18 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 "slider_min": up.SLIDER_MIN,
                 "slider_max": up.SLIDER_MAX,
                 "slider_step": up.SLIDER_STEP,
+                "nudge_step": up.NUDGE_STEP,
                 "value_min": up.VALUE_MIN,
                 "value_max": up.VALUE_MAX,
+                "value_decimals": up.VALUE_DECIMALS,
+                # Schedule coordinates: how long the run is, and whether the
+                # plugin may claim exact step numbers for a phase-specific
+                # schedule (it may not, until WanGP exposes phase boundaries).
+                "steps": context.steps,
+                "phase_boundaries_known": context.boundaries_known,
+                "schedule_slot_limits": {
+                    "min": sch.MIN_SLOTS, "max": sch.MAX_SLOTS, "default": sch.DEFAULT_SLOTS,
+                },
                 "can_restore": instance.restore_snapshot is not None,
                 "signature": signature,
                 "status": status,
@@ -487,7 +536,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
     # ----------------------------------------------------------- actions
 
-    def _apply_action(self, instance: InstanceState, action_json, state_value, selected, multipliers, guidance):
+    def _apply_action(
+        self, instance: InstanceState, action_json, state_value, selected, multipliers, guidance, steps=None
+    ):
         no_change = (gr.update(), gr.update())
         try:
             action = json.loads(action_json or "{}")
@@ -495,26 +546,26 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             return no_change + (gr.update(),)
 
         try:
-            model_type, inventory, stack, phases = self._context(
-                instance, state_value, selected, multipliers, guidance
+            model_type, inventory, stack, phases, context = self._context(
+                instance, state_value, selected, multipliers, guidance, steps
             )
-            changed = self._dispatch(instance, action, stack, inventory, phases, model_type)
+            changed = self._dispatch(instance, action, stack, inventory, phases, model_type, context)
 
             if not changed:
-                payload = self._build_payload(instance, state_value, selected, multipliers, guidance)
+                payload = self._build_payload(instance, state_value, selected, multipliers, guidance, steps)
                 return no_change + (payload,)
 
             up.normalize_stack_tokens(stack, phases, instance.phase_memory)
             values, multiplier_text = stack.to_native(inventory)
-            payload = self._build_payload(instance, state_value, values, multiplier_text, guidance)
+            payload = self._build_payload(instance, state_value, values, multiplier_text, guidance, steps)
             return gr.update(value=values), gr.update(value=multiplier_text), payload
         except Exception as error:
             traceback.print_exc()
             instance.note(f"Action failed: {error}", True)
-            payload = self._build_payload(instance, state_value, selected, multipliers, guidance)
+            payload = self._build_payload(instance, state_value, selected, multipliers, guidance, steps)
             return no_change + (payload,)
 
-    def _dispatch(self, instance, action, stack, inventory, phases, model_type) -> bool:
+    def _dispatch(self, instance, action, stack, inventory, phases, model_type, context=None) -> bool:
         """Apply one typed frontend action. Returns True when native state moved."""
         kind = str(action.get("type", ""))
 
@@ -526,7 +577,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             changed = False
             for item in action.get("actions", []) or []:
                 if isinstance(item, dict):
-                    changed = self._dispatch(instance, item, stack, inventory, phases, model_type) or changed
+                    changed = self._dispatch(
+                        instance, item, stack, inventory, phases, model_type, context
+                    ) or changed
             return changed
 
         if kind == "toggle":
@@ -543,6 +596,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             return stack.remove(normalize_id(action.get("id")))
 
         if kind == "set_strength":
+            # Routes itself: a scheduled phase moves its schedule base, an
+            # unscheduled one moves the plain scalar.
             return up.set_phase_value(
                 stack,
                 normalize_id(action.get("id")),
@@ -551,7 +606,11 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 phases,
                 instance.phase_memory,
                 bool(action.get("linked", False)),
+                instance.schedules,
             )
+
+        if kind.startswith("schedule_"):
+            return self._schedule_action(instance, action, stack, phases, context)
 
         if kind == "convert_simple":
             return up.convert_to_simple(stack, normalize_id(action.get("id")), phases)
@@ -600,6 +659,64 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
         if kind.startswith("profile_"):
             return self._profile_action(instance, action, stack, inventory, phases, model_type)
+
+        return False
+
+    def _schedule_action(self, instance, action, stack, phases, context) -> bool:
+        """Apply one timeline action. Python validates every committed range.
+
+        The frontend never writes a raw token: it says what the user did and
+        this decides whether the native multiplier moves at all.
+        """
+        kind = str(action.get("type", ""))
+        lora_id = normalize_id(action.get("id"))
+        phase = action.get("phase", 0)
+        args = (phases, instance.phase_memory, instance.schedules, context)
+
+        try:
+            if kind == "schedule_enable":
+                return up.schedule_enable(stack, lora_id, phase, *args)
+
+            if kind == "schedule_set_base":
+                return up.schedule_set_base(
+                    stack, lora_id, phase, action.get("value"), *args,
+                    linked=bool(action.get("linked", False)),
+                )
+
+            if kind == "schedule_add_region":
+                return up.schedule_add_region(stack, lora_id, phase, *args)
+
+            if kind == "schedule_commit_region":
+                return up.schedule_commit_region(
+                    stack, lora_id, phase, str(action.get("region_id", "")),
+                    action.get("start"), action.get("end"), *args,
+                    keep_width=bool(action.get("keep_width", False)),
+                )
+
+            if kind == "schedule_set_region_strength":
+                return up.schedule_set_region_strength(
+                    stack, lora_id, phase, str(action.get("region_id", "")),
+                    action.get("value"), *args,
+                )
+
+            if kind == "schedule_delete_region":
+                return up.schedule_delete_region(
+                    stack, lora_id, phase, str(action.get("region_id", "")), *args
+                )
+
+            if kind == "schedule_clear_phase":
+                return up.schedule_clear_phase(stack, lora_id, phase, *args)
+
+            if kind == "schedule_normalize":
+                changed = up.schedule_normalize(stack, lora_id, phase, action.get("slots"), *args)
+                if changed:
+                    instance.note("Schedule re-gridded; the native multiplier was rewritten.")
+                return changed
+        except sch.ScheduleError as error:
+            # A refusal is a normal outcome (a full timeline, a preserved
+            # token), so it is reported in the status bar, not raised.
+            instance.note(str(error), True)
+            return False
 
         return False
 

@@ -69,7 +69,10 @@
   border: 1px solid var(--border-color-primary);
   border-radius: var(--radius-sm, 6px);
   padding: 4px 8px;
-  min-height: 28px;
+  /* Header and toolbar controls are secondary targets: bigger than the old
+     28px so a thumb can hit them, smaller than the 40px the row controls use
+     so the panel does not grow a second toolbar's worth of height. */
+  min-height: 34px;
 }
 .__NS__ select.lb-select {
   color: var(--input-text-color, var(--body-text-color));
@@ -118,6 +121,9 @@
 /* Height is set inline from the measured row height so that 1, 2 and 3 rows
    each shrink to fit and only a fourth row starts scrolling. */
 .__NS__ .lb-grid-wrap {
+  /* The measured cap height is written to this box, so it must include the
+     padding and border rather than adding them on top. */
+  box-sizing: border-box;
   overflow-y: auto;
   overflow-x: hidden;
   border: 1px solid var(--border-color-primary);
@@ -177,14 +183,15 @@
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+/* Badges stay clear of the Inspector button in the top-right corner. */
 .__NS__ .lb-badges {
   position: absolute;
   top: 5px;
   left: 5px;
-  right: 5px;
+  right: 44px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 4px;
   pointer-events: none;
   font-size: 11px;
@@ -231,31 +238,40 @@
   gap: 8px;
   font-weight: 600;
 }
-.__NS__ .lb-rows { display: flex; flex-direction: column; gap: 4px; }
+.__NS__ .lb-rows { display: flex; flex-direction: column; gap: 6px; }
+
+/* An active row is a small card: identity and destructive actions on the top
+   line, then the phase chips, then one strength control, then the timeline if
+   it is open. Everything the finger aims at is at least 40px. */
 .__NS__ .lb-row {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 7px;
+  flex-direction: column;
   border: 1px solid var(--border-color-primary);
   border-radius: var(--radius-sm, 6px);
   background: var(--input-background-fill);
+  overflow: hidden;
 }
-/* The strength controls get the width; the name truncates and the "i" button
-   carries the full record. */
+.__NS__ .lb-row-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 7px;
+  min-width: 0;
+}
+/* The name is what gives way: the controls keep their width, and the full name
+   lives in the tooltip and the Inspector. */
 .__NS__ .lb-row-name {
   flex: 1 1 90px;
-  min-width: 60px;
-  max-width: 34%;
-  font-size: var(--text-xs, 12px);
+  min-width: 40px;
+  font-size: var(--text-sm, 13px);
+  font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.__NS__ .lb-phases { flex: 1 1 auto; justify-content: flex-end; }
 .__NS__ .lb-row-note {
   font-size: 10px;
+  font-weight: 400;
   padding: 0 5px;
   margin-left: 6px;
   border-radius: 999px;
@@ -263,30 +279,79 @@
   color: var(--body-text-color-subdued, var(--body-text-color));
   white-space: nowrap;
 }
-.__NS__ .lb-phases { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.__NS__ .lb-phase { display: flex; align-items: center; gap: 5px; }
-.__NS__ .lb-phase label {
-  font-size: 10px;
-  color: var(--body-text-color-subdued, var(--body-text-color));
+.__NS__ button.lb-schedule-toggle { flex: 0 0 auto; }
+.__NS__ button.lb-btn.lb-on {
+  border-color: var(--border-color-accent, var(--color-accent, currentColor));
+  background: color-mix(in srgb, var(--color-accent, currentColor) 18%, transparent);
+}
+/* Remove sits apart from everything else it could be confused with. */
+.__NS__ button.lb-btn.lb-remove { margin-left: 2px; }
+
+/* ------------------------------------------------------------ phase chips */
+
+.__NS__ .lb-phase-strip {
+  display: flex;
+  gap: 6px;
+  padding: 0 7px 6px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.__NS__ .lb-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  min-height: 40px;
+  padding: 4px 11px;
+  border: 1px solid var(--border-color-primary);
+  border-radius: 999px;
+  background: var(--background-fill-primary);
+  color: var(--body-text-color);
+  font-size: var(--text-xs, 12px);
+  cursor: pointer;
   white-space: nowrap;
 }
-.__NS__ .lb-phase input[type="range"] {
-  width: 96px;
+.__NS__ .lb-chip.lb-on {
+  border-color: var(--border-color-accent, var(--color-accent, currentColor));
+  background: color-mix(in srgb, var(--color-accent, currentColor) 18%, transparent);
+}
+.__NS__ .lb-chip.lb-chip-static { cursor: default; opacity: 0.85; }
+.__NS__ .lb-chip strong { font-variant-numeric: tabular-nums; }
+.__NS__ .lb-chip-mark { color: var(--color-accent, currentColor); }
+
+/* ------------------------------------------------------ strength control */
+
+/* [-] slider [number] [+] on one line at every width: the slider is the only
+   part that gives up space. */
+.__NS__ .lb-weight {
+  display: grid;
+  grid-template-columns: 42px minmax(60px, 1fr) 78px 42px;
+  gap: 6px;
+  align-items: center;
+  padding: 0 7px 7px;
+}
+.__NS__ .lb-schedule .lb-weight { padding: 8px 0 0; }
+.__NS__ .lb-weight input[type="range"] {
+  width: 100%;
+  min-height: 40px;
   accent-color: var(--color-accent, currentColor);
   background: transparent;
+  touch-action: pan-y;
 }
-.__NS__ .lb-phase input[type="range"]:disabled { opacity: 0.4; cursor: not-allowed; }
+.__NS__ .lb-weight input[type="range"].lb-out-of-range { accent-color: var(--body-text-color-subdued, gray); }
+.__NS__ .lb-weight input[type="range"]:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* Number inputs do not inherit Gradio's field styling, so on a dark theme they
    rendered as the browser default: white on white. Every colour is stated. */
 .__NS__ input[type="number"],
-.__NS__ .lb-phase input[type="number"] {
-  width: 68px;
+.__NS__ .lb-weight input.lb-number {
+  width: 100%;
   font: inherit;
+  font-size: var(--text-md, 15px);
   font-variant-numeric: tabular-nums;
-  text-align: right;
-  padding: 2px 4px;
-  min-height: 24px;
+  text-align: center;
+  padding: 4px;
+  min-height: 40px;
   color: var(--input-text-color, var(--body-text-color));
   background: var(--input-background-fill, var(--background-fill-primary));
   border: 1px solid var(--input-border-color, var(--border-color-primary));
@@ -299,39 +364,179 @@
 }
 .__NS__ input[type="number"]::placeholder { color: var(--body-text-color-subdued, inherit); }
 
-/* Line-height sized steppers: easy to hit, and they must not grow the row. */
 .__NS__ button.lb-btn.lb-step {
-  min-height: 24px;
-  height: 24px;
-  min-width: 22px;
-  padding: 0 6px;
+  min-height: 40px;
+  min-width: 40px;
+  padding: 0;
   line-height: 1;
-  font-size: 13px;
+  font-size: 16px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex: 0 0 auto;
 }
 .__NS__ button.lb-btn.lb-inspect {
-  min-height: 24px;
-  height: 24px;
-  min-width: 24px;
+  min-height: 34px;
+  min-width: 34px;
   padding: 0;
   font-style: italic;
   font-weight: 700;
   flex: 0 0 auto;
 }
+
+/* ------------------------------------------------- preserved multipliers */
+
+.__NS__ .lb-preserved {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  padding: 0 7px 7px;
+}
 .__NS__ .lb-advanced {
-  flex: 1 1 auto;
+  flex: 1 1 140px;
   font-family: var(--font-mono, monospace);
   font-size: 11px;
-  padding: 2px 6px;
+  padding: 4px 6px;
   border-radius: var(--radius-xs, 4px);
   border: 1px dashed var(--border-color-primary);
   color: var(--body-text-color-subdued, var(--body-text-color));
   overflow-x: auto;
   white-space: nowrap;
 }
+.__NS__ .lb-preserved-note {
+  flex: 1 1 100%;
+  font-size: var(--text-xs, 11px);
+  color: var(--body-text-color-subdued, var(--body-text-color));
+}
+
+/* --------------------------------------------------------- step schedule */
+
+.__NS__ .lb-schedule {
+  border-top: 1px solid var(--border-color-primary);
+  background: var(--background-fill-secondary, var(--background-fill-primary));
+  padding: 8px;
+}
+.__NS__ .lb-sched-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+}
+.__NS__ .lb-sched-titles { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.__NS__ .lb-timeline-wrap {
+  margin-top: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-gutter: stable;
+}
+/* Wide enough that a slot is a real target on a phone, and it scrolls rather
+   than shrinking slots into invisibility. */
+.__NS__ .lb-timeline {
+  position: relative;
+  min-width: 480px;
+  height: 128px;
+  border: 1px solid var(--border-color-primary);
+  border-radius: var(--radius-xs, 4px);
+  background: var(--background-fill-primary);
+  overflow: hidden;
+  user-select: none;
+  touch-action: pan-y;
+}
+.__NS__ .lb-gridline {
+  position: absolute;
+  top: 0;
+  bottom: 18px;
+  width: 1px;
+  background: var(--border-color-primary);
+  opacity: 0.5;
+}
+.__NS__ .lb-tick {
+  position: absolute;
+  bottom: 3px;
+  transform: translateX(-50%);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--body-text-color-subdued, var(--body-text-color));
+  pointer-events: none;
+}
+.__NS__ .lb-baseline {
+  position: absolute;
+  left: 6px;
+  top: 4px;
+  font-size: 10px;
+  color: var(--body-text-color-subdued, var(--body-text-color));
+  pointer-events: none;
+}
+.__NS__ .lb-region {
+  position: absolute;
+  top: 22px;
+  height: 76px;
+  display: flex;
+  align-items: stretch;
+  border: 2px solid var(--border-color-primary);
+  border-radius: var(--radius-xs, 5px);
+  background: var(--input-background-fill, var(--background-fill-primary));
+  overflow: hidden;
+  cursor: grab;
+  touch-action: none;   /* the region owns the gesture, not the scroller */
+  box-sizing: border-box;
+}
+.__NS__ .lb-region.lb-on {
+  border-color: var(--border-color-accent, var(--color-accent, currentColor));
+  background: color-mix(in srgb, var(--color-accent, currentColor) 20%, var(--input-background-fill));
+  z-index: 2;
+}
+.__NS__ .lb-region.lb-dragging { cursor: grabbing; opacity: 0.92; }
+.__NS__ .lb-region:focus-visible { outline: 2px solid var(--color-accent, Highlight); outline-offset: -3px; }
+.__NS__ .lb-region-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  overflow: hidden;
+  pointer-events: none;   /* the body drags the region, it is not a target */
+  font-variant-numeric: tabular-nums;
+}
+.__NS__ .lb-region-body strong { font-size: var(--text-sm, 13px); }
+.__NS__ .lb-region-body span {
+  font-size: 10px;
+  color: var(--body-text-color-subdued, var(--body-text-color));
+  white-space: nowrap;
+}
+.__NS__ .lb-handle {
+  flex: 0 0 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: ew-resize;
+  touch-action: none;
+  color: var(--body-text-color-subdued, var(--body-text-color));
+  background: var(--background-fill-secondary, var(--background-fill-primary));
+  font-size: 15px;
+  line-height: 1;
+}
+.__NS__ .lb-handle-left { border-right: 1px solid var(--border-color-primary); }
+.__NS__ .lb-handle-right { border-left: 1px solid var(--border-color-primary); }
+.__NS__ .lb-region-editor {
+  margin-top: 8px;
+  border: 1px solid var(--border-color-primary);
+  border-radius: var(--radius-xs, 4px);
+  background: var(--background-fill-primary);
+  padding: 7px;
+}
+.__NS__ .lb-region-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+.__NS__ .lb-region-head strong { font-size: var(--text-xs, 12px); }
+
 .__NS__ .lb-row.lb-missing { border-style: dashed; opacity: 0.85; }
 
 /* -------------------------------------------------------- context menu */
@@ -401,8 +606,8 @@
 
 @media (max-width: 620px) {
   .__NS__ .lb-search { flex-basis: 100%; }
-  .__NS__ .lb-row-name { flex-basis: 100%; }
-  .__NS__ .lb-phase input[type="range"] { width: 84px; }
+  .__NS__ .lb-weight { grid-template-columns: 42px minmax(50px, 1fr) 70px 42px; }
+  .__NS__ .lb-timeline { min-width: 360px; }
 }
 
 /* ------------------------------------------------------- video previews */
@@ -428,6 +633,25 @@
   opacity: 0.85;
 }
 .__NS__ .lb-play:hover { opacity: 1; }
+
+/* Top-right on every tile, and big enough to hit without zooming. */
+.__NS__ button.lb-btn.lb-tile-inspect {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0;
+  z-index: 3;
+  border-radius: 999px;
+  font-style: italic;
+  font-weight: 700;
+  line-height: 1;
+  opacity: 0.88;
+  background: color-mix(in srgb, var(--background-fill-primary) 82%, transparent);
+}
+.__NS__ button.lb-btn.lb-tile-inspect:hover { opacity: 1; }
 .__NS__ .lb-tile.lb-playing .lb-play { opacity: 1; }
 .__NS__ .lb-tile.lb-loading .lb-play { opacity: 0.5; cursor: progress; }
 .__NS__ video.lb-thumb {
