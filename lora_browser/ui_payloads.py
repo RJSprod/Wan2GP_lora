@@ -129,14 +129,16 @@ class ScheduleContext:
             steps = 0
         return cls(steps=max(0, steps))
 
-    def default_slots(self, shared: bool) -> int:
+    def default_slots(self, shared: bool = False) -> int:
         """Timeline length for a freshly opened schedule.
 
-        A shared schedule spans the whole run, so when the step count is known
-        one slot per step is both honest and exactly what the user sees in the
-        step counter.  A phase-specific schedule has no such anchor.
+        One slot per inference step whenever the step count is known, so the
+        timeline has the same resolution as the run the user configured.  For a
+        shared schedule that also makes each slot exactly one step; for a
+        phase-specific one the slots are still spread inside a phase, which is
+        why only the shared case is ever *labelled* in steps.
         """
-        if shared and self.steps:
+        if self.steps:
             return sch.clamp_slots(self.steps)
         return sch.DEFAULT_SLOTS
 
@@ -688,6 +690,10 @@ def sync_schedules(
 
             if stored is not None and _tracks(stored, values):
                 live.add(key)
+                if not stored.regions:
+                    # Nothing has been drawn yet, so the timeline is free to
+                    # follow the step counter the user is currently looking at.
+                    stored.slots = (context or ScheduleContext()).default_slots(shared)
                 continue
 
             if len(values) > 1:
@@ -981,16 +987,27 @@ def schedule_add_region(
     memory: dict[str, list[float]],
     schedules: dict[tuple[str, int], sch.PhaseSchedule],
     context: ScheduleContext | None = None,
+    start: Any = None,
+    end: Any = None,
 ) -> bool:
-    """Add one region in genuine free space, at the schedule's base strength.
+    """Add one region at the schedule's base strength.
 
-    Refused rather than overlapped when the timeline is full: creating a region
-    on top of another and letting collision resolution sort it out would delete
-    someone's work as a side effect of a single tap.
+    With ``start`` (and optionally ``end``) the user drew it on the timeline, so
+    it goes where they put it -- clipped to the free run their gesture started
+    in, never over a neighbour.  Without them it is placed automatically: the
+    free tail, else the first hole that fits, else the largest.
+
+    Either way the timeline being full is a refusal, not an overlap: creating a
+    region on top of another and letting collision resolution sort it out would
+    delete someone's work as a side effect of one tap.
     """
     target = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=True)
     schedule = target.schedule
-    span = sch.find_region_slot(schedule.regions, schedule.slots)
+    span = None
+    if start is not None:
+        span = sch.fit_region(schedule.regions, schedule.slots, start, end)
+    if span is None:
+        span = sch.find_region_slot(schedule.regions, schedule.slots)
     if span is None:
         raise sch.ScheduleError("The schedule is full - delete or shrink a region first.")
 

@@ -39,6 +39,9 @@ START = {
     "multipliers": "0.71;1.23 1,0.8,0.4,0;0.7,0.5,0.2,0 0.5:0.9",
 }
 
+#: What the step counter says, so slot counts can be checked against it.
+STEPS = 30
+
 IDS = {
     "__INST__": INSTANCE,
     "__NS__": NS,
@@ -127,7 +130,7 @@ class _Host:
         self.plugin._init_stores()
         self.selected = list(START["selected"])
         self.multipliers = START["multipliers"]
-        self.steps = 30
+        self.steps = STEPS
 
     def payload(self):
         return self.plugin._build_payload(
@@ -235,6 +238,12 @@ def native(page):
 
 def settle(page, ms=500):
     page.wait_for_timeout(ms)
+
+
+def select_phase(page, row, index):
+    """These tests share one page, so never inherit whichever chip was left on."""
+    row.locator(".lb-phase-strip .lb-chip").nth(index).click()
+    settle(page, 500)
 
 
 class TestPanelInTheBrowser:
@@ -409,6 +418,111 @@ class TestPanelInTheBrowser:
         assert "branch" in row.locator(".lb-preserved-note").inner_text().lower()
         assert row.locator("button.lb-schedule-toggle").count() == 0
         assert native(page).split()[2] == "0.5:0.9"
+
+    def test_fast_taps_all_land(self, panel):
+        """Each answer used to be built from state the previous tap had not
+        written yet, so a burst sprang back to an older value."""
+        page, _, _ = panel
+        row = page.locator('.lb-row[data-id="lora_01.safetensors"]')
+        select_phase(page, row, 0)
+        number = row.locator(".lb-weight-main input[type=number]")
+        number.fill("0.50")
+        number.press("Enter")
+        settle(page, 1200)
+
+        plus = row.locator(".lb-weight-main button.lb-step").nth(1)
+        for _ in range(6):
+            plus.click(delay=0)
+        settle(page, 2500)
+        assert number.input_value() == "0.56"
+        assert native(page).split()[0].startswith("0.56;")
+
+        # And with no gap at all between them.
+        page.evaluate("""() => {
+          const row = document.querySelector('.lb-row[data-id="lora_01.safetensors"]');
+          const minus = row.querySelectorAll('.lb-weight-main button.lb-step')[0];
+          for (let i = 0; i < 8; i++) { minus.click(); }
+        }""")
+        settle(page, 2500)
+        assert number.input_value() == "0.48"
+        assert native(page).split()[0].startswith("0.48;")
+
+    def test_a_typed_value_is_not_overwritten_by_an_earlier_answer(self, panel):
+        page, _, _ = panel
+        row = page.locator('.lb-row[data-id="lora_01.safetensors"]')
+        select_phase(page, row, 0)
+        number = row.locator(".lb-weight-main input[type=number]")
+        row.locator(".lb-weight-main button.lb-step").nth(1).click()
+        number.fill("0.37")
+        number.press("Enter")
+        settle(page, 2000)
+        assert number.input_value() == "0.37"
+        assert native(page).split()[0].startswith("0.37;")
+
+    def test_a_new_timeline_has_one_slot_per_step(self, panel):
+        page, _, _ = panel
+        row = page.locator('.lb-row[data-id="lora_01.safetensors"]')
+        select_phase(page, row, 0)
+        row.locator("button.lb-schedule-toggle").click()
+        settle(page, 900)
+        slots = page.evaluate("""() => window.wgpLoraBrowser['%s'].state.rows
+            .find(r => r.id === 'lora_01.safetensors').phase_schedules[0].slots""" % INSTANCE)
+        assert slots == STEPS
+        assert row.locator(".lb-tick").last.inner_text() == str(STEPS)
+
+    def test_a_region_can_be_drawn_on_empty_timeline_space(self, panel):
+        page, _, _ = panel
+        row = page.locator('.lb-row[data-id="lora_01.safetensors"]')
+        timeline = row.locator(".lb-timeline")
+        timeline.scroll_into_view_if_needed()
+        settle(page, 200)
+        box = timeline.bounding_box()
+        slot = box["width"] / float(STEPS)
+
+        page.mouse.move(box["x"] + slot * 7.5, box["y"] + box["height"] / 2)
+        page.mouse.down()
+        page.mouse.move(box["x"] + slot * 13.5, box["y"] + box["height"] / 2, steps=10)
+        assert row.locator(".lb-region.lb-ghost").count() == 1
+        page.mouse.up()
+        settle(page, 1200)
+
+        assert row.locator('[data-lb="region-range"]').inner_text() == "Slots 8\u201314"
+        # A new region starts at the strength the row already had.
+        assert row.locator(".lb-region-editor input[type=number]").input_value() == "0.37"
+
+    def test_the_drawn_region_is_what_wangp_is_given(self, panel):
+        page, _, _ = panel
+        row = page.locator('.lb-row[data-id="lora_01.safetensors"]')
+        phase_two = native(page).split()[0].split(";")[1]
+
+        strength = row.locator(".lb-region-editor input[type=number]")
+        strength.fill("0.9")
+        strength.press("Enter")
+        settle(page, 1500)
+
+        # One value per step, the drawn slots at the region's strength and
+        # everything else at the base -- exactly the picture on screen.
+        token = native(page).split()[0]
+        phase_one = token.split(";")[0].split(",")
+        assert len(phase_one) == STEPS
+        assert phase_one[7:14] == ["0.9"] * 7
+        assert set(phase_one[:7] + phase_one[14:]) == {"0.37"}
+        # The phase that was not being edited is untouched.
+        assert token.split(";")[1] == phase_two
+
+    def test_a_tap_on_empty_space_draws_a_region(self, panel):
+        page, _, _ = panel
+        row = page.locator('.lb-row[data-id="lora_01.safetensors"]')
+        timeline = row.locator(".lb-timeline")
+        box = timeline.bounding_box()
+        slot = box["width"] / float(STEPS)
+        page.mouse.click(box["x"] + slot * 20.5, box["y"] + box["height"] / 2)
+        settle(page, 1200)
+        assert row.locator(".lb-region").count() == 2
+        assert row.locator('[data-lb="region-range"]').inner_text().startswith("Slots 21")
+
+        row.locator("button.lb-schedule-toggle").click()   # tidy up for later tests
+        settle(page, 400)
 
     def test_a_gradio_remount_rebuilds_the_panel(self, panel):
         """Gradio can wipe the HTML host; the panel must come back by itself."""

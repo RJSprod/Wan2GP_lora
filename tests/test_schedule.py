@@ -133,6 +133,28 @@ class TestPlacement:
     def test_a_full_timeline_refuses(self):
         assert sch.find_region_slot([region("r1", 1, 10)], 10) is None
 
+    def test_a_drawn_span_is_taken_as_drawn(self):
+        assert sch.fit_region([], 20, 4, 9) == (4, 9)
+
+    def test_a_drawn_span_stops_at_the_next_region(self):
+        regions = [region("r1", 10, 14)]
+        assert sch.fit_region(regions, 20, 6, 18) == (6, 9)
+
+    def test_a_drawn_span_stops_at_the_previous_region(self):
+        regions = [region("r1", 1, 5)]
+        assert sch.fit_region(regions, 20, 12, 8) == (8, 12)
+
+    def test_a_tap_gets_the_default_width_inside_its_gap(self):
+        assert sch.fit_region([], 20, 3) == (3, 3 + sch.preferred_width(20) - 1)
+        # Clipped when the gap is shorter than the default width.
+        assert sch.fit_region([region("r1", 6, 20)], 20, 3) == (3, 5)
+
+    def test_drawing_inside_an_existing_region_is_refused(self):
+        assert sch.fit_region([region("r1", 4, 9)], 20, 6, 8) is None
+
+    def test_a_drawn_span_is_clamped_to_the_timeline(self):
+        assert sch.fit_region([], 10, 0, 99) == (1, 10)
+
     def test_placement_never_overlaps(self):
         regions = [region("r1", 3, 6), region("r2", 10, 12)]
         span = sch.find_region_slot(regions, 20)

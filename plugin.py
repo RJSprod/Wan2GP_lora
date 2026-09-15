@@ -684,7 +684,10 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 )
 
             if kind == "schedule_add_region":
-                return up.schedule_add_region(stack, lora_id, phase, *args)
+                return up.schedule_add_region(
+                    stack, lora_id, phase, *args,
+                    start=action.get("start"), end=action.get("end"),
+                )
 
             if kind == "schedule_commit_region":
                 return up.schedule_commit_region(
