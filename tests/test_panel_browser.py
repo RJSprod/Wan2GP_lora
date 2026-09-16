@@ -354,8 +354,10 @@ class TestPanelInTheBrowser:
         page.mouse.up()
         settle(page, 700)
 
-        # Slot 3's region was dropped onto slot 4's and covered it completely.
-        assert native(page).split()[1] == "1,0.8,1,0.4;0.7,0.5,0.2,0"
+        # 1,0.8,0.4,0 is three regions over a gap. Slot 2's was dropped onto
+        # slot 3's and covered it completely; the slot it left behind is zero,
+        # not some base showing through.
+        assert native(page).split()[1] == "1,0,0.8,0;0.7,0.5,0.2,0"
         assert row.locator(".lb-region").count() == 2
 
     def test_a_resize_moves_only_the_dragged_edge(self, panel):
@@ -375,22 +377,55 @@ class TestPanelInTheBrowser:
         )
         page.mouse.up()
         settle(page, 700)
-        assert native(page).split()[1] == "1,0.8,0.8,0.4;0.7,0.5,0.2,0"
+        # Slot 1's region grew right by one; its neighbour did not move.
+        assert native(page).split()[1] == "1,1,0.8,0;0.7,0.5,0.2,0"
 
-    def test_a_base_edit_does_not_flatten_the_schedule(self, panel):
+    def test_scheduler_mode_replaces_the_plain_strength_control(self, panel):
+        """The scrubber is removed, not disabled: it is not what WanGP applies."""
         page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
-        number = row.locator(".lb-weight-main input[type=number]")
-        number.fill("0.6")
-        number.press("Enter")
-        settle(page, 700)
-        assert native(page).split()[1] == "0.6,0.8,0.8,0.4;0.7,0.5,0.2,0"
-        assert row.locator(".lb-region").count() == 2
+        assert row.locator(".lb-timeline").count() == 1
+        assert row.locator(".lb-weight-main").count() == 0
+        # Exactly one strength control on the row, and it belongs to the region.
+        assert row.locator("input[type=range]").count() == 1
+        assert row.locator(".lb-region-editor input[type=range]").count() == 1
+        # Linking acts on a control that is not there, so it is not offered.
+        assert row.locator(".lb-phase-strip .lb-chip").count() == 2
+
+        # A row that is not in scheduler mode still has its plain control.
+        plain = page.locator('.lb-row[data-id="lora_01.safetensors"]')
+        assert plain.locator(".lb-weight-main input[type=range]").count() == 1
+
+    def test_a_collapsed_scheduled_phase_never_offers_a_scrubber(self, panel):
+        page, _, _ = panel
+        row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
+        before = native(page)
+        row.locator("button.lb-schedule-toggle").click()
+        settle(page, 600)
+
+        assert row.locator(".lb-timeline").count() == 0
+        assert row.locator("input[type=range]").count() == 0
+        summary = row.locator(".lb-sched-summary")
+        assert summary.count() == 1
+        assert native(page) == before
+
+        # And the summary is the way back in.
+        summary.click()
+        settle(page, 600)
+        assert row.locator(".lb-timeline").count() == 1
+
+    def test_a_scheduled_phase_chip_counts_regions(self, panel):
+        page, _, _ = panel
+        row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
+        chip = row.locator(".lb-phase-strip .lb-chip").first
+        assert "\u223f" in chip.inner_text().lower()
+        assert "region" in (chip.get_attribute("title") or "")
 
     def test_closing_the_timeline_keeps_the_schedule(self, panel):
         page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
         before = native(page)
+        regions = row.locator(".lb-region").count()
         row.locator(".lb-sched-head button:has-text('Close')").click()
         settle(page)
         assert row.locator(".lb-timeline").count() == 0
@@ -398,7 +433,7 @@ class TestPanelInTheBrowser:
 
         row.locator("button.lb-schedule-toggle").click()
         settle(page, 700)
-        assert row.locator(".lb-region").count() == 2
+        assert row.locator(".lb-region").count() == regions
 
     def test_clear_phase_only_clears_the_selected_phase(self, panel):
         page, _, _ = panel
@@ -501,12 +536,12 @@ class TestPanelInTheBrowser:
         settle(page, 1500)
 
         # One value per step, the drawn slots at the region's strength and
-        # everything else at the base -- exactly the picture on screen.
+        # every slot no region covers at zero -- exactly the picture on screen.
         token = native(page).split()[0]
         phase_one = token.split(";")[0].split(",")
         assert len(phase_one) == STEPS
         assert phase_one[7:14] == ["0.9"] * 7
-        assert set(phase_one[:7] + phase_one[14:]) == {"0.37"}
+        assert set(phase_one[:7] + phase_one[14:]) == {"0"}
         # The phase that was not being edited is untouched.
         assert token.split(";")[1] == phase_two
 

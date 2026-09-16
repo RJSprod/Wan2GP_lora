@@ -25,9 +25,10 @@ thumbnail browser and a real-time strength editor.
 - **Phase chips.** On a multi-phase model each phase is a chip showing its own
   value; tapping one chooses what the strength control and the timeline edit.
 - **Step schedules you can draw.** WanGP's comma multipliers (`1,0.8,0.4,0`) are
-  a first-class editing surface: a base strength plus regions you draw, move,
-  resize and re-weight on an inline timeline, one slot per inference step, per
-  phase. See [Step schedules](#step-schedules).
+  a first-class editing surface: regions you draw, move, resize and re-weight on
+  an inline timeline, one slot per inference step, per phase. Scheduling is a
+  *mode* — it replaces the plain strength control rather than sitting under it.
+  See [Step schedules](#step-schedules).
 - **Image previews first, video previews as a still.** A LoRA with only a video
   preview gets its *first frame* decoded server-side and cached; the video itself
   is never loaded in the browser.
@@ -93,6 +94,7 @@ its syntax:
 | `0.8` | one multiplier | strength control |
 | `0.4;0.9` | per guidance phase | one phase chip each |
 | `1,0.5,0.25` | step/time varying schedule | editable timeline, spread over the whole run |
+| `0,0,0.5,0.5` | a schedule that is off at first | two empty slots, then one region |
 | `1,0.8;0.7,0.5` | a schedule inside each phase | one editable timeline per phase |
 | `1;0.7,0.5,0.2` | scalar phase + scheduled phase | phase 1 is a number, phase 2 a timeline |
 | `0.5:0.9` | LoRA multiplier branches | preserved verbatim, read-only |
@@ -116,35 +118,53 @@ cannot shift another LoRA's multiplier onto the wrong file.
 ### Step schedules
 
 A comma in a WanGP multiplier makes it vary over the run. The panel edits those
-as **base strength + regions**:
+as **regions on a timeline**, and scheduling a phase is a mode:
 
 ```
-Step schedule   Phase 1   phase-relative • 30 schedule slots    [+ Region] [Slots: 30 ▾] [Clear phase] [Close]
+[i] Detail Enhancer                                   [Schedule ▴]  [×]
+[Phase 1 ∿2]  [Phase 2 0.5]
 
-  base 0.6  ┌──────────┐                    ┌────┐
+Step schedule   Phase 1   30 global steps    [+ Region] [Slots: 30 ▾] [Clear phase] [Close]
+
+  empty slots = 0
+            ┌──────────┐                    ┌────┐
   ──────────│   0.95   │────────────────────│ 0.2│────────
             └──────────┘                    └────┘
    1    4    7    10   13   16   19   22   25   28   30
+
+  Selected region  [Steps 13–19]  [Delete]
+  [−]  ------------ slider ------------  [0.2]  [+]
 ```
 
-- Everything not covered by a region is the **base**, and the row's normal
-  strength control edits that base. Moving it never flattens the schedule: your
-  regions keep their own strengths.
+**Scheduling replaces the plain strength control.** While a phase is scheduled
+the row has no slider, `+`/`-` or numeric field of its own — the region's
+controls are the only ones on screen, open or collapsed. That is not cosmetic:
+a scheduled phase is its regions, so a plain strength would be a number WanGP
+never applies.
+
+**Slots no region covers are zero.** There is no base strength hiding behind the
+timeline. Boxes over steps 1–2 and 4–6 mean step 3 is off, and stays off until
+something covers it. A phase you have not drawn on yet is simply not scheduled —
+it is worth its plain strength, and opening the scheduler writes nothing.
+
 - **Draw a region by dragging across empty timeline space**, or tap once for one
-  of the default width. A new region starts at the strength the row already had,
-  so drawing one changes nothing until you move it. Drawing stops at the
-  neighbouring region rather than overrunning it — dragging is for that.
+  of the default width. A new region starts at the strength the row already had.
+  Drawing stops at the neighbouring region rather than overrunning it — dragging
+  is for that.
 - `+ Region` does the same without aiming: the free tail, else the first hole
   that fits, else the largest. Either way a full timeline is refused rather than
   overlapped.
 - Drag a region's body to move it, its edges to resize it. Bounds snap to whole
   slots, and on drop the dragged region wins: a partial overlap shrinks its
-  neighbour, dropping inside one splits it, covering one deletes it.
-- **Close** collapses the timeline and keeps the schedule. **Clear phase**
-  removes the schedule for the selected phase only, keeping its base as a plain
-  multiplier.
-- Schedule state is **per phase**. Phase 1 and phase 2 have independent regions,
-  and linking phase values moves both bases without copying regions between them.
+  neighbour, dropping inside one splits it, covering one deletes it. The slots a
+  region leaves behind go back to zero.
+- **Close** leaves the scheduler and keeps the schedule; the row then shows what
+  it is doing (`∿ 0.95 at steps 4–10, 0.2 at steps 13–19`) and tapping that goes
+  back in. **Clear phase** is the one that removes it, returning that phase — and
+  only that phase — to a plain multiplier and its ordinary strength control.
+- Schedule state is **per phase**. Phase 1 and phase 2 have independent regions;
+  linking moves the plain strength of unscheduled phases and skips scheduled
+  ones, and never copies regions between them.
 
 **A new timeline has one slot per inference step**, so its resolution matches the
 run you configured, and it keeps following the step counter until you draw
@@ -335,8 +355,12 @@ Four things the design spec leaves to implementation, settled here:
 - **Numeric precision.** Direct entry keeps four decimals — the same precision
   the serialiser emits — rather than the two the editor used to round to. An
   untouched imported token is not rewritten at all, whatever its precision.
-- **Linked phases.** Linking moves the *base* of every visible phase. It never
-  copies regions between phases; schedules stay independent.
+- **Linked phases.** Linking moves the plain strength of every visible phase
+  that has one, skipping any phase that is scheduled. It never copies regions
+  between phases; schedules stay independent.
+- **What fills the gaps.** Nothing: an uncovered slot is 0, not a base. The
+  strength a phase had before scheduling survives only as what a new region
+  starts at and what *Clear phase* restores.
 - **Irregular imported schedules.** Edited at their own native resolution. A list
   too long to drag usefully is preserved and shown read-only, with an explicit
   re-grid offered; nothing is ever re-gridded on load.

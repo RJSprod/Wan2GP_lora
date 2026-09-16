@@ -463,6 +463,9 @@ def schedule_payload(
             for region in sch.sort_regions(schedule.regions)
         ],
         "selected_region_id": schedule.selected_region_id,
+        # Every slot no region covers is worth this. It is not a fill the base
+        # hides behind: a scheduled phase applies the LoRA only where it is drawn.
+        "gap_strength": sch.GAP_STRENGTH,
         "editable": bool(schedule.editable),
         "normalization_required": bool(schedule.normalization_required),
         "dirty": bool(schedule.dirty),
@@ -568,15 +571,19 @@ def set_phase_value(
     Which thing it writes depends on the selected phase:
 
     * an unscheduled phase -> the plain scalar,
-    * a scheduled phase -> that schedule's *base*, leaving its regions in place.
+    * a phase whose timeline is open but empty -> the value it is worth until
+      something is drawn,
+    * a phase that has regions -> nothing at all.
 
-    The second rule is what keeps the strength control and the timeline from
-    contradicting each other; flattening the schedule back to a scalar because
-    a slider moved would throw away the user's regions.
+    The last rule is the point.  Once a phase is scheduled, every slot is either
+    inside a region or zero, so there is no plain strength left for a slider to
+    mean; the editor removes that control rather than leaving one that looks
+    like it does something.  A stray edit from anywhere else is refused here for
+    the same reason.
 
-    Editing a LoRA whose token is advanced is refused: the frontend has to ask
-    for an explicit conversion first, so branch syntax is never flattened by an
-    accidental drag.
+    Editing a LoRA whose token is advanced is refused too: the frontend has to
+    ask for an explicit conversion first, so branch syntax is never flattened by
+    an accidental drag.
     """
     position = stack.index_of(lora_id)
     if position < 0:
@@ -888,6 +895,10 @@ def _set_base(
             # An unscheduled phase keeps its plain scalar behaviour.
             changed = _set_scalar_phase(stack, lora_id, index, value, phases, memory, schedules) or changed
             continue
+        if target.schedule.regions:
+            # Scheduled: the timeline owns every slot, so there is nothing here
+            # for a plain strength edit to change.
+            continue
         target.schedule.base = sanitize_value(value, target.schedule.base)
         changed = _commit(stack, lora_id, target, phases, memory) or changed
 
@@ -960,8 +971,17 @@ def schedule_set_base(
     context: ScheduleContext | None = None,
     linked: bool = False,
 ) -> bool:
-    """Move the base under a schedule, keeping every region's own strength."""
+    """Set what a phase is worth while its timeline is still empty.
+
+    Refused once regions exist: their gaps are zero, not this value, so writing
+    it would only change what a future region seeds at without changing a single
+    slot the user can see.
+    """
     target = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=True)
+    if target.schedule.regions:
+        raise sch.ScheduleError(
+            "This phase is scheduled - edit its regions on the timeline instead."
+        )
     target.schedule.base = sanitize_value(value, target.schedule.base)
     changed = _commit(stack, lora_id, target, phases, memory)
 
@@ -973,6 +993,8 @@ def schedule_set_base(
                 other = _resolve(stack, lora_id, index, phases, memory, schedules, context, create=False)
             except sch.ScheduleError:
                 changed = _set_scalar_phase(stack, lora_id, index, value, phases, memory, schedules) or changed
+                continue
+            if other.schedule.regions:
                 continue
             other.schedule.base = sanitize_value(value, other.schedule.base)
             changed = _commit(stack, lora_id, other, phases, memory) or changed

@@ -352,7 +352,9 @@ ALWAYS RUN THE NEGATIVE TEST
   lora_browser/
     multiplier_codec.py      parse/serialise loras_multipliers  (heavily tested)
     schedule.py              step-schedule regions: compile, reconstruct,
-                             place, resolve collisions (pure, heavily tested)
+                             place, resolve collisions (pure, heavily tested).
+                             Uncovered slots are 0 -- a scheduled phase applies
+                             the LoRA only where a region says so.
     ui_payloads.py           state model, phase resolution, action application
     inventory.py             native LoRA list -> displayable entries
     thumbnails.py            preview matching, first-frame decode, cache
