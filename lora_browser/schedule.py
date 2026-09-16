@@ -98,6 +98,19 @@ class PhaseSchedule:
     source_raw: str | None = None
     #: ``False`` until a material edit; a clean schedule is never serialised.
     dirty: bool = False
+    #: ``True`` when slot *i* is step *i* -- which is what a schedule drawn in
+    #: the panel always is, and what an imported list is only by coincidence.
+    #:
+    #: It decides what a change to the step count means (see
+    #: ``refit_schedule`` and ``normalize_schedule``), and it is separate from
+    #: ``dirty`` because the two answer different questions. ``dirty`` asks
+    #: "has this been edited since it was read", which is about serialising;
+    #: it is false again after a reload, when the token is all that survived.
+    #: Deciding alignment from it meant a schedule the user drew was treated
+    #: as an import the first time they touched the step counter after a
+    #: restart -- so 4 -> 5 stretched the regions and 5 -> 6 did not, with
+    #: nothing on screen to say why.
+    step_aligned: bool = False
     #: ``False`` when the list is too long to offer as a timeline.
     editable: bool = True
     #: ``True`` when editing requires an explicit resolution change first.
@@ -526,6 +539,7 @@ def refit_schedule(schedule: PhaseSchedule, target_slots: int) -> PhaseSchedule:
         ),
     )
     rebuilt.dirty = True
+    rebuilt.step_aligned = True
     return rebuilt
 
 
@@ -540,6 +554,9 @@ def normalize_schedule(schedule: PhaseSchedule, target_slots: int) -> PhaseSched
     values = normalize_values(compile_schedule(schedule), target)
     rebuilt = reconstruct_schedule(values, raw=schedule.source_raw, slots=target)
     rebuilt.dirty = True
+    # Resampling is what turns a list authored at its own resolution into one
+    # slot per step. That is the whole point of it, and it happens once.
+    rebuilt.step_aligned = True
     rebuilt.source_values = schedule.source_values
     rebuilt.editable = True
     rebuilt.normalization_required = False

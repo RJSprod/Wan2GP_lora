@@ -755,7 +755,22 @@ def sync_schedules(
                 # The token carries a schedule this editor state does not match:
                 # WanGP is the truth, so derive the timeline from the token.
                 live.add(key)
-                schedules[key] = sch.reconstruct_schedule(values, raw=info.raw)
+                rebuilt = sch.reconstruct_schedule(values, raw=info.raw)
+                # Whether slot *i* is step *i* is decided HERE, and it has to
+                # be: this is the last moment the step count that produced the
+                # token is still the one on screen. A token carrying one value
+                # per step was authored against this counter -- by the panel,
+                # in practice -- so a later change to the counter moves the end
+                # of its timeline and leaves every region where it is. A token
+                # of some other length was authored at its own resolution and
+                # is spread across the whole run by WanGP, so it is resampled
+                # into alignment instead, once.
+                #
+                # Asking ``dirty`` instead meant asking "has the panel touched
+                # it since it was read", which is false for everything after a
+                # reload -- including a schedule the user drew themselves.
+                rebuilt.step_aligned = len(values) == (context or ScheduleContext()).target_slots()
+                schedules[key] = rebuilt
 
     for key in [key for key in schedules if key not in live]:
         del schedules[key]
@@ -845,7 +860,7 @@ def refit_schedules(
         if sch.clamp_slots(schedule.slots) == target:
             continue
         schedules[key] = (
-            sch.refit_schedule(schedule, target) if schedule.dirty
+            sch.refit_schedule(schedule, target) if schedule.step_aligned
             else sch.normalize_schedule(schedule, target)
         )
         target_state = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=False)
@@ -969,6 +984,9 @@ def _resolve(
             base=base,
             slots=(context or ScheduleContext()).default_slots(shared),
             regions=[],
+            # Opened at the step count, so it is step-aligned before anything
+            # is drawn on it.
+            step_aligned=True,
         )
         schedules[key] = schedule
 
@@ -1017,6 +1035,10 @@ def _commit(
 ) -> bool:
     """Serialise the edited phase back into the native token."""
     target.schedule.dirty = True
+    # Drawn in the panel means drawn against the step counter: slot i is step
+    # i, and a later change to the step count moves the end of the timeline
+    # rather than sliding every region along it.
+    target.schedule.step_aligned = True
     lists = [list(values) for values in target.lists]
     lists[target.index] = sch.native_values(target.schedule)
 
