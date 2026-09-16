@@ -315,6 +315,68 @@ class TestNormalisation:
         assert sch.clamp_slots("nonsense") == sch.DEFAULT_SLOTS
 
 
+class TestRefit:
+    """Slot i is step i, so a step-count change is a tail operation."""
+
+    def test_growing_leaves_the_steps_that_existed_alone(self):
+        schedule = sch.reconstruct_schedule([1, 0.8, 0.4, 0.2])
+        assert sch.compile_schedule(sch.refit_schedule(schedule, 5)) == [1, 0.8, 0.4, 0.2, 0]
+
+    def test_a_new_step_arrives_undefined(self):
+        schedule = sch.reconstruct_schedule([0.5, 0.5])
+        grown = sch.refit_schedule(schedule, 4)
+        assert sch.compile_schedule(grown) == [0.5, 0.5, 0, 0]
+        assert [(r.start, r.end) for r in grown.regions] == [(1, 2)]
+
+    def test_shrinking_drops_the_steps_that_are_gone(self):
+        schedule = sch.reconstruct_schedule([1, 0.8, 0.4, 0.2])
+        assert sch.compile_schedule(sch.refit_schedule(schedule, 3)) == [1, 0.8, 0.4]
+
+    def test_a_region_straddling_the_new_end_is_clipped(self):
+        schedule = sch.PhaseSchedule(base=0.5, slots=6, regions=[region("r1", 2, 5, 0.5)])
+        refitted = sch.refit_schedule(schedule, 3)
+        assert [(r.id, r.start, r.end) for r in refitted.regions] == [("r1", 2, 3)]
+
+    def test_a_region_entirely_beyond_the_new_end_is_gone(self):
+        schedule = sch.PhaseSchedule(
+            base=0.5, slots=8,
+            regions=[region("r1", 1, 2, 0.5), region("r2", 6, 8, 0.9)],
+        )
+        refitted = sch.refit_schedule(schedule, 4)
+        assert [(r.id, r.start, r.end) for r in refitted.regions] == [("r1", 1, 2)]
+        assert sch.compile_schedule(refitted) == [0.5, 0.5, 0, 0]
+
+    def test_shrinking_past_everything_empties_the_timeline(self):
+        schedule = sch.PhaseSchedule(base=0.5, slots=8, regions=[region("r1", 5, 8, 0.9)])
+        refitted = sch.refit_schedule(schedule, 3)
+        assert refitted.regions == []
+        assert refitted.selected_region_id is None
+
+    def test_the_selected_region_survives_when_it_does(self):
+        schedule = sch.PhaseSchedule(
+            base=0.5, slots=8, selected_region_id="r2",
+            regions=[region("r1", 1, 2, 0.5), region("r2", 4, 5, 0.9)],
+        )
+        assert sch.refit_schedule(schedule, 6).selected_region_id == "r2"
+        # And falls back to what is left when it does not.
+        assert sch.refit_schedule(schedule, 3).selected_region_id == "r1"
+
+    def test_refitting_is_not_resampling(self):
+        """The distinction the two operations exist for."""
+        schedule = sch.reconstruct_schedule([1, 0])
+        assert sch.compile_schedule(sch.refit_schedule(schedule, 4)) == [1, 0, 0, 0]
+        assert sch.compile_schedule(sch.normalize_schedule(schedule, 4)) == [1, 1, 0, 0]
+
+    def test_a_refit_to_the_same_length_changes_nothing(self):
+        schedule = sch.reconstruct_schedule([1, 0.8, 0, 0.2])
+        assert sch.compile_schedule(sch.refit_schedule(schedule, 4)) == [1, 0.8, 0, 0.2]
+
+    def test_refitting_is_bounded(self):
+        schedule = sch.reconstruct_schedule([0.5, 0.5])
+        assert sch.refit_schedule(schedule, 10_000).slots == sch.MAX_SLOTS
+        assert sch.refit_schedule(schedule, 0).slots == sch.MIN_SLOTS
+
+
 class TestRegionIds:
     def test_ids_do_not_reuse_a_live_number(self):
         assert sch.next_region_id([region("r1", 1, 2), region("r3", 4, 5)]) == "r4"

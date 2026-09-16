@@ -511,6 +511,11 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 # schedule (it may not, until WanGP exposes phase boundaries).
                 "steps": context.steps,
                 "phase_boundaries_known": context.boundaries_known,
+                # The frontend commits a resync when it sees this, so the
+                # timelines follow the step counter without the user asking.
+                "schedules_out_of_sync": up.schedules_need_resync(
+                    stack, phases, instance.schedules, context
+                ),
                 "schedule_slot_limits": {
                     "min": sch.MIN_SLOTS, "max": sch.MAX_SLOTS, "default": sch.DEFAULT_SLOTS,
                 },
@@ -709,6 +714,14 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
             if kind == "schedule_clear_phase":
                 return up.schedule_clear_phase(stack, lora_id, phase, *args)
+
+            if kind == "schedule_resync":
+                changed = up.refit_schedules(
+                    stack, phases, instance.schedules, instance.phase_memory, context
+                )
+                if changed:
+                    instance.note(f"Schedules follow {context.steps} steps.")
+                return changed
 
             if kind == "schedule_normalize":
                 changed = up.schedule_normalize(stack, lora_id, phase, action.get("slots"), *args)

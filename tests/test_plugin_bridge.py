@@ -1201,3 +1201,123 @@ class TestImportSafety:
         assert written == "1,0.8,0.4;0.6"
         # Same numbers, spelled the way the serialiser spells them.
         assert [float(value) for value in written.split(";")[0].split(",")] == [1.0, 0.80, 0.400]
+
+
+class TestStepCountSync:
+    """Timelines follow num_inference_steps, live, without being asked."""
+
+    LORAS = ["a.safetensors", "b.safetensors"]
+
+    def _drawn(self, plugin, state, multipliers, steps):
+        """A schedule the panel authored, so it is step-aligned."""
+        payload = payload_of(plugin, state, self.LORAS, multipliers, steps=steps)
+        region = row_of(payload, "a.safetensors")["phase_schedules"][0]["regions"][0]
+        _, mults, _ = act(
+            plugin,
+            {"type": "schedule_set_region_strength", "id": "a.safetensors", "phase": 0,
+             "region_id": region["id"], "value": region["strength"]},
+            state, self.LORAS, multipliers, steps=steps,
+        )
+        return mults.get("value", multipliers)
+
+    def _resync(self, plugin, state, multipliers, steps):
+        _, mults, payload = act(
+            plugin, {"type": "schedule_resync"}, state, self.LORAS, multipliers, steps=steps
+        )
+        return mults.get("value", multipliers), payload
+
+    def test_a_longer_run_inherits_what_was_there(self, plugin, state):
+        multipliers = self._drawn(plugin, state, "1,0.8,0.4,0.2 1;1", 4)
+        written, _ = self._resync(plugin, state, multipliers, 5)
+        assert written.split()[0] == "1,0.8,0.4,0.2,0"
+
+    def test_a_shorter_run_drops_only_the_steps_that_are_gone(self, plugin, state):
+        multipliers = self._drawn(plugin, state, "1,0.8,0.4,0.2 1;1", 4)
+        written, _ = self._resync(plugin, state, multipliers, 3)
+        assert written.split()[0] == "1,0.8,0.4"
+
+    def test_a_region_straddling_the_new_end_is_clipped(self, plugin, state):
+        multipliers = self._drawn(plugin, state, "0,0.5,0.5,0.5,0.5 1;1", 5)
+        written, _ = self._resync(plugin, state, multipliers, 3)
+        assert written.split()[0] == "0,0.5,0.5"
+
+    def test_the_panel_asks_for_a_resync_and_then_stops(self, plugin, state):
+        """The flag drives one round trip, not a loop."""
+        multipliers = self._drawn(plugin, state, "1,0.8,0.4,0.2 1;1", 4)
+        assert payload_of(plugin, state, self.LORAS, multipliers, steps=9)["schedules_out_of_sync"]
+
+        written, payload = self._resync(plugin, state, multipliers, 9)
+        assert payload["schedules_out_of_sync"] is False
+        assert len(written.split()[0].split(",")) == 9
+
+        # Asking again changes nothing.
+        again, _ = self._resync(plugin, state, written, 9)
+        assert again.split()[0] == written.split()[0]
+
+    def test_every_lora_and_phase_follows_at_once(self, plugin, state):
+        multipliers = "1,0.8;0.5,0.5 0.2,0.2,0.2 "
+        # Author both so they are step-aligned, then move the counter.
+        for lora in self.LORAS:
+            payload = payload_of(plugin, state, self.LORAS, multipliers, steps=2)
+            row = row_of(payload, lora)
+            for phase, schedule in enumerate(row["phase_schedules"] or []):
+                if not schedule or not schedule["regions"]:
+                    continue
+                _, mults, _ = act(
+                    plugin,
+                    {"type": "schedule_set_region_strength", "id": lora, "phase": phase,
+                     "region_id": schedule["regions"][0]["id"],
+                     "value": schedule["regions"][0]["strength"]},
+                    state, self.LORAS, multipliers, steps=2,
+                )
+                multipliers = mults.get("value", multipliers)
+
+        written, payload = self._resync(plugin, state, multipliers, 4)
+        first, second = written.split()[0], written.split()[1]
+        assert [len(part.split(",")) for part in first.split(";")] == [4, 4]
+        assert len(second.split(";")[0].split(",")) == 4
+        assert payload["schedules_out_of_sync"] is False
+
+    def test_an_untouched_import_is_resampled_not_truncated(self, plugin, state):
+        """WanGP spreads it across the run; truncating would change the render."""
+        written, _ = self._resync(plugin, state, "1,0.8,0.4,0 1;1", 12)
+        assert written.split()[0] == "1,1,1,0.8,0.8,0.8,0.4,0.4,0.4,0,0,0"
+
+    def test_a_read_only_multiplier_is_never_refitted(self, plugin, state):
+        for token in ("0.5:0.9", "1;1"):
+            _, mults, _ = act(
+                plugin, {"type": "schedule_resync"}, state, self.LORAS,
+                token + " 1;1", steps=12,
+            )
+            assert "value" not in mults
+
+    def test_an_over_long_schedule_is_left_preserved(self, plugin, state):
+        long_token = ",".join(["0.5"] * 200)
+        _, mults, payload = act(
+            plugin, {"type": "schedule_resync"}, state, self.LORAS,
+            long_token + " 1;1", steps=12,
+        )
+        assert "value" not in mults
+        assert row_of(payload, "a.safetensors")["phase_schedules"][0]["editable"] is False
+
+    def test_a_step_count_beyond_the_ceiling_settles(self, plugin, state):
+        """It must stop asking rather than never matching."""
+        multipliers = self._drawn(plugin, state, "1,0.8,0.4,0.2 1;1", 4)
+        written, payload = self._resync(plugin, state, multipliers, 10_000)
+        assert payload["schedules_out_of_sync"] is False
+        assert len(written.split()[0].split(",")) == 120
+
+    def test_nothing_happens_when_the_step_count_is_unknown(self, plugin, state):
+        multipliers = "1,0.8,0.4,0.2 1;1"
+        payload = payload_of(plugin, state, self.LORAS, multipliers)
+        assert payload["schedules_out_of_sync"] is False
+        _, mults, _ = act(plugin, {"type": "schedule_resync"}, state, self.LORAS, multipliers)
+        assert "value" not in mults
+
+    def test_an_empty_timeline_needs_no_write_to_follow(self, plugin, state):
+        act(plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 0},
+            state, self.LORAS, "0.8;0.5 1;1", steps=10)
+        payload = payload_of(plugin, state, self.LORAS, "0.8;0.5 1;1", steps=25)
+        schedule = row_of(payload, "a.safetensors")["phase_schedules"][0]
+        assert schedule["slots"] == 25
+        assert payload["schedules_out_of_sync"] is False

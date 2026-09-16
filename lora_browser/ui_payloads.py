@@ -129,6 +129,14 @@ class ScheduleContext:
             steps = 0
         return cls(steps=max(0, steps))
 
+    def target_slots(self) -> int:
+        """The slot count every editable schedule should currently have.
+
+        Clamped, so a step count beyond what a timeline can hold settles at the
+        ceiling instead of never matching and asking to be refitted forever.
+        """
+        return sch.clamp_slots(self.steps) if self.steps else 0
+
     def default_slots(self, shared: bool = False) -> int:
         """Timeline length for a freshly opened schedule.
 
@@ -711,6 +719,84 @@ def sync_schedules(
 
     for key in [key for key in schedules if key not in live]:
         del schedules[key]
+
+
+def _drawn_schedules(
+    stack: "Stack",
+    phases: PhaseConfig,
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+):
+    """Every phase that has something drawn on its timeline, in stack order.
+
+    An empty timeline is skipped: it has no values in the token, so its length
+    is a view preference that ``sync_schedules`` already keeps current.
+    """
+    for position, lora_id in enumerate(stack.ids):
+        info = codec.classify(stack.tokens[position], phases.capacity)
+        if info.kind == codec.ADVANCED:
+            continue
+        shared = token_is_shared(info, phases, lora_id, schedules)
+        for phase in range(1 if shared else phases.capacity):
+            key = schedule_key(lora_id, phase, shared)
+            schedule = schedules.get(key)
+            if schedule is None or not schedule.regions or not schedule.editable:
+                continue
+            yield lora_id, phase, key, schedule
+
+
+def schedules_need_resync(
+    stack: "Stack",
+    phases: PhaseConfig,
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None,
+) -> bool:
+    """True when some timeline is not the length the step counter says."""
+    target = (context or ScheduleContext()).target_slots()
+    if not target:
+        return False
+    return any(
+        sch.clamp_slots(schedule.slots) != target
+        for _, _, _, schedule in _drawn_schedules(stack, phases, schedules)
+    )
+
+
+def refit_schedules(
+    stack: "Stack",
+    phases: PhaseConfig,
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    memory: dict[str, list[float]],
+    context: ScheduleContext | None,
+) -> bool:
+    """Bring every timeline to the current step count.
+
+    Two different operations, because a slot means two different things:
+
+    * a schedule drawn in the panel is step-aligned -- slot *i* is step *i* --
+      so it is **truncated or extended** at the end.  Steps that still exist keep
+      exactly what they had and a new step arrives undefined.
+    * a schedule that arrived from a preset, an .lset file or a hand edit was
+      authored at its own resolution, and WanGP spreads it across the whole run.
+      Truncating that would change what it renders, so it is **resampled** into
+      step alignment once, and is step-aligned from then on.
+
+    ``dirty`` is what tells them apart: it is set the moment the panel edits a
+    schedule, and clear for one that has only ever been read.
+    """
+    target = (context or ScheduleContext()).target_slots()
+    if not target:
+        return False
+
+    changed = False
+    for lora_id, phase, key, schedule in list(_drawn_schedules(stack, phases, schedules)):
+        if sch.clamp_slots(schedule.slots) == target:
+            continue
+        schedules[key] = (
+            sch.refit_schedule(schedule, target) if schedule.dirty
+            else sch.normalize_schedule(schedule, target)
+        )
+        target_state = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=False)
+        changed = _commit(stack, lora_id, target_state, phases, memory) or changed
+    return changed
 
 
 def _phase_values(info: codec.TokenInfo, phases: PhaseConfig, lora_id: str, phase: int) -> list[float]:

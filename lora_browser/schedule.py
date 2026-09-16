@@ -496,6 +496,39 @@ def normalize_values(values: list[float], target_slots: int) -> list[float]:
     return result
 
 
+def refit_schedule(schedule: PhaseSchedule, target_slots: int) -> PhaseSchedule:
+    """Change the slot count without moving anything that stays.
+
+    This is what a change to the inference step count means: slot *i* is step
+    *i*, so growing adds undefined slots at the end and shrinking drops the ones
+    that no longer exist.  A region straddling the new end is clipped to it, and
+    one entirely beyond it is gone.
+
+    Deliberately not ``normalize_schedule``: resampling would slide every region
+    along the timeline to keep its *proportion* of the run, which is right for a
+    schedule spread across the whole run and wrong for one drawn step by step.
+    """
+    target = clamp_slots(target_slots)
+    kept: list[Region] = []
+    for region in sort_regions(schedule.regions):
+        if int(region.start) > target:
+            continue
+        kept.append(replace(region, end=min(int(region.end), target)))
+
+    rebuilt = replace(
+        schedule,
+        slots=target,
+        regions=kept,
+        selected_region_id=(
+            schedule.selected_region_id
+            if any(region.id == schedule.selected_region_id for region in kept)
+            else (kept[0].id if kept else None)
+        ),
+    )
+    rebuilt.dirty = True
+    return rebuilt
+
+
 def normalize_schedule(schedule: PhaseSchedule, target_slots: int) -> PhaseSchedule:
     """Re-grid a schedule to ``target_slots``, keeping what it currently means.
 

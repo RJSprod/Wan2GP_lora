@@ -166,12 +166,31 @@ it is worth its plain strength, and opening the scheduler writes nothing.
   linking moves the plain strength of unscheduled phases and skips scheduled
   ones, and never copies regions between them.
 
-**A new timeline has one slot per inference step**, so its resolution matches the
-run you configured, and it keeps following the step counter until you draw
-something on it. After that the slot count lives in the multiplier itself, so
-changing the step count leaves the two disagreeing; the panel says so on the
-`Slots:` button and re-grids on request rather than rewriting your schedule
-behind you.
+**One slot per inference step, always.** Timelines follow the step counter live:
+change it in WanGP and every schedule in the panel comes with it, for every LoRA
+and every phase, without being asked.
+
+How a schedule follows depends on where it came from, because a slot means two
+different things:
+
+- A schedule **drawn in the panel** is step-aligned — slot *i* is step *i* — so
+  it is truncated or extended at the end. Going 4 → 5 steps keeps steps 1–4
+  exactly as they were and leaves step 5 undefined (so, 0, until you draw on it);
+  going 5 → 3 drops steps 4–5 and keeps the rest. A region straddling the new end
+  is clipped to it; one entirely beyond it is gone, and does not come back if you
+  lengthen the run again.
+- A schedule **that arrived from a preset, an `.lset` file or a hand edit** was
+  authored at its own resolution, and WanGP spreads it across the whole run.
+  Truncating that would change what it renders, so it is resampled into step
+  alignment once — and is step-aligned from then on.
+
+Read-only multipliers are never refitted: branch syntax, an ambiguous phase
+count, or a list too long to drag all stay exactly as imported. `Slots:` is still
+there for choosing a resolution deliberately.
+
+This is the one place the panel rewrites a schedule you did not touch. Binding
+the timeline to the step counter is what makes the two agree, and the trade is
+that changing steps writes `loras_multipliers` for every scheduled LoRA.
 
 **Slot numbers say what they are.** A comma-only token spans the whole run, so
 when the timeline has one slot per step those slots really are steps and are
@@ -186,9 +205,9 @@ region and not yet changing its strength — leaves the native multiplier exactl
 as it was. An imported schedule is likewise rendered, never re-serialised, until
 you make a material edit.
 
-`Slots:` re-grids a schedule to a different resolution. It is the one control
-here that rewrites an imported multiplier, which is why it is an explicit choice
-rather than something that happens on load.
+`Slots:` re-grids a schedule to a different resolution by resampling it — what
+you want when a schedule should keep its shape at a different granularity, as
+opposed to the step counter moving, which keeps the steps that still exist.
 
 ### Phases
 
@@ -361,9 +380,10 @@ Four things the design spec leaves to implementation, settled here:
 - **What fills the gaps.** Nothing: an uncovered slot is 0, not a base. The
   strength a phase had before scheduling survives only as what a new region
   starts at and what *Clear phase* restores.
-- **Irregular imported schedules.** Edited at their own native resolution. A list
-  too long to drag usefully is preserved and shown read-only, with an explicit
-  re-grid offered; nothing is ever re-gridded on load.
+- **Irregular imported schedules.** Resampled into step alignment the first time
+  they are seen, which preserves what they render; after that they follow the
+  step counter like any other. A list too long to drag usefully is preserved and
+  shown read-only instead, with an explicit re-grid offered.
 - **Multi-phase coordinates.** Phase-relative by default. Exact global step
   numbers are claimed only for a schedule that really does span the whole run at
   one slot per step.

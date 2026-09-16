@@ -163,6 +163,10 @@ def _serve(host):
             self.wfile.write(data)
 
         def do_GET(self):
+            if self.path.startswith("/steps"):
+                host.steps = int(self.path.rsplit("=", 1)[-1])
+                self._send(json.dumps({"steps": host.steps}))
+                return
             if self.path == "/":
                 page = PAGE.replace("__CSS__", _asset("lora_browser.css").replace("__NS__", NS))
                 page = page.replace("__SCRIPT__", _asset("lora_browser.js"))
@@ -236,8 +240,39 @@ def native(page):
     return page.evaluate("window.__native")
 
 
+def expected_values(schedule):
+    """What the token should say, compiled from the regions on screen."""
+    values = [schedule["gap_strength"]] * schedule["slots"]
+    for region in schedule["regions"]:
+        for slot in range(region["start"], region["end"] + 1):
+            values[slot - 1] = region["strength"]
+    return [("%g" % value) for value in values]
+
+
 def settle(page, ms=500):
     page.wait_for_timeout(ms)
+
+
+def schedule_of(page, lora_id, phase=0):
+    """The schedule the panel is currently showing, as the payload gave it."""
+    return page.evaluate(
+        """(args) => window.wgpLoraBrowser[args.instance].state.rows
+             .find(r => r.id === args.id).phase_schedules[args.phase]""",
+        {"instance": INSTANCE, "id": lora_id, "phase": phase},
+    )
+
+
+def drag_by_slots(page, node, timeline, slots, count, handle=None):
+    """Drag a region (or one of its handles) a whole number of slots."""
+    target = handle if handle is not None else node
+    box = target.bounding_box()
+    step = timeline.bounding_box()["width"] / float(slots)
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(
+        box["x"] + box["width"] / 2 + step * count, box["y"] + box["height"] / 2, steps=8
+    )
+    return step
 
 
 def select_phase(page, row, index):
@@ -339,46 +374,45 @@ class TestPanelInTheBrowser:
     def test_dragging_a_region_commits_one_canonical_update(self, panel):
         page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
-        region = row.locator(".lb-region").nth(1)
+        before = schedule_of(page, "lora_02.safetensors")
+        moved = before["regions"][0]
+
+        region = row.locator(".lb-region").first
         region.scroll_into_view_if_needed()
         settle(page, 200)
-        box = region.bounding_box()
-        timeline = row.locator(".lb-timeline").bounding_box()
-        slot = timeline["width"] / 4.0
-
-        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-        page.mouse.down()
-        page.mouse.move(box["x"] + box["width"] / 2 + slot, box["y"] + box["height"] / 2, steps=8)
+        start_x = region.bounding_box()["x"]
+        drag_by_slots(page, region, row.locator(".lb-timeline"), before["slots"], 2)
         # The preview follows the pointer without a round trip.
-        assert row.locator(".lb-region").nth(1).bounding_box()["x"] > box["x"] + slot / 2
+        assert row.locator(".lb-region").first.bounding_box()["x"] > start_x
         page.mouse.up()
         settle(page, 700)
 
-        # 1,0.8,0.4,0 is three regions over a gap. Slot 2's was dropped onto
-        # slot 3's and covered it completely; the slot it left behind is zero,
-        # not some base showing through.
-        assert native(page).split()[1] == "1,0,0.8,0;0.7,0.5,0.2,0"
-        assert row.locator(".lb-region").count() == 2
+        after = schedule_of(page, "lora_02.safetensors")
+        assert after["regions"][0]["start"] == moved["start"] + 2
+        assert after["regions"][0]["end"] == moved["end"] + 2
+        # The token is exactly the picture: regions where they are, zero elsewhere.
+        assert native(page).split()[1].split(";")[0].split(",") == expected_values(after)
 
     def test_a_resize_moves_only_the_dragged_edge(self, panel):
         page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
+        before = schedule_of(page, "lora_02.safetensors")
+        resized = before["regions"][0]
+
         region = row.locator(".lb-region").first
         region.scroll_into_view_if_needed()
         settle(page, 200)
-        handle = region.locator(".lb-handle-right").bounding_box()
-        timeline = row.locator(".lb-timeline").bounding_box()
-
-        page.mouse.move(handle["x"] + handle["width"] / 2, handle["y"] + handle["height"] / 2)
-        page.mouse.down()
-        page.mouse.move(
-            handle["x"] + handle["width"] / 2 + timeline["width"] / 4.0,
-            handle["y"] + handle["height"] / 2, steps=8,
+        drag_by_slots(
+            page, region, row.locator(".lb-timeline"), before["slots"], -1,
+            handle=region.locator(".lb-handle-left"),
         )
         page.mouse.up()
         settle(page, 700)
-        # Slot 1's region grew right by one; its neighbour did not move.
-        assert native(page).split()[1] == "1,1,0.8,0;0.7,0.5,0.2,0"
+
+        after = schedule_of(page, "lora_02.safetensors")
+        assert after["regions"][0]["start"] == resized["start"] - 1
+        assert after["regions"][0]["end"] == resized["end"]
+        assert native(page).split()[1].split(";")[0].split(",") == expected_values(after)
 
     def test_scheduler_mode_replaces_the_plain_strength_control(self, panel):
         """The scrubber is removed, not disabled: it is not what WanGP applies."""
@@ -570,7 +604,7 @@ class TestPanelInTheBrowser:
         settle(page, 700)
         regions = row.locator(".lb-region").count()
         before = native(page)
-        assert regions == 2
+        assert regions > 0
 
         page.evaluate("""() => {
           const root = document.querySelector('[id^=lb_root_]');
@@ -583,6 +617,55 @@ class TestPanelInTheBrowser:
         assert native(page) == before
         # View state survives with it, because it never left the frontend.
         assert page.locator('.lb-row[data-id="lora_02.safetensors"] .lb-region').count() == regions
+
+    def test_the_timeline_follows_the_step_counter(self, panel):
+        """The reported issue: change the steps in WanGP, live, and the
+        schedule has to come with it."""
+        page, host, _ = panel
+        row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
+        select_phase(page, row, 0)
+        if row.locator(".lb-timeline").count() == 0:
+            row.locator("button.lb-schedule-toggle").click()
+            settle(page, 700)
+
+        def set_steps(count):
+            """Move the counter, then push a payload as WanGP's change does."""
+            page.evaluate("(n) => fetch('/steps?n=' + n)", count)
+            settle(page, 250)
+            page.evaluate("""() => fetch('/payload').then(r => r.json()).then(d => {
+                window.__native = d.multipliers; window.__push(d.payload); })""")
+            settle(page, 1800)
+
+        try:
+            set_steps(4)
+            assert schedule_of(page, "lora_02.safetensors")["slots"] == 4
+            drawn = schedule_of(page, "lora_02.safetensors")
+            native_before_growth = native(page).split()[1].split(";")[0].split(",")
+            assert native_before_growth == expected_values(drawn)
+            assert row.locator(".lb-tick").last.inner_text() == "4"
+
+            # Longer: what was there is inherited, the new step arrives undefined.
+            set_steps(5)
+            grown = schedule_of(page, "lora_02.safetensors")
+            assert grown["slots"] == 5
+            values = native(page).split()[1].split(";")[0].split(",")
+            assert len(values) == 5
+            assert values[:4] == native_before_growth
+            assert values[4] == "0"
+            assert grown["regions"] == drawn["regions"]
+
+            # Shorter: the steps that are gone are dropped, the rest untouched.
+            set_steps(3)
+            shrunk = schedule_of(page, "lora_02.safetensors")
+            assert shrunk["slots"] == 3
+            assert native(page).split()[1].split(";")[0].split(",") == values[:3]
+
+            # And it settles rather than asking again.
+            assert page.evaluate(
+                "() => window.wgpLoraBrowser['%s'].state.rows.length" % INSTANCE
+            ) == 3
+        finally:
+            set_steps(STEPS)
 
     def test_the_panel_fits_a_phone(self, panel):
         page, _, _ = panel

@@ -1730,16 +1730,12 @@
   function normalizeButton(row, phase, schedule) {
     var button = document.createElement("button");
     button.type = "button";
-    // A schedule keeps the length its token spells out, so changing the step
-    // counter afterwards can leave the two disagreeing. Re-gridding rewrites the
-    // multiplier, so it is offered here rather than done silently.
-    var mismatch = S.steps && schedule.active && schedule.slots !== S.steps;
-    button.className = "lb-btn" + (mismatch ? " lb-mismatch" : "");
+    // Editable timelines follow the step counter on their own now, so this is
+    // for choosing a resolution deliberately -- a read-only list too long to
+    // drag, or a schedule you want coarser than the run.
+    button.className = "lb-btn";
     button.textContent = "Slots: " + schedule.slots + " ▾";
-    button.title = mismatch
-      ? "This schedule has " + schedule.slots + " values but the run is now "
-        + S.steps + " steps - tap to re-grid it"
-      : "Change how many schedule values this phase uses";
+    button.title = "Change how many schedule values this phase uses";
     button.addEventListener("click", function (event) {
       var rect = button.getBoundingClientRect();
       openMenu(rect.left, rect.bottom, slotMenuItems(row, phase, schedule));
@@ -2685,6 +2681,14 @@
     // while edits are still outstanding they keep winning, so a value the user
     // has just set does not flicker back to the one before it.
     if (settleSync()) { S.localValues = {}; }
+
+    // The step counter moved: bring every timeline to the new length before
+    // anything is drawn from it. Python decides what that means per schedule
+    // and answers with a payload where nothing is out of sync any more, so this
+    // settles after one round rather than looping.
+    if (payload.schedules_out_of_sync && !S.inFlight && !S.drag && !S.dragging) {
+      send({ type: "schedule_resync" });
+    }
 
     renderHeader();
     renderGrid();
