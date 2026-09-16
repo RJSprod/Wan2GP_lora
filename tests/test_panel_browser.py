@@ -131,16 +131,21 @@ class _Host:
         self.selected = list(START["selected"])
         self.multipliers = START["multipliers"]
         self.steps = STEPS
+        #: Guidance phases, as WanGP's own dropdown would report them. Step
+        #: schedules exist only at 1, so that is where this starts; the tests
+        #: about more phases switch and switch back.
+        self.guidance = 1
 
     def payload(self):
         return self.plugin._build_payload(
-            self.plugin._instance(INSTANCE), STATE, self.selected, self.multipliers, 2, self.steps
+            self.plugin._instance(INSTANCE), STATE, self.selected, self.multipliers,
+            self.guidance, self.steps,
         )
 
     def act(self, action_json):
         choices, mults, text = self.plugin._apply_action(
             self.plugin._instance(INSTANCE), action_json, STATE, self.selected,
-            self.multipliers, 2, self.steps,
+            self.multipliers, self.guidance, self.steps,
         )
         if isinstance(choices, dict) and "value" in choices:
             self.selected = list(choices["value"])
@@ -166,6 +171,10 @@ def _serve(host):
             if self.path.startswith("/steps"):
                 host.steps = int(self.path.rsplit("=", 1)[-1])
                 self._send(json.dumps({"steps": host.steps}))
+                return
+            if self.path.startswith("/guidance"):
+                host.guidance = int(self.path.rsplit("=", 1)[-1])
+                self._send(json.dumps({"guidance": host.guidance}))
                 return
             if self.path == "/":
                 page = PAGE.replace("__CSS__", _asset("lora_browser.css").replace("__NS__", NS))
@@ -275,10 +284,43 @@ def drag_by_slots(page, node, timeline, slots, count, handle=None):
     return step
 
 
+def repaint(page, ms=1800):
+    """Push a fresh payload, as any WanGP change event would."""
+    page.evaluate("""() => fetch('/payload').then(r => r.json()).then(d => {
+        window.__native = d.multipliers; window.__push(d.payload); })""")
+    settle(page, ms)
+
+
+def set_guidance(page, count):
+    """Move WanGP's guidance-phase dropdown."""
+    page.evaluate("(n) => fetch('/guidance?n=' + n)", count)
+    settle(page, 250)
+    repaint(page)
+
+
+def open_timeline(page, row):
+    if row.locator(".lb-timeline").count() == 0:
+        row.locator("button.lb-schedule-toggle").click()
+        settle(page, 800)
+
+
+def draw_region(page, row, at=0.3):
+    """Open the timeline and tap once, so the row has a schedule to look at."""
+    open_timeline(page, row)
+    timeline = row.locator(".lb-timeline")
+    timeline.scroll_into_view_if_needed()
+    settle(page, 200)
+    box = timeline.bounding_box()
+    page.mouse.click(box["x"] + box["width"] * at, box["y"] + box["height"] / 2)
+    settle(page, 1300)
+
+
 def select_phase(page, row, index):
     """These tests share one page, so never inherit whichever chip was left on."""
-    row.locator(".lb-phase-strip .lb-chip").nth(index).click()
-    settle(page, 500)
+    chips = row.locator(".lb-phase-strip .lb-chip")
+    if chips.count() > index:
+        chips.nth(index).click()
+        settle(page, 500)
 
 
 class TestPanelInTheBrowser:
@@ -329,32 +371,51 @@ class TestPanelInTheBrowser:
     def test_a_value_outside_the_slider_range_is_kept(self, panel):
         page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_01.safetensors"]')
-        row.locator(".lb-phase-strip .lb-chip").nth(1).click()
-        settle(page)
-        assert row.locator(".lb-weight-main input[type=number]").input_value() == "1.23"
+        number = row.locator(".lb-weight-main input[type=number]")
+        number.fill("1.23")
+        number.press("Enter")
+        settle(page, 1200)
+
+        # The slider pins at its maximum and the exact value stays in the token.
+        assert number.input_value() == "1.23"
         assert row.locator(".lb-weight-main input[type=range]").input_value() == "1"
-        assert native(page).split()[0] == "0.71;1.23"
+        assert native(page).split()[0].split(";")[0] == "1.23"
+
+        number.fill("0.71")
+        number.press("Enter")
+        settle(page, 1200)
 
     def test_the_three_weight_controls_have_three_semantics(self, panel):
         page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_01.safetensors"]')
         number = row.locator(".lb-weight-main input[type=number]")
 
+        # One Phase guidance, so these act on phase 1; phase 2 rides along in
+        # the token untouched.
         row.locator(".lb-weight-main button.lb-step").nth(1).click()
         settle(page)
-        assert native(page).split()[0] == "0.71;1.24"
+        assert native(page).split()[0] == "0.72;1.23"
 
         number.fill("0.855")
         number.press("Enter")
         settle(page)
-        assert native(page).split()[0] == "0.71;0.855"
+        assert native(page).split()[0] == "0.855;1.23"
 
         slider = row.locator(".lb-weight-main input[type=range]")
         slider.click()
         slider.press("ArrowRight")
         settle(page)
-        value = float(native(page).split()[0].split(";")[1])
+        value = float(native(page).split()[0].split(";")[0])
         assert round(value * 100) % 5 == 0
+
+    def test_the_scheduler_is_offered_in_one_phase(self, panel):
+        page, _, _ = panel
+        assert page.evaluate(
+            "() => window.wgpLoraBrowser['%s'].state.schedulingEnabled" % INSTANCE
+        ) is True
+        assert page.locator(
+            '.lb-row[data-id="lora_01.safetensors"] button.lb-schedule-toggle'
+        ).count() == 1
 
     def test_opening_a_timeline_changes_nothing(self, panel):
         page, _, _ = panel
@@ -418,13 +479,14 @@ class TestPanelInTheBrowser:
         """The scrubber is removed, not disabled: it is not what WanGP applies."""
         page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
+        open_timeline(page, row)
         assert row.locator(".lb-timeline").count() == 1
         assert row.locator(".lb-weight-main").count() == 0
         # Exactly one strength control on the row, and it belongs to the region.
         assert row.locator("input[type=range]").count() == 1
         assert row.locator(".lb-region-editor input[type=range]").count() == 1
-        # Linking acts on a control that is not there, so it is not offered.
-        assert row.locator(".lb-phase-strip .lb-chip").count() == 2
+        # Scheduling needs One Phase, so there are no phase chips to link.
+        assert row.locator(".lb-phase-strip").count() == 0
 
         # A row that is not in scheduler mode still has its plain control.
         plain = page.locator('.lb-row[data-id="lora_01.safetensors"]')
@@ -448,13 +510,6 @@ class TestPanelInTheBrowser:
         settle(page, 600)
         assert row.locator(".lb-timeline").count() == 1
 
-    def test_a_scheduled_phase_chip_counts_regions(self, panel):
-        page, _, _ = panel
-        row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
-        chip = row.locator(".lb-phase-strip .lb-chip").first
-        assert "\u223f" in chip.inner_text().lower()
-        assert "region" in (chip.get_attribute("title") or "")
-
     def test_closing_the_timeline_keeps_the_schedule(self, panel):
         page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
@@ -469,16 +524,17 @@ class TestPanelInTheBrowser:
         settle(page, 700)
         assert row.locator(".lb-region").count() == regions
 
-    def test_clear_phase_only_clears_the_selected_phase(self, panel):
+    def test_clear_phase_returns_it_to_a_plain_strength(self, panel):
         page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
-        first_phase = native(page).split()[1].split(";")[0]
-        row.locator(".lb-phase-strip .lb-chip").nth(1).click()
-        settle(page, 700)
+        hidden = native(page).split()[1].split(";")[1]
         row.locator(".lb-sched-head button:has-text('Clear phase')").click()
-        settle(page, 800)
+        settle(page, 900)
         token = native(page).split()[1]
-        assert token == first_phase + ";0.7"
+        assert "," not in token.split(";")[0]
+        # The phase this guidance mode hides is untouched.
+        assert token.split(";")[1] == hidden
+        assert row.locator(".lb-weight-main input[type=range]").count() == 1
 
     def test_an_advanced_token_is_preserved_and_explained(self, panel):
         page, _, _ = panel
@@ -597,11 +653,8 @@ class TestPanelInTheBrowser:
         """Gradio can wipe the HTML host; the panel must come back by itself."""
         page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
-        # Phase 1 is the one that still has regions at this point.
-        row.locator(".lb-phase-strip .lb-chip").first.click()
-        settle(page, 500)
-        row.locator("button.lb-schedule-toggle").click()
-        settle(page, 700)
+        if row.locator(".lb-region").count() == 0:
+            draw_region(page, row)
         regions = row.locator(".lb-region").count()
         before = native(page)
         assert regions > 0
@@ -623,10 +676,6 @@ class TestPanelInTheBrowser:
         schedule has to come with it."""
         page, host, _ = panel
         row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
-        select_phase(page, row, 0)
-        if row.locator(".lb-timeline").count() == 0:
-            row.locator("button.lb-schedule-toggle").click()
-            settle(page, 700)
 
         def set_steps(count):
             """Move the counter, then push a payload as WanGP's change does."""
@@ -636,36 +685,58 @@ class TestPanelInTheBrowser:
                 window.__native = d.multipliers; window.__push(d.payload); })""")
             settle(page, 1800)
 
+        def phase_one():
+            return native(page).split()[1].split(";")[0].split(",")
+
         try:
+            # A schedule drawn against a four-step run, as the user described.
             set_steps(4)
-            assert schedule_of(page, "lora_02.safetensors")["slots"] == 4
+            draw_region(page, row, at=0.1)
             drawn = schedule_of(page, "lora_02.safetensors")
-            native_before_growth = native(page).split()[1].split(";")[0].split(",")
-            assert native_before_growth == expected_values(drawn)
+            assert drawn["slots"] == 4
+            assert drawn["regions"]
+            at_four = phase_one()
+            assert at_four == expected_values(drawn)
             assert row.locator(".lb-tick").last.inner_text() == "4"
 
             # Longer: what was there is inherited, the new step arrives undefined.
             set_steps(5)
             grown = schedule_of(page, "lora_02.safetensors")
             assert grown["slots"] == 5
-            values = native(page).split()[1].split(";")[0].split(",")
-            assert len(values) == 5
-            assert values[:4] == native_before_growth
-            assert values[4] == "0"
+            assert phase_one() == at_four + ["0"]
             assert grown["regions"] == drawn["regions"]
 
             # Shorter: the steps that are gone are dropped, the rest untouched.
             set_steps(3)
-            shrunk = schedule_of(page, "lora_02.safetensors")
-            assert shrunk["slots"] == 3
-            assert native(page).split()[1].split(";")[0].split(",") == values[:3]
-
-            # And it settles rather than asking again.
-            assert page.evaluate(
-                "() => window.wgpLoraBrowser['%s'].state.rows.length" % INSTANCE
-            ) == 3
+            assert schedule_of(page, "lora_02.safetensors")["slots"] == 3
+            assert phase_one() == at_four[:3]
         finally:
             set_steps(STEPS)
+
+    def test_leaving_one_phase_resets_a_scheduled_lora(self, panel):
+        """No single strength carries a schedule over, so it switches off."""
+        page, _, _ = panel
+        row = page.locator('.lb-row[data-id="lora_01.safetensors"]')
+        row.locator("button.lb-schedule-toggle").click()
+        settle(page, 800)
+        timeline = row.locator(".lb-timeline")
+        timeline.scroll_into_view_if_needed()
+        settle(page, 200)
+        box = timeline.bounding_box()
+        slots = schedule_of(page, "lora_01.safetensors")["slots"]
+        page.mouse.click(box["x"] + box["width"] * 0.3, box["y"] + box["height"] / 2)
+        settle(page, 1200)
+        assert row.locator(".lb-region").count() >= 1
+        assert "," in native(page).split()[0]
+
+        try:
+            set_guidance(page, 2)
+            settle(page, 900)
+            assert native(page).split()[0] == "0;0"
+            assert row.locator("button.lb-schedule-toggle").count() == 0
+            assert row.locator(".lb-timeline").count() == 0
+        finally:
+            set_guidance(page, 1)
 
     def test_the_panel_fits_a_phone(self, panel):
         page, _, _ = panel

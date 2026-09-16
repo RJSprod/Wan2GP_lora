@@ -130,7 +130,7 @@ class ScheduleContext:
         return cls(steps=max(0, steps))
 
     def target_slots(self) -> int:
-        """The slot count every editable schedule should currently have.
+        """One slot per inference step, or 0 when the step count is unknown.
 
         Clamped, so a step count beyond what a timeline can hold settles at the
         ceiling instead of never matching and asking to be refitted forever.
@@ -138,17 +138,37 @@ class ScheduleContext:
         return sch.clamp_slots(self.steps) if self.steps else 0
 
     def default_slots(self, shared: bool = False) -> int:
-        """Timeline length for a freshly opened schedule.
+        """Timeline length for a freshly opened schedule."""
+        return self.target_slots() or sch.DEFAULT_SLOTS
 
-        One slot per inference step whenever the step count is known, so the
-        timeline has the same resolution as the run the user configured.  For a
-        shared schedule that also makes each slot exactly one step; for a
-        phase-specific one the slots are still spread inside a phase, which is
-        why only the shared case is ever *labelled* in steps.
-        """
-        if self.steps:
-            return sch.clamp_slots(self.steps)
-        return sch.DEFAULT_SLOTS
+
+def scheduling_allowed(phases: PhaseConfig) -> bool:
+    """Whether a step schedule can say what it appears to say.
+
+    WanGP's ``expand_slist`` stretches each phase's comma list to fill that
+    phase's interval, so a list is step-exact exactly when its length equals the
+    number of steps in the interval it covers.
+
+    In One Phase mode the switch points sit at the end of the run, so phase 1
+    covers every step: a list of ``num_inference_steps`` values runs one value
+    per step, exactly as drawn.
+
+    With two or more guidance phases, phase 1 covers only up to
+    ``model_switch_step`` -- derived at generation time from the sampler's
+    timesteps and the switch threshold, and not knowable while editing.  A
+    four-slot schedule drawn against a four-step run would be squeezed into
+    however many steps phase 1 turns out to be, so the timeline would be showing
+    something WanGP is not going to do.  Rather than draw that, the editor does
+    not offer scheduling at all there.
+    """
+    return phases.effective <= 1
+
+
+SCHEDULING_DISABLED_REASON = (
+    "Step schedules need One Phase guidance: with more phases WanGP squeezes "
+    "each phase's values into that phase, so a timeline could not show what "
+    "actually runs."
+)
 
 
 def phase_labels(phases: int) -> list[str]:
@@ -360,8 +380,23 @@ def multiplier_fields(
             "advanced_preserved": True,
         }
 
-    if info.kind == codec.SCHEDULED:
+    if info.kind == codec.SCHEDULED and scheduling_allowed(phases):
         return _scheduled_fields(info, phases, lora_id, schedules or {}, context, with_schedules)
+
+    if info.kind == codec.SCHEDULED:
+        # More than one guidance phase: this token is on its way to being reset,
+        # and until it is there is nothing here a strength control can mean.
+        return {
+            "multiplier_raw": info.raw,
+            "multiplier_kind": codec.SCHEDULED,
+            "phase_values": [],
+            "hidden_values": [],
+            "linked": False,
+            "phase_schedules": [],
+            "schedule_shared": False,
+            "schedule_reason": SCHEDULING_DISABLED_REASON,
+            "advanced_preserved": False,
+        }
 
     values = full_values(info, phases, lora_id, memory)
     visible = values[: phases.effective]
@@ -382,7 +417,7 @@ def multiplier_fields(
                 lora_id, phases, schedules or {}, context,
                 shared=token_is_shared(info, phases, lora_id, schedules),
             )
-            if with_schedules else []
+            if with_schedules and scheduling_allowed(phases) else []
         ),
         "schedule_shared": token_is_shared(info, phases, lora_id, schedules),
         "schedule_reason": "",
@@ -691,6 +726,11 @@ def sync_schedules(
     imported schedule is rendered, never re-serialised.
     """
     live: set[tuple[str, int]] = set()
+    if not scheduling_allowed(phases):
+        # Nothing here could be edited truthfully; the tokens themselves are
+        # reset by refit_schedules, which is the only thing allowed to write.
+        schedules.clear()
+        return
 
     for position, lora_id in enumerate(stack.ids):
         info = codec.classify(stack.tokens[position], phases.capacity)
@@ -708,7 +748,7 @@ def sync_schedules(
                 if not stored.regions:
                     # Nothing has been drawn yet, so the timeline is free to
                     # follow the step counter the user is currently looking at.
-                    stored.slots = (context or ScheduleContext()).default_slots(shared)
+                    stored.slots = (context or ScheduleContext()).default_slots()
                 continue
 
             if len(values) > 1:
@@ -751,6 +791,13 @@ def schedules_need_resync(
     context: ScheduleContext | None,
 ) -> bool:
     """True when some timeline is not the length the step counter says."""
+    if not scheduling_allowed(phases):
+        # Any schedule still in a token has to go; see refit_schedules.
+        return any(
+            codec.classify(token, phases.capacity).kind == codec.SCHEDULED
+            for token in stack.tokens
+        )
+
     target = (context or ScheduleContext()).target_slots()
     if not target:
         return False
@@ -779,9 +826,16 @@ def refit_schedules(
       Truncating that would change what it renders, so it is **resampled** into
       step alignment once, and is step-aligned from then on.
 
+    When the guidance mode has more than one phase, no schedule can be shown
+    truthfully at all, so instead of refitting them this clears them -- see
+    ``_clear_schedules_for_phase_mode``.
+
     ``dirty`` is what tells them apart: it is set the moment the panel edits a
     schedule, and clear for one that has only ever been read.
     """
+    if not scheduling_allowed(phases):
+        return _clear_schedules_for_phase_mode(stack, phases, schedules, memory)
+
     target = (context or ScheduleContext()).target_slots()
     if not target:
         return False
@@ -796,6 +850,35 @@ def refit_schedules(
         )
         target_state = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=False)
         changed = _commit(stack, lora_id, target_state, phases, memory) or changed
+    return changed
+
+
+def _clear_schedules_for_phase_mode(
+    stack: "Stack",
+    phases: PhaseConfig,
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    memory: dict[str, list[float]],
+) -> bool:
+    """Drop every schedule when the guidance mode stops supporting them.
+
+    A scheduled LoRA goes to 0 rather than to some strength picked on its
+    behalf: the schedule said the multiplier varies over the run, and no single
+    number carries that over, so the honest move is to switch the LoRA off and
+    let the user set what they want.  Unscheduled LoRAs keep their strengths --
+    those mean the same thing in any phase mode.
+    """
+    schedules.clear()
+    changed = False
+    for position, token in enumerate(stack.tokens):
+        info = codec.classify(token, phases.capacity)
+        if info.kind != codec.SCHEDULED:
+            continue
+        lora_id = stack.ids[position]
+        zeroed = codec.build_token([0.0] * phases.capacity, phases.capacity)
+        if stack.tokens[position] != zeroed:
+            stack.tokens[position] = zeroed
+            memory[normalize_id(lora_id)] = [0.0] * phases.capacity
+            changed = True
     return changed
 
 
@@ -860,6 +943,9 @@ def _resolve(
     position = stack.index_of(lora_id)
     if position < 0:
         raise sch.ScheduleError("That LoRA is not active.")
+
+    if not scheduling_allowed(phases):
+        raise sch.ScheduleError(SCHEDULING_DISABLED_REASON)
 
     info = codec.classify(stack.tokens[position], phases.capacity)
     if info.kind == codec.ADVANCED:

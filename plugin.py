@@ -516,6 +516,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 "schedules_out_of_sync": up.schedules_need_resync(
                     stack, phases, instance.schedules, context
                 ),
+                # Step schedules only mean what they show in One Phase guidance.
+                "scheduling_enabled": up.scheduling_allowed(phases),
+                "scheduling_disabled_reason": up.SCHEDULING_DISABLED_REASON,
                 "schedule_slot_limits": {
                     "min": sch.MIN_SLOTS, "max": sch.MAX_SLOTS, "default": sch.DEFAULT_SLOTS,
                 },
@@ -720,7 +723,11 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                     stack, phases, instance.schedules, instance.phase_memory, context
                 )
                 if changed:
-                    instance.note(f"Schedules follow {context.steps} steps.")
+                    instance.note(
+                        f"Schedules follow {context.steps} steps."
+                        if up.scheduling_allowed(phases)
+                        else "Guidance uses more than one phase; scheduled LoRAs were reset to 0."
+                    )
                 return changed
 
             if kind == "schedule_normalize":
