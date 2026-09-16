@@ -659,10 +659,20 @@ class TestMediaBridge:
         )
         assert str(tmp_path) not in raw
 
-    def test_inspect_without_a_sidecar_reports_an_error(self, plugin, state, tmp_path):
+    def test_inspect_opens_for_a_lora_with_no_catalogue(self, plugin, state, tmp_path):
+        """No sidecar is a state to render, not a refusal.
+
+        Inspect is also where a catalogue is fetched from, so it has to open
+        before there is anything to show. The payload says the catalogue is
+        absent instead; only a LoRA that is not in the inventory is an error,
+        which the next test covers.
+        """
         self._library(tmp_path)
         result = self.ask(plugin, state, {"kind": "inspect", "id": "b.safetensors"})
-        assert result["error"]
+        assert "error" not in result
+        assert result["id"] == "b.safetensors"
+        assert result["has_catalogue"] is False
+        assert result["media"] == []
 
     def test_inspect_refuses_an_unknown_lora(self, plugin, state, tmp_path):
         self._library(tmp_path)
