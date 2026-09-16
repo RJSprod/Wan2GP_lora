@@ -468,15 +468,17 @@
 .__NS__ .lb-sched-titles { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .__NS__ .lb-timeline-wrap {
   margin-top: 8px;
-  overflow-x: auto;
-  overflow-y: hidden;
-  scrollbar-gutter: stable;
+  overflow: hidden;
 }
-/* Wide enough that a slot is a real target on a phone, and it scrolls rather
-   than shrinking slots into invisibility. */
+/* The whole run is always in view: the timeline takes the width it is given and
+   the slots divide it. Dense schedules get their room from the full-screen
+   editor rather than from a scrollbar. */
 .__NS__ .lb-timeline {
   position: relative;
-  min-width: 480px;
+  /* Its own border is part of the width it was given, or it overflows by 2px
+     and the wrapper finds something to scroll after all. */
+  box-sizing: border-box;
+  width: 100%;
   height: 128px;
   border: 1px solid var(--border-color-primary);
   border-radius: var(--radius-xs, 4px);
@@ -557,8 +559,11 @@
   color: var(--body-text-color-subdued, var(--body-text-color));
   white-space: nowrap;
 }
+/* Handles give way before the body does, so a one-slot region is still a drag
+   target when the run is long. Precise resizing is what full screen is for. */
 .__NS__ .lb-handle {
-  flex: 0 0 22px;
+  flex: 0 1 22px;
+  min-width: 5px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -656,7 +661,7 @@
 @media (max-width: 620px) {
   .__NS__ .lb-search { flex-basis: 100%; }
   .__NS__ .lb-weight { grid-template-columns: 42px minmax(50px, 1fr) 70px 42px; }
-  .__NS__ .lb-timeline { min-width: 360px; }
+  .__NS__ .lb-timeline { height: 112px; }
 }
 
 /* ------------------------------------------------------- video previews */
@@ -711,6 +716,45 @@
   background: #000;
   display: block;
 }
+
+/* ------------------------------------------------ full-screen schedule */
+
+/* Same shell as the inspect view, different contents: one timeline with room
+   to work in, and the region editor under it. */
+.lb-sched-modal .lb-sched-modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px 14px;
+  overflow-y: auto;
+}
+/* The modal has its own title bar, so the panel's does not repeat it. */
+.lb-sched-modal .lb-sched-titles > strong { display: none; }
+.lb-sched-modal .lb-schedule {
+  border-top: 0;
+  background: transparent;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+/* Full width, because width is what a timeline needs -- but only as tall as its
+   contents. A region does not get easier to aim at by being a wall. */
+.lb-modal-overlay .lb-modal.lb-sched-modal {
+  height: auto;
+  max-height: 88vh;
+}
+.lb-sched-modal .lb-sched-modal-body { overflow-y: auto; }
+.lb-sched-modal .lb-timeline-wrap { flex: 0 0 auto; }
+.lb-sched-modal .lb-timeline { height: clamp(170px, 24vh, 230px); }
+.lb-sched-modal .lb-region { top: 34px; bottom: 34px; height: auto; }
+.lb-sched-modal .lb-handle { flex: 0 0 26px; }
+.lb-sched-modal .lb-region-body strong { font-size: var(--text-lg, 17px); }
+.lb-sched-modal .lb-region-editor { flex: 0 0 auto; }
+.lb-sched-modal .lb-tick { font-size: 11px; }
 
 /* -------------------------------------------------------- inspect view */
 
