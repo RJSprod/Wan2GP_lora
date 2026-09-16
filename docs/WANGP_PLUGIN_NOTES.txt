@@ -211,6 +211,27 @@ WHY IT TOOK FOUR ROUNDS
         its last value, so "0.8" == "0.8;0.8".
       - A token with MORE parts than the phase count is REJECTED by WanGP.
 
+    WHEN A COMMA LIST IS STEP-EXACT (shared/utils/loras_mutipliers.py)
+      expand_slist() does NOT truncate or pad a comma list to the step count.
+      It RESAMPLES it to fill the interval it covers:
+
+          expand_one(slist, n) -> [slist[i * len(slist) // n] for i in range(n)]
+
+      For a shared (comma-only) token the interval is the whole run, so the
+      expansion is the identity exactly when len(slist) == num_inference_steps.
+
+      For a token using ';' the interval is that phase:
+          expand_one(phase1, model_switch_step)
+        + expand_one(phase2, model_switch_step2 - model_switch_step)
+        + expand_one(phase3, num_inference_steps - model_switch_step2)
+      and model_switch_step comes from get_model_switch_steps(), which needs the
+      sampler's actual timesteps. It is NOT knowable while the user is editing.
+
+      In One Phase guidance both switch points default to the total, so phase 1
+      covers every step and a ';' token is still step-exact. That is why this
+      plugin offers step schedules only in One Phase: with more, "0.8,0.8,0.8,0"
+      at 4 steps renders [0.8, 0.8, 0.64, 0.64], not what was drawn.
+
     SCHEDULE GRAMMAR IS PHASE-MAJOR
       In "1,0.8,0.4,0;0.7,0.5,0.2,0" the ';' is the outer separator: phase 1 is
       scheduled 1 -> 0.8 -> 0.4 -> 0 and phase 2 is scheduled separately. Emit

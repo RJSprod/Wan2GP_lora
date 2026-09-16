@@ -58,6 +58,9 @@
     valueDecimals: 4,
     steps: 0,
     slotLimits: { min: 1, max: 120, default: 20 },
+    //: Step schedules only mean what they show in One Phase guidance.
+    schedulingEnabled: true,
+    schedulingDisabledReason: "",
     profiles: [],
     profilesIncomplete: [],
     civitaiKeySet: false,
@@ -1093,6 +1096,15 @@
     return found || regions[0] || null;
   }
 
+  /* One phase only: with more, WanGP squeezes each phase's values into that
+     phase, so a timeline would be drawing something it cannot promise. */
+  function schedulingNote() {
+    var note = document.createElement("div");
+    note.className = "lb-preserved-note";
+    note.textContent = S.schedulingDisabledReason;
+    return note;
+  }
+
   function rowsKey() {
     return S.rows.map(function (row) {
       var phase = phaseOf(row);
@@ -1110,7 +1122,8 @@
       ].join(":");
     // The step count is in here because the schedule header compares itself
     // against it; a run length change has to reach the row.
-    }).join("|") + "#" + S.phases.effective + "#" + S.nameMode + "#" + S.steps;
+    }).join("|") + "#" + S.phases.effective + "#" + S.nameMode + "#" + S.steps
+      + "#" + (S.schedulingEnabled ? "sched" : "nosched");
   }
 
   function renderRows(force) {
@@ -1155,12 +1168,18 @@
 
     var phase = phaseOf(row);
     var schedule = scheduleOf(row, phase);
-    var open = !!S.scheduleOpenById[row.id];
+    var open = !!S.scheduleOpenById[row.id] && S.schedulingEnabled;
 
     node.appendChild(buildRowTop(row, phase, schedule, open));
 
     if (row.multiplier_kind === "advanced") {
       node.appendChild(buildPreserved(row));
+      return node;
+    }
+
+    if (row.multiplier_kind === "scheduled" && !S.schedulingEnabled) {
+      // Waiting for the reset that leaving One Phase triggers.
+      node.appendChild(schedulingNote());
       return node;
     }
 
@@ -1244,7 +1263,7 @@
     if (row.multiplier_kind === "scheduled") { name.appendChild(note("Scheduled")); }
     top.appendChild(name);
 
-    if (row.multiplier_kind !== "advanced") {
+    if (row.multiplier_kind !== "advanced" && S.schedulingEnabled) {
       var toggle = document.createElement("button");
       toggle.type = "button";
       toggle.className = "lb-btn lb-schedule-toggle" + (open ? " lb-on" : "");
@@ -2649,6 +2668,10 @@
     S.valueDecimals = payload.value_decimals || 4;
     S.steps = payload.steps || 0;
     if (payload.schedule_slot_limits) { S.slotLimits = payload.schedule_slot_limits; }
+    S.schedulingEnabled = payload.scheduling_enabled !== false;
+    S.schedulingDisabledReason = payload.scheduling_disabled_reason || "";
+    // Leaving One Phase closes every timeline: there is nothing left to show.
+    if (!S.schedulingEnabled) { S.scheduleOpenById = {}; }
     S.defaultProfile = payload.default_profile || "";
     S.civitaiKeySet = !!payload.civitai_key_set;
     if (payload.sort_mode) { S.sortMode = payload.sort_mode; }

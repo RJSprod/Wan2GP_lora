@@ -136,6 +136,23 @@ Step schedule   Phase 1   30 global steps    [+ Region] [Slots: 30 ▾] [Clear p
   [−]  ------------ slider ------------  [0.2]  [+]
 ```
 
+**Scheduling needs One Phase guidance.** WanGP stretches each phase's comma list
+to fill that phase's interval, so a list runs one value per step only when its
+length matches the number of steps in the interval it covers. In One Phase the
+switch points sit at the end of the run, so phase 1 covers every step and a
+30-value schedule at 30 steps runs exactly as drawn. With two or more phases,
+phase 1 covers only up to `model_switch_step` — derived at generation time from
+the sampler's timesteps and the switch threshold, and unknowable while editing —
+so a four-slot schedule drawn against a four-step run would be squeezed into
+however many steps phase 1 turns out to be. Rather than draw something WanGP is
+not going to do, the panel does not offer scheduling there at all.
+
+Switching guidance to two or more phases therefore resets a scheduled LoRA to
+**0**: the schedule said the multiplier varies over the run, and no single number
+carries that over, so the LoRA switches off and waits for you to set what you
+want. LoRAs on a plain strength are untouched — that means the same thing in any
+phase mode. Coming back to One Phase keeps each phase's own value.
+
 **Scheduling replaces the plain strength control.** While a phase is scheduled
 the row has no slider, `+`/`-` or numeric field of its own — the region's
 controls are the only ones on screen, open or collapsed. That is not cosmetic:
@@ -162,13 +179,13 @@ it is worth its plain strength, and opening the scheduler writes nothing.
   it is doing (`∿ 0.95 at steps 4–10, 0.2 at steps 13–19`) and tapping that goes
   back in. **Clear phase** is the one that removes it, returning that phase — and
   only that phase — to a plain multiplier and its ordinary strength control.
-- Schedule state is **per phase**. Phase 1 and phase 2 have independent regions;
-  linking moves the plain strength of unscheduled phases and skips scheduled
-  ones, and never copies regions between them.
+- Schedule state is held **per phase** internally, so a model that carries a
+  phase 2 value in One Phase mode keeps it untouched while phase 1 is scheduled.
+  Linking is a multi-phase affair and so never coexists with a schedule.
 
 **One slot per inference step, always.** Timelines follow the step counter live:
-change it in WanGP and every schedule in the panel comes with it, for every LoRA
-and every phase, without being asked.
+change it in WanGP and every schedule in the panel comes with it, without being
+asked.
 
 How a schedule follows depends on where it came from, because a slot means two
 different things:
