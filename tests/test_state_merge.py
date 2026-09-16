@@ -384,6 +384,85 @@ class TestScheduleStateModel:
         assert stack.tokens[1] == "0.75;0.75"    # a plain strength means the same
         assert self.schedules == {}
 
+    def _load(self, multipliers, steps, ids=("a.safetensors",)):
+        """A token as it comes back after a reload: nothing but the token.
+
+        This is the state the bug lived in. The editor keeps its region
+        objects in memory only, so after a WanGP restart or a page reload the
+        schedule is rebuilt from the token and has never been edited *in this
+        process* -- which is a fact about the process, not about the schedule.
+        """
+        stack = up.Stack.from_native(list(ids), multipliers)
+        up.sync_schedules(stack, self.phases, self.schedules, up.ScheduleContext(steps=steps))
+        return stack
+
+    def _steps(self, stack, steps):
+        """One payload round at a new step count, in plugin.py's own order:
+        the payload build syncs, reports what is out of step, and the browser
+        answers with a resync."""
+        context = up.ScheduleContext(steps=steps)
+        up.sync_schedules(stack, self.phases, self.schedules, context)
+        if up.schedules_need_resync(stack, self.phases, self.schedules, context):
+            up.refit_schedules(stack, self.phases, self.schedules, self.memory, context)
+            up.sync_schedules(stack, self.phases, self.schedules, context)
+        return [
+            (r.start, r.end, r.strength)
+            for r in sch.sort_regions(self.schedules[("a.safetensors", 0)].regions)
+        ]
+
+    def test_more_steps_adds_undefined_slots_and_moves_nothing(self):
+        """The reported bug: 4 -> 5 stretched the regions, 5 -> 6 did not.
+
+        Both went through the same branch and disagreed because the *first*
+        change ran against a schedule rebuilt from the token, which is not
+        marked dirty, and resampling set the flag the second change then read.
+        A schedule drawn one slot per step grows at its end whichever change
+        it is.
+        """
+        stack = self._load("0.5,0.5,0.3,0.3;0.64", 4)
+        drawn = [(1, 2, 0.5), (3, 4, 0.3)]
+        assert self._steps(stack, 4) == drawn
+        assert self.schedules[("a.safetensors", 0)].dirty is False
+
+        assert self._steps(stack, 5) == drawn
+        assert stack.tokens[0] == "0.5,0.5,0.3,0.3,0;0.64"
+        assert self._steps(stack, 6) == drawn
+        assert stack.tokens[0] == "0.5,0.5,0.3,0.3,0,0;0.64"
+
+    def test_fewer_steps_cuts_into_the_last_region(self):
+        """Down is the same rule read the other way: the end of the timeline
+        moves, and a region straddling it is clipped rather than slid."""
+        stack = self._load("0.5,0.5,0.3,0.3;0.64", 4)
+        assert self._steps(stack, 3) == [(1, 2, 0.5), (3, 3, 0.3)]
+        assert stack.tokens[0] == "0.5,0.5,0.3;0.64"
+        assert self._steps(stack, 2) == [(1, 2, 0.5)]
+        assert stack.tokens[0] == "0.5,0.5;0.64"
+
+    def test_a_list_authored_at_another_resolution_is_resampled_once(self):
+        """The case the other branch is for, and it still works.
+
+        Eight values against a four-step run were never one slot per step, so
+        truncating them would change what WanGP renders. They are resampled
+        into alignment instead -- once. From then on the timeline is
+        step-aligned like any other and grows at its end.
+        """
+        stack = self._load("1,1,0.8,0.8,0.5,0.5,0.2,0.2;0.64", 4)
+        assert self.schedules[("a.safetensors", 0)].step_aligned is False
+        assert self._steps(stack, 4) == [(1, 1, 1.0), (2, 2, 0.8), (3, 3, 0.5), (4, 4, 0.2)]
+        assert stack.tokens[0] == "1,0.8,0.5,0.2;0.64"
+
+        assert self._steps(stack, 5) == [(1, 1, 1.0), (2, 2, 0.8), (3, 3, 0.5), (4, 4, 0.2)]
+        assert stack.tokens[0] == "1,0.8,0.5,0.2,0;0.64"
+
+    def test_a_token_that_already_fits_the_run_is_left_alone(self):
+        """One value per step is step-aligned on arrival, whoever wrote it."""
+        stack = self._load("0.5,0.5,0.3,0.3;0.64", 4)
+        assert self.schedules[("a.safetensors", 0)].step_aligned is True
+        assert up.schedules_need_resync(
+            stack, self.phases, self.schedules, up.ScheduleContext(steps=4)
+        ) is False
+        assert stack.tokens[0] == "0.5,0.5,0.3,0.3;0.64"
+
     def test_an_empty_timeline_still_takes_a_strength(self):
         """Nothing is drawn yet, so the phase is worth one value."""
         stack = self._stack("0.4;0.5")
