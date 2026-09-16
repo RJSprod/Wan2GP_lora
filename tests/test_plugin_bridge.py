@@ -1089,3 +1089,115 @@ class TestScheduleActions:
         assert payload["nudge_step"] == 0.01
         assert payload["value_decimals"] == 4
         assert payload["schedule_slot_limits"]["max"] >= 30
+
+
+class TestImportSafety:
+    """What an existing install's multipliers go through when this build reads them.
+
+    Nothing here needs a converter: the panel derives regions from the token and
+    those regions say the same thing back, so a schedule written by WanGP, a
+    preset, an .lset file or a hand edit is rendered, never rewritten.
+    """
+
+    LORAS = ["a.safetensors", "b.safetensors"]
+
+    #: Shapes a real install can hold, including ones the editor's own model
+    #: would never produce.
+    CORPUS = [
+        "1;1",
+        "0.71;1.23",
+        "1,0.8,0.4,0;0.7,0.5,0.2,0",          # WanGP's documented form
+        "0.9,0.8;1.2,1.1",
+        "1;0.7,0.5,0.2",                       # scalar phase + scheduled phase
+        "0,0,0.5,0.5,0",                       # off, then on, then off
+        "0.5,0.5,0.5",                         # flat and non-zero
+        "0,0,0",                               # flat and off
+        "1.0,0.80,0.400;0.7",                  # trailing zeros the codec would trim
+        "1.4,-0.5;0.125",                      # out of range and fine decimals
+        "0.5:0.9;1",                           # branch syntax, never editable
+        "1,0.5,0.25",                          # shared across phases
+    ]
+
+    @pytest.mark.parametrize("token", CORPUS)
+    def test_rendering_never_touches_the_multiplier(self, plugin, state, token):
+        multipliers = token + " 1;1"
+        for _ in range(3):
+            payload = payload_of(plugin, state, self.LORAS, multipliers, steps=30)
+            assert row_of(payload, "a.safetensors")["multiplier_raw"] == token
+
+        # And no action that only looks at it writes anything back.
+        for action in (
+            {"type": "ready"},
+            {"type": "sort", "value": "recent"},
+            {"type": "zoom", "value": 120},
+        ):
+            choices, mults, _ = act(plugin, action, state, self.LORAS, multipliers, steps=30)
+            assert "value" not in choices and "value" not in mults
+
+    @pytest.mark.parametrize("token", CORPUS)
+    def test_what_the_editor_shows_is_what_the_token_says(self, plugin, state, token):
+        """Regions compiled back must equal the values WanGP was given."""
+        multipliers = token + " 1;1"
+        payload = payload_of(plugin, state, self.LORAS, multipliers, steps=30)
+        row = row_of(payload, "a.safetensors")
+        if row["multiplier_kind"] != "scheduled":
+            return
+
+        declared = [part.split(",") for part in token.split(";")]
+        for index, schedule in enumerate(row["phase_schedules"] or []):
+            if schedule is None:
+                continue
+            source = declared[0] if row["schedule_shared"] else declared[index]
+            if len(source) < 2:
+                continue
+            rebuilt = [schedule["gap_strength"]] * schedule["slots"]
+            for region in schedule["regions"]:
+                for slot in range(region["start"], region["end"] + 1):
+                    rebuilt[slot - 1] = region["strength"]
+            assert rebuilt == [float(value) for value in source]
+
+    def test_opening_the_scheduler_on_an_imported_schedule_writes_nothing(self, plugin, state):
+        multipliers = "1,0.8,0.4,0;0.7,0.5,0.2,0 1;1"
+        for phase in (0, 1):
+            choices, mults, payload = act(
+                plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": phase},
+                state, self.LORAS, multipliers, steps=30,
+            )
+            assert "value" not in choices and "value" not in mults
+            assert row_of(payload, "a.safetensors")["multiplier_raw"] == "1,0.8,0.4,0;0.7,0.5,0.2,0"
+
+    def test_an_accelerator_managed_stack_with_a_schedule_survives(self, plugin, state):
+        multipliers = "1;1|1,0.8,0.4,0"
+        payload = payload_of(plugin, state, self.LORAS, multipliers, steps=30)
+        assert row_of(payload, "b.safetensors")["multiplier_kind"] == "scheduled"
+        _, mults, _ = act(
+            plugin, {"type": "set_strength", "id": "a.safetensors", "phase": 0, "value": 0.5},
+            state, self.LORAS, multipliers, steps=30,
+        )
+        # The bar stayed put and the schedule to its right is untouched.
+        assert mults["value"] == "0.5;1|1,0.8,0.4,0"
+
+    def test_a_profile_and_a_disable_restore_cycle_preserve_zeros(self, plugin, state):
+        multipliers = "0,0,0.5,0.5,0;0.7 1;1"
+        act(plugin, {"type": "profile_save", "name": "zeros"}, state, self.LORAS, multipliers)
+        _, mults, _ = act(plugin, {"type": "profile_recall", "name": "zeros"}, state, [], "")
+        assert mults["value"].split()[0] == "0,0,0.5,0.5,0;0.7"
+
+        act(plugin, {"type": "disable_all"}, state, self.LORAS, multipliers)
+        _, mults, _ = act(plugin, {"type": "restore"}, state, [], "")
+        assert mults["value"].split()[0] == "0,0,0.5,0.5,0;0.7"
+
+    def test_editing_a_token_canonicalises_its_formatting_but_not_its_values(self, plugin, state):
+        """The one rewrite there is, and only once an edit actually happens."""
+        multipliers = "1.0,0.80,0.400;0.7 1;1"
+        payload = payload_of(plugin, state, self.LORAS, multipliers, steps=30)
+        assert row_of(payload, "a.safetensors")["multiplier_raw"] == "1.0,0.80,0.400;0.7"
+
+        _, mults, _ = act(
+            plugin, {"type": "set_strength", "id": "a.safetensors", "phase": 1, "value": 0.6},
+            state, self.LORAS, multipliers, steps=30,
+        )
+        written = mults["value"].split()[0]
+        assert written == "1,0.8,0.4;0.6"
+        # Same numbers, spelled the way the serialiser spells them.
+        assert [float(value) for value in written.split(";")[0].split(",")] == [1.0, 0.80, 0.400]

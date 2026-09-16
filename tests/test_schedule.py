@@ -323,3 +323,65 @@ class TestRegionIds:
         regions = [region("r1", 1, 2), region("r2", 4, 5)]
         remaining = [item for item in regions if item.id != "r1"]
         assert sch.next_region_id(remaining) == "r3"
+
+
+class TestImportFidelity:
+    """Any list WanGP would accept must survive being read by the editor.
+
+    The decomposition changed when gaps became zero, so this is the property
+    that makes an import converter unnecessary: whatever a token says, the
+    regions derived from it say exactly the same thing back.
+    """
+
+    @pytest.mark.parametrize(
+        "values",
+        [
+            [1],                              # a scalar list
+            [0],                              # off
+            [1, 0.8, 0.4, 0],                 # WanGP's own documented example
+            [0.9, 0.8],                       # the docs' phase-1 half
+            [1.2, 1.1, 1],
+            [0.5] * 12,                       # flat, non-zero
+            [0] * 12,                         # flat, zero
+            [0, 0, 1, 1, 0, 0],               # on in the middle only
+            [1, 0, 1, 0, 1, 0],               # alternating
+            [1.4, -0.5, 1.4],                 # out of 0..1 and negative
+            [0.125, 0.0625, 0.125],           # fine decimals
+            [0.71, 0.71, 1.23],               # values the slider cannot show
+            [0, 0.0001, 0],                   # a very small non-zero
+        ],
+    )
+    def test_reconstruction_says_exactly_what_the_token_said(self, values):
+        schedule = sch.reconstruct_schedule(values)
+        assert sch.compile_schedule(schedule) == [float(value) for value in values]
+
+    def test_every_shape_of_short_list_round_trips(self):
+        """Exhaustive over every arrangement of three plausible strengths."""
+        import itertools
+
+        for length in (1, 2, 3, 4):
+            for values in itertools.product([0.0, 1.0, 0.45], repeat=length):
+                schedule = sch.reconstruct_schedule(list(values))
+                assert sch.compile_schedule(schedule) == list(values), values
+
+    def test_random_lists_round_trip(self):
+        import random
+
+        rng = random.Random(20260916)
+        for _ in range(2000):
+            values = [
+                round(rng.choice([0.0, 0.0, rng.uniform(-1.5, 2.0)]), 4)
+                for _ in range(rng.randint(1, 24))
+            ]
+            schedule = sch.reconstruct_schedule(values)
+            assert sch.compile_schedule(schedule) == values, values
+
+    def test_a_region_set_derived_from_a_token_is_always_valid(self):
+        """Nothing imported can arrive overlapping or out of bounds."""
+        import random
+
+        rng = random.Random(1)
+        for _ in range(500):
+            values = [rng.choice([0.0, 0.5, 1.0]) for _ in range(rng.randint(1, 20))]
+            schedule = sch.reconstruct_schedule(values)
+            sch.validate_regions(schedule.regions, schedule.slots)
