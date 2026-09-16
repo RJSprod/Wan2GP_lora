@@ -175,6 +175,12 @@ it is worth its plain strength, and opening the scheduler writes nothing.
   slots, and on drop the dragged region wins: a partial overlap shrinks its
   neighbour, dropping inside one splits it, covering one deletes it. The slots a
   region leaves behind go back to zero.
+- **The whole run is always in view.** The timeline takes the width it is given
+  and the slots divide it, however many there are — it never scrolls sideways.
+- **Full screen** opens the same editor as a dialog the width of the window,
+  with more height per region. It is live, not a preview: everything drawn or
+  dragged there goes straight to WanGP, and the row behind it stays in step.
+  Close it with the button, the backdrop, or Escape.
 - **Close** leaves the scheduler and keeps the schedule; the row then shows what
   it is doing (`∿ 0.95 at steps 4–10, 0.2 at steps 13–19`) and tapping that goes
   back in. **Clear phase** is the one that removes it, returning that phase — and

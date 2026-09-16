@@ -524,6 +524,64 @@ class TestPanelInTheBrowser:
         settle(page, 700)
         assert row.locator(".lb-region").count() == regions
 
+    def test_the_inline_timeline_never_scrolls(self, panel):
+        """Every step is in view at whatever width the panel is given."""
+        page, _, _ = panel
+        row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
+        open_timeline(page, row)
+
+        for width in (1100, 700, 400):
+            page.set_viewport_size({"width": width, "height": 1000})
+            settle(page, 400)
+            sizes = page.evaluate("""() => {
+              const w = document.querySelector('.lb-timeline-wrap');
+              const t = w.querySelector('.lb-timeline');
+              return {scroll: w.scrollWidth, client: w.clientWidth,
+                      timeline: t.getBoundingClientRect().width};
+            }""")
+            assert sizes["scroll"] <= sizes["client"], (width, sizes)
+            assert sizes["timeline"] <= sizes["client"] + 1, (width, sizes)
+        page.set_viewport_size({"width": 1100, "height": 1000})
+        settle(page, 400)
+
+    def test_full_screen_is_the_same_editor_with_room(self, panel):
+        page, _, _ = panel
+        row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
+        open_timeline(page, row)
+        before = native(page)
+        inline = row.locator(".lb-timeline").bounding_box()
+
+        try:
+            row.locator(".lb-sched-head button:has-text('Full screen')").click()
+            settle(page, 700)
+            modal = page.locator(".lb-sched-modal")
+            assert modal.count() == 1
+            assert native(page) == before        # opening it is a view change
+
+            # Full width like the row, and taller: the room is vertical, which
+            # is what makes a region easy to aim at.
+            box = modal.locator(".lb-timeline").bounding_box()
+            assert box["width"] >= inline["width"] - 8
+            assert box["height"] > inline["height"]
+
+            # It is live: an edit here reaches WanGP like any other.
+            modal.locator(".lb-region").first.click()
+            settle(page, 400)
+            strength = modal.locator(".lb-region-editor input[type=number]")
+            strength.fill("0.44")
+            strength.press("Enter")
+            settle(page, 1500)
+            assert "0.44" in native(page).split()[1]
+        finally:
+            # A left-open overlay would swallow every later test's clicks.
+            page.keyboard.press("Escape")
+            settle(page, 400)
+
+        assert page.locator(".lb-sched-modal").count() == 0
+        # The row it came from is untouched, and still shows the edit.
+        assert row.locator(".lb-timeline").count() == 1
+        assert "0.44" in native(page).split()[1]
+
     def test_clear_phase_returns_it_to_a_plain_strength(self, panel):
         page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_02.safetensors"]')

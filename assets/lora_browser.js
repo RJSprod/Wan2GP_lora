@@ -81,6 +81,8 @@
     selectedRegionByKey: {},
     //: Transient pointer state for a region drag; never anything canonical.
     drag: null,
+    //: The full-screen schedule editor, when one is open.
+    scheduleModal: null,
     ready: false,
     mounted: false,
     forceNative: false,
@@ -1610,11 +1612,12 @@
 
   /* ------------------------------------------------------- timeline */
 
-  function buildSchedule(row, phase, schedule) {
+  function buildSchedule(row, phase, schedule, options) {
+    options = options || {};
     var box = document.createElement("div");
     box.className = "lb-schedule";
     if (!schedule) {
-      box.appendChild(scheduleHead(row, phase, null));
+      box.appendChild(scheduleHead(row, phase, null, options));
       var pending = document.createElement("div");
       pending.className = "lb-empty";
       pending.textContent = "Opening schedule...";
@@ -1622,7 +1625,7 @@
       return { node: box, paint: null };
     }
 
-    box.appendChild(scheduleHead(row, phase, schedule));
+    box.appendChild(scheduleHead(row, phase, schedule, options));
 
     if (!schedule.editable) {
       var locked = document.createElement("div");
@@ -1666,7 +1669,8 @@
     };
   }
 
-  function scheduleHead(row, phase, schedule) {
+  function scheduleHead(row, phase, schedule, options) {
+    options = options || {};
     var head = document.createElement("div");
     head.className = "lb-sched-head";
 
@@ -1712,17 +1716,33 @@
         }
         delete S.selectedRegionByKey[regionKey(row, phase)];
         S.scheduleOpenById[row.id] = false;
+        if (options.modal) { closeScheduleModal(); }
         send({ type: "schedule_clear_phase", id: row.id, phase: phase });
       });
       actions.appendChild(clear);
+    }
+
+    if (!options.modal) {
+      // A long run leaves little room per slot inline; this is where the
+      // timeline gets the width to work in.
+      var expand = document.createElement("button");
+      expand.type = "button";
+      expand.className = "lb-btn";
+      expand.textContent = "\u2922 Full screen";
+      expand.title = "Edit this schedule in a full-screen view";
+      expand.addEventListener("click", function () { openScheduleModal(row.id, phase); });
+      actions.appendChild(expand);
     }
 
     var close = document.createElement("button");
     close.type = "button";
     close.className = "lb-btn";
     close.textContent = "Close";
-    close.title = "Collapse the timeline - the schedule is kept";
+    close.title = options.modal
+      ? "Close the full-screen editor"
+      : "Collapse the timeline - the schedule is kept";
     close.addEventListener("click", function () {
+      if (options.modal) { closeScheduleModal(); return; }
       S.scheduleOpenById[row.id] = false;
       renderRows(true);
     });
@@ -1838,6 +1858,73 @@
     });
     timeline.title = "Drag across empty space to draw a region";
     return timeline;
+  }
+
+  /* ----------------------------------------------- full-screen schedule */
+
+  /* The same editor the row holds, given the whole window. Everything inside is
+     the inline code path, so dragging, drawing and committing behave
+     identically -- only the width differs. */
+  function openScheduleModal(id, phase) {
+    closeScheduleModal();
+    var row = rowById(id);
+    if (!row) { return; }
+
+    var overlay = document.createElement("div");
+    overlay.className = "lb-modal-overlay " + NS;
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.innerHTML =
+      '<div class="lb-modal lb-sched-modal">' +
+        '<div class="lb-modal-head">' +
+          '<div class="lb-modal-title" data-lb="title"></div>' +
+          '<button type="button" class="lb-btn lb-icon" data-lb="close" aria-label="Close">\u00D7</button>' +
+        '</div>' +
+        '<div class="lb-sched-modal-body" data-lb="body"></div>' +
+      '</div>';
+    document.body.appendChild(overlay);
+
+    S.scheduleModal = { id: id, phase: phase, node: overlay };
+    overlay.querySelector('[data-lb="close"]').addEventListener("click", closeScheduleModal);
+    overlay.addEventListener("click", function (event) {
+      if (event.target === overlay) { closeScheduleModal(); }
+    });
+    document.addEventListener("keydown", onScheduleModalKey);
+    paintScheduleModal();
+  }
+
+  function onScheduleModalKey(event) {
+    if (event.key === "Escape") { closeScheduleModal(); }
+  }
+
+  function closeScheduleModal() {
+    if (!S.scheduleModal) { return; }
+    document.removeEventListener("keydown", onScheduleModalKey);
+    S.scheduleModal.node.remove();
+    S.scheduleModal = null;
+  }
+
+  function rowById(id) {
+    var found = null;
+    S.rows.forEach(function (row) { if (row.id === id) { found = row; } });
+    return found;
+  }
+
+  /* Rebuilt from each payload, the way the rows are -- never while a pointer is
+     mid-gesture inside it. */
+  function paintScheduleModal() {
+    var modal = S.scheduleModal;
+    if (!modal || S.drag || S.dragging) { return; }
+
+    var row = rowById(modal.id);
+    var schedule = row ? scheduleOf(row, modal.phase) : null;
+    if (!row || !schedule) { closeScheduleModal(); return; }
+
+    modal.node.querySelector('[data-lb="title"]').textContent =
+      "Step schedule \u2014 " + rowName(row);
+    var body = modal.node.querySelector('[data-lb="body"]');
+    body.innerHTML = "";
+    body.appendChild(buildSchedule(row, modal.phase, schedule, { modal: true }).node);
   }
 
   /* ---------------------------------------------------- drawing a region */
@@ -2671,7 +2758,7 @@
     S.schedulingEnabled = payload.scheduling_enabled !== false;
     S.schedulingDisabledReason = payload.scheduling_disabled_reason || "";
     // Leaving One Phase closes every timeline: there is nothing left to show.
-    if (!S.schedulingEnabled) { S.scheduleOpenById = {}; }
+    if (!S.schedulingEnabled) { S.scheduleOpenById = {}; closeScheduleModal(); }
     S.defaultProfile = payload.default_profile || "";
     S.civitaiKeySet = !!payload.civitai_key_set;
     if (payload.sort_mode) { S.sortMode = payload.sort_mode; }
@@ -2688,6 +2775,7 @@
       S.selectedRegionByKey = {};
       S.playingTile = null;
       closeInspect();
+      closeScheduleModal();
     }
 
     S.byId = {};
@@ -2718,6 +2806,7 @@
     // Not forced: the row key knows when structure changed, and rebuilding on a
     // value-only payload would take focus out of a field being typed into.
     renderRows();
+    paintScheduleModal();
     setStatus(payload.status || "Synced to WanGP state", !!payload.status_warn);
     maybeApplyDefaultProfile();
 
