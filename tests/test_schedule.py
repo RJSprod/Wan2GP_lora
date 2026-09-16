@@ -19,71 +19,93 @@ def bounds(regions):
 
 
 class TestCompile:
-    def test_base_only_fills_every_slot(self):
+    def test_an_empty_timeline_is_worth_its_base(self):
+        """Nothing drawn is not a schedule of zeros -- it is not a schedule."""
         schedule = sch.PhaseSchedule(base=0.8, slots=5, regions=[])
         assert sch.compile_schedule(schedule) == [0.8] * 5
 
-    def test_one_region_overrides_its_slots_inclusively(self):
+    def test_slots_no_region_covers_are_zero(self):
         schedule = sch.PhaseSchedule(base=1.0, slots=6, regions=[region("r1", 2, 4, 0.3)])
-        assert sch.compile_schedule(schedule) == [1.0, 0.3, 0.3, 0.3, 1.0, 1.0]
+        assert sch.compile_schedule(schedule) == [0, 0.3, 0.3, 0.3, 0, 0]
+
+    def test_the_gap_between_two_regions_is_zero(self):
+        # Boxes over 1-2 and 4-6: slot 3 is off until something covers it.
+        schedule = sch.PhaseSchedule(
+            base=0.9, slots=6,
+            regions=[region("r1", 1, 2, 0.9), region("r2", 4, 6, 0.5)],
+        )
+        assert sch.compile_schedule(schedule) == [0.9, 0.9, 0, 0.5, 0.5, 0.5]
 
     def test_multiple_regions(self):
         schedule = sch.PhaseSchedule(
             base=1.0, slots=8,
             regions=[region("r1", 1, 2, 0.5), region("r2", 5, 6, 0.25)],
         )
-        assert sch.compile_schedule(schedule) == [0.5, 0.5, 1.0, 1.0, 0.25, 0.25, 1.0, 1.0]
+        assert sch.compile_schedule(schedule) == [0.5, 0.5, 0, 0, 0.25, 0.25, 0, 0]
 
     def test_exact_strengths_are_not_rounded(self):
         schedule = sch.PhaseSchedule(base=1.23, slots=3, regions=[region("r1", 2, 2, 0.0625)])
-        assert sch.compile_schedule(schedule) == [1.23, 0.0625, 1.23]
+        assert sch.compile_schedule(schedule) == [0, 0.0625, 0]
 
-    def test_a_flat_schedule_is_emitted_as_one_scalar(self):
-        """Opening a timeline, or adding a region at base strength, writes nothing."""
+    def test_an_empty_timeline_writes_nothing(self):
+        """Opening the scheduler must not change what WanGP renders."""
         empty = sch.PhaseSchedule(base=0.71, slots=20, regions=[])
         assert sch.native_values(empty) == [0.71]
         assert sch.is_materialized(empty) is False
 
-        at_base = sch.PhaseSchedule(base=0.71, slots=20, regions=[region("r1", 1, 4, 0.71)])
-        assert sch.native_values(at_base) == [0.71]
-        assert sch.is_materialized(at_base) is False
+    def test_one_region_is_already_a_schedule(self):
+        """Even at the strength the phase already had: the rest is now zero."""
+        drawn = sch.PhaseSchedule(base=0.71, slots=4, regions=[region("r1", 1, 2, 0.71)])
+        assert sch.native_values(drawn) == [0.71, 0.71, 0, 0]
+        assert sch.is_materialized(drawn) is True
 
-    def test_a_real_schedule_is_emitted_in_full(self):
-        schedule = sch.PhaseSchedule(base=1.0, slots=4, regions=[region("r1", 2, 3, 0.5)])
-        assert sch.native_values(schedule) == [1.0, 0.5, 0.5, 1.0]
+    def test_a_region_covering_everything_is_still_a_schedule(self):
+        schedule = sch.PhaseSchedule(base=1.0, slots=3, regions=[region("r1", 1, 3, 0.4)])
+        assert sch.native_values(schedule) == [0.4, 0.4, 0.4]
         assert sch.is_materialized(schedule) is True
 
 
 class TestReconstruct:
-    def test_flat_list_has_no_regions(self):
+    def test_every_non_zero_run_becomes_a_region(self):
         schedule = sch.reconstruct_schedule([0.6, 0.6, 0.6])
-        assert schedule.base == 0.6
-        assert schedule.regions == []
+        assert bounds(schedule.regions) == [("r1", 1, 3)]
         assert schedule.slots == 3
 
-    def test_one_run_becomes_one_region(self):
-        schedule = sch.reconstruct_schedule([1, 1, 0.4, 0.4, 1])
-        assert schedule.base == 1
+    def test_zeros_stay_gaps(self):
+        schedule = sch.reconstruct_schedule([0, 0, 0.4, 0.4, 0])
         assert bounds(schedule.regions) == [("r1", 3, 4)]
         assert schedule.regions[0].strength == 0.4
 
     def test_several_runs(self):
-        schedule = sch.reconstruct_schedule([1, 0.8, 0.8, 1, 0.2])
-        assert bounds(schedule.regions) == [("r1", 2, 3), ("r2", 5, 5)]
+        schedule = sch.reconstruct_schedule([1, 0.8, 0.8, 0, 0.2])
+        assert bounds(schedule.regions) == [("r1", 1, 1), ("r2", 2, 3), ("r3", 5, 5)]
 
-    def test_base_reappearing_between_runs_is_not_a_region(self):
+    def test_a_run_of_a_different_strength_is_its_own_region(self):
         schedule = sch.reconstruct_schedule([0.5, 0.9, 0.5, 0.9])
-        assert bounds(schedule.regions) == [("r1", 2, 2), ("r2", 4, 4)]
+        assert bounds(schedule.regions) == [("r1", 1, 1), ("r2", 2, 2), ("r3", 3, 3), ("r4", 4, 4)]
+
+    def test_the_base_is_the_first_real_strength(self):
+        """It seeds new regions and survives Clear phase; it never fills a gap."""
+        schedule = sch.reconstruct_schedule([0, 0, 0.45, 0.45])
+        assert schedule.base == 0.45
+        assert sch.compile_schedule(schedule) == [0, 0, 0.45, 0.45]
+
+    def test_an_all_zero_list_is_an_empty_timeline(self):
+        schedule = sch.reconstruct_schedule([0, 0, 0])
+        assert schedule.regions == []
+        assert schedule.base == 0
+        assert sch.compile_schedule(schedule) == [0, 0, 0]
 
     def test_values_over_one_and_negative(self):
         schedule = sch.reconstruct_schedule([1.4, 1.4, -0.3])
         assert schedule.base == 1.4
-        assert bounds(schedule.regions) == [("r1", 3, 3)]
-        assert schedule.regions[0].strength == -0.3
+        assert bounds(schedule.regions) == [("r1", 1, 2), ("r2", 3, 3)]
+        assert schedule.regions[1].strength == -0.3
 
     @pytest.mark.parametrize(
         "values",
-        [[1, 0.8, 0.4, 0], [0.7, 0.7, 0.2, 0.7], [1.23, 0.0625, 1.23], [0.5]],
+        [[1, 0.8, 0.4, 0], [0.7, 0.7, 0.2, 0.7], [1.23, 0.0625, 1.23], [0.5],
+         [0, 0, 0], [0, 1, 0, 1], [0.5, 0, 0, 0.5]],
     )
     def test_reconstruction_is_exactly_reversible(self, values):
         assert sch.compile_schedule(sch.reconstruct_schedule(values)) == values
@@ -270,7 +292,8 @@ class TestNormalisation:
         schedule = sch.PhaseSchedule(base=1.0, slots=4, regions=[region("r1", 3, 4, 0.2)])
         rebuilt = sch.normalize_schedule(schedule, 8)
         assert rebuilt.slots == 8
-        assert sch.compile_schedule(rebuilt) == [1, 1, 1, 1, 0.2, 0.2, 0.2, 0.2]
+        # Gaps re-grid as gaps, not as a base that was never there.
+        assert sch.compile_schedule(rebuilt) == [0, 0, 0, 0, 0.2, 0.2, 0.2, 0.2]
         assert rebuilt.dirty is True
 
     def test_normalising_makes_an_over_long_schedule_editable(self):
@@ -292,6 +315,68 @@ class TestNormalisation:
         assert sch.clamp_slots("nonsense") == sch.DEFAULT_SLOTS
 
 
+class TestRefit:
+    """Slot i is step i, so a step-count change is a tail operation."""
+
+    def test_growing_leaves_the_steps_that_existed_alone(self):
+        schedule = sch.reconstruct_schedule([1, 0.8, 0.4, 0.2])
+        assert sch.compile_schedule(sch.refit_schedule(schedule, 5)) == [1, 0.8, 0.4, 0.2, 0]
+
+    def test_a_new_step_arrives_undefined(self):
+        schedule = sch.reconstruct_schedule([0.5, 0.5])
+        grown = sch.refit_schedule(schedule, 4)
+        assert sch.compile_schedule(grown) == [0.5, 0.5, 0, 0]
+        assert [(r.start, r.end) for r in grown.regions] == [(1, 2)]
+
+    def test_shrinking_drops_the_steps_that_are_gone(self):
+        schedule = sch.reconstruct_schedule([1, 0.8, 0.4, 0.2])
+        assert sch.compile_schedule(sch.refit_schedule(schedule, 3)) == [1, 0.8, 0.4]
+
+    def test_a_region_straddling_the_new_end_is_clipped(self):
+        schedule = sch.PhaseSchedule(base=0.5, slots=6, regions=[region("r1", 2, 5, 0.5)])
+        refitted = sch.refit_schedule(schedule, 3)
+        assert [(r.id, r.start, r.end) for r in refitted.regions] == [("r1", 2, 3)]
+
+    def test_a_region_entirely_beyond_the_new_end_is_gone(self):
+        schedule = sch.PhaseSchedule(
+            base=0.5, slots=8,
+            regions=[region("r1", 1, 2, 0.5), region("r2", 6, 8, 0.9)],
+        )
+        refitted = sch.refit_schedule(schedule, 4)
+        assert [(r.id, r.start, r.end) for r in refitted.regions] == [("r1", 1, 2)]
+        assert sch.compile_schedule(refitted) == [0.5, 0.5, 0, 0]
+
+    def test_shrinking_past_everything_empties_the_timeline(self):
+        schedule = sch.PhaseSchedule(base=0.5, slots=8, regions=[region("r1", 5, 8, 0.9)])
+        refitted = sch.refit_schedule(schedule, 3)
+        assert refitted.regions == []
+        assert refitted.selected_region_id is None
+
+    def test_the_selected_region_survives_when_it_does(self):
+        schedule = sch.PhaseSchedule(
+            base=0.5, slots=8, selected_region_id="r2",
+            regions=[region("r1", 1, 2, 0.5), region("r2", 4, 5, 0.9)],
+        )
+        assert sch.refit_schedule(schedule, 6).selected_region_id == "r2"
+        # And falls back to what is left when it does not.
+        assert sch.refit_schedule(schedule, 3).selected_region_id == "r1"
+
+    def test_refitting_is_not_resampling(self):
+        """The distinction the two operations exist for."""
+        schedule = sch.reconstruct_schedule([1, 0])
+        assert sch.compile_schedule(sch.refit_schedule(schedule, 4)) == [1, 0, 0, 0]
+        assert sch.compile_schedule(sch.normalize_schedule(schedule, 4)) == [1, 1, 0, 0]
+
+    def test_a_refit_to_the_same_length_changes_nothing(self):
+        schedule = sch.reconstruct_schedule([1, 0.8, 0, 0.2])
+        assert sch.compile_schedule(sch.refit_schedule(schedule, 4)) == [1, 0.8, 0, 0.2]
+
+    def test_refitting_is_bounded(self):
+        schedule = sch.reconstruct_schedule([0.5, 0.5])
+        assert sch.refit_schedule(schedule, 10_000).slots == sch.MAX_SLOTS
+        assert sch.refit_schedule(schedule, 0).slots == sch.MIN_SLOTS
+
+
 class TestRegionIds:
     def test_ids_do_not_reuse_a_live_number(self):
         assert sch.next_region_id([region("r1", 1, 2), region("r3", 4, 5)]) == "r4"
@@ -300,3 +385,65 @@ class TestRegionIds:
         regions = [region("r1", 1, 2), region("r2", 4, 5)]
         remaining = [item for item in regions if item.id != "r1"]
         assert sch.next_region_id(remaining) == "r3"
+
+
+class TestImportFidelity:
+    """Any list WanGP would accept must survive being read by the editor.
+
+    The decomposition changed when gaps became zero, so this is the property
+    that makes an import converter unnecessary: whatever a token says, the
+    regions derived from it say exactly the same thing back.
+    """
+
+    @pytest.mark.parametrize(
+        "values",
+        [
+            [1],                              # a scalar list
+            [0],                              # off
+            [1, 0.8, 0.4, 0],                 # WanGP's own documented example
+            [0.9, 0.8],                       # the docs' phase-1 half
+            [1.2, 1.1, 1],
+            [0.5] * 12,                       # flat, non-zero
+            [0] * 12,                         # flat, zero
+            [0, 0, 1, 1, 0, 0],               # on in the middle only
+            [1, 0, 1, 0, 1, 0],               # alternating
+            [1.4, -0.5, 1.4],                 # out of 0..1 and negative
+            [0.125, 0.0625, 0.125],           # fine decimals
+            [0.71, 0.71, 1.23],               # values the slider cannot show
+            [0, 0.0001, 0],                   # a very small non-zero
+        ],
+    )
+    def test_reconstruction_says_exactly_what_the_token_said(self, values):
+        schedule = sch.reconstruct_schedule(values)
+        assert sch.compile_schedule(schedule) == [float(value) for value in values]
+
+    def test_every_shape_of_short_list_round_trips(self):
+        """Exhaustive over every arrangement of three plausible strengths."""
+        import itertools
+
+        for length in (1, 2, 3, 4):
+            for values in itertools.product([0.0, 1.0, 0.45], repeat=length):
+                schedule = sch.reconstruct_schedule(list(values))
+                assert sch.compile_schedule(schedule) == list(values), values
+
+    def test_random_lists_round_trip(self):
+        import random
+
+        rng = random.Random(20260916)
+        for _ in range(2000):
+            values = [
+                round(rng.choice([0.0, 0.0, rng.uniform(-1.5, 2.0)]), 4)
+                for _ in range(rng.randint(1, 24))
+            ]
+            schedule = sch.reconstruct_schedule(values)
+            assert sch.compile_schedule(schedule) == values, values
+
+    def test_a_region_set_derived_from_a_token_is_always_valid(self):
+        """Nothing imported can arrive overlapping or out of bounds."""
+        import random
+
+        rng = random.Random(1)
+        for _ in range(500):
+            values = [rng.choice([0.0, 0.5, 1.0]) for _ in range(rng.randint(1, 20))]
+            schedule = sch.reconstruct_schedule(values)
+            sch.validate_regions(schedule.regions, schedule.slots)

@@ -3,8 +3,18 @@
 WanGP expresses a time-varying multiplier as a comma separated list of values
 inside one phase, e.g. ``1,0.8,0.4,0``.  That list is the native truth and
 ``multiplier_codec`` owns its grammar.  This module owns the *editor* view of
-one such list: a base strength plus a set of non-overlapping regions that
-override it.
+one such list: a set of non-overlapping regions, each holding a strength, over a
+timeline whose uncovered slots are **zero**.
+
+That last rule is the whole model.  A slot no region covers is a step the LoRA
+is not applied on; it does not fall back to some resting strength hiding behind
+the timeline.  Drawing regions is therefore the only way a scheduled phase says
+anything, which is why a scheduled phase has no plain strength control at all.
+
+``base`` is not a fill.  It is the value the phase is worth while nothing has
+been drawn yet -- so opening a timeline changes nothing -- and the strength a
+newly drawn region starts at.  The moment one region exists, every other slot
+is zero.
 
 Everything here is pure.  The timeline is where a mis-drag would silently
 change what WanGP renders, so collision resolution and placement live in
@@ -41,6 +51,9 @@ DEFAULT_SLOTS = 20
 #: "+ Region" aims for roughly a fifth of the timeline (spec: 20-25%).
 REGION_WIDTH_FRACTION = 0.22
 
+#: What a slot no region covers is worth. Not configurable: it is the model.
+GAP_STRENGTH = 0.0
+
 _ID_PREFIX = "r"
 
 
@@ -71,6 +84,9 @@ class PhaseSchedule:
     knows the exact list WanGP was given and emits it byte-for-byte.
     """
 
+    #: The strength this phase is worth while no region has been drawn, and the
+    #: strength a new region starts at. Never painted into the gaps between
+    #: regions -- those are ``GAP_STRENGTH``.
     base: float = 1.0
     slots: int = DEFAULT_SLOTS
     regions: list[Region] = field(default_factory=list)
@@ -155,12 +171,19 @@ def overlaps(left: Region, right: Region) -> bool:
 def compile_schedule(schedule: PhaseSchedule) -> list[float]:
     """The value list this schedule means, one entry per slot.
 
+    Slots no region covers are zero.  A timeline with nothing drawn on it is the
+    exception: it is not a schedule of zeros, it is a phase that has not been
+    scheduled, so it is worth its base everywhere.
+
     Regions are applied in slot order, so a caller that hands in overlapping
     regions still gets a deterministic result -- but committed region sets are
     validated to be disjoint, so that case only arises mid-gesture.
     """
     slots = held_slots(schedule.slots)
-    values = [float(schedule.base)] * slots
+    if not schedule.regions:
+        return [float(schedule.base)] * slots
+
+    values = [GAP_STRENGTH] * slots
     for region in sort_regions(schedule.regions):
         start = max(1, int(region.start))
         end = min(slots, int(region.end))
@@ -172,22 +195,19 @@ def compile_schedule(schedule: PhaseSchedule) -> list[float]:
 def native_values(schedule: PhaseSchedule) -> list[float]:
     """What to write into the native token for this phase.
 
-    A schedule that works out to one value everywhere is emitted as that single
-    scalar rather than as N copies of it.  The two are identical to WanGP, and it
-    is what lets opening the panel -- or adding a region and not yet changing its
-    strength -- leave the native token alone.
+    A timeline with nothing on it is emitted as the single scalar it is worth,
+    which is what lets opening the scheduler leave the native token alone.  Once
+    anything is drawn, the full list goes out: the zeros between regions are
+    part of what the user drew.
     """
     if not schedule.regions:
         return [float(schedule.base)]
-    values = compile_schedule(schedule)
-    if all(_same(value, values[0]) for value in values):
-        return [values[0]]
-    return values
+    return compile_schedule(schedule)
 
 
 def is_materialized(schedule: PhaseSchedule) -> bool:
-    """True when this schedule needs comma syntax to be expressed."""
-    return len(native_values(schedule)) > 1
+    """True when something has actually been scheduled."""
+    return bool(schedule.regions)
 
 
 # -------------------------------------------------------------- reconstruct
@@ -199,21 +219,20 @@ def reconstruct_schedule(
     raw: str | None = None,
     slots: int | None = None,
 ) -> PhaseSchedule:
-    """Turn an imported value list back into base + regions.
+    """Turn an imported value list back into regions over zero.
 
-    The base is the first value and every contiguous run that differs from it
-    becomes one region, which makes the decomposition deterministic and exactly
-    reversible: ``compile_schedule(reconstruct_schedule(v)) == v``.
+    Every contiguous run of non-zero values becomes one region and the zeros
+    between them stay gaps, which makes the decomposition deterministic and
+    exactly reversible: ``compile_schedule(reconstruct_schedule(v)) == v``.
     """
     numbers = [float(value) for value in values] or [1.0]
     total = len(numbers) if slots is None else clamp_slots(slots)
-    base = numbers[0]
 
     regions: list[Region] = []
     index = 0
     while index < len(numbers):
         value = numbers[index]
-        if _same(value, base):
+        if _same(value, GAP_STRENGTH):
             index += 1
             continue
         run_end = index
@@ -223,6 +242,12 @@ def reconstruct_schedule(
             Region(id=f"{_ID_PREFIX}{len(regions) + 1}", start=index + 1, end=run_end + 1, strength=value)
         )
         index = run_end + 1
+
+    # The base only seeds new regions and survives "Clear phase"; the first real
+    # strength in the list is the best guess at what the phase is worth. An
+    # all-zero list is the one case where the timeline is genuinely empty, and
+    # zero is then what it is worth.
+    base = next((value for value in numbers if not _same(value, GAP_STRENGTH)), GAP_STRENGTH)
 
     schedule = PhaseSchedule(
         base=base,
@@ -469,6 +494,39 @@ def normalize_values(values: list[float], target_slots: int) -> list[float]:
         source = int(index * len(numbers) / target)
         result.append(numbers[min(source, len(numbers) - 1)])
     return result
+
+
+def refit_schedule(schedule: PhaseSchedule, target_slots: int) -> PhaseSchedule:
+    """Change the slot count without moving anything that stays.
+
+    This is what a change to the inference step count means: slot *i* is step
+    *i*, so growing adds undefined slots at the end and shrinking drops the ones
+    that no longer exist.  A region straddling the new end is clipped to it, and
+    one entirely beyond it is gone.
+
+    Deliberately not ``normalize_schedule``: resampling would slide every region
+    along the timeline to keep its *proportion* of the run, which is right for a
+    schedule spread across the whole run and wrong for one drawn step by step.
+    """
+    target = clamp_slots(target_slots)
+    kept: list[Region] = []
+    for region in sort_regions(schedule.regions):
+        if int(region.start) > target:
+            continue
+        kept.append(replace(region, end=min(int(region.end), target)))
+
+    rebuilt = replace(
+        schedule,
+        slots=target,
+        regions=kept,
+        selected_region_id=(
+            schedule.selected_region_id
+            if any(region.id == schedule.selected_region_id for region in kept)
+            else (kept[0].id if kept else None)
+        ),
+    )
+    rebuilt.dirty = True
+    return rebuilt
 
 
 def normalize_schedule(schedule: PhaseSchedule, target_slots: int) -> PhaseSchedule:

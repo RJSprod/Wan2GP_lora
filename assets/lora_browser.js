@@ -1039,16 +1039,25 @@
 
   /* ------------------------------------------------------ active rows */
 
-  /* One active row is:
+  /* An active row is one of two modes, never both:
    *
-   *   [i] LoRA name                        [Schedule v]  [x]
-   *   [Phase 1 0.71] [Phase 2 1.23] [Independent]
-   *   [-]  ----------- slider -----------  [0.71]  [+]
-   *   (optionally, an inline step-schedule timeline underneath)
+   *   plain      [i] LoRA name                      [Schedule v]  [x]
+   *              [Phase 1 0.71] [Phase 2 1.23] [Independent]
+   *              [-]  --------- slider ---------  [0.71]  [+]
    *
-   * Selected phase and expansion are view state held here; regions and bases
-   * are canonical state that Python validates.  Collapsing a schedule is a
-   * view change only -- it never deletes one. */
+   *   scheduled  [i] LoRA name                      [Schedule ^]  [x]
+   *              [Phase 1 ~2] [Phase 2 1.23]
+   *              timeline, then [-] --- slider --- [0.9] [+] for the region
+   *
+   * The plain strength control is removed in scheduled mode rather than
+   * disabled, because it is not what WanGP applies: a scheduled phase is its
+   * regions, and every slot they do not cover is zero. Leaving a scrubber on
+   * screen that changes nothing would be a lie about what is running.
+   *
+   * Selected phase and expansion are view state held here; regions are
+   * canonical state that Python validates. Collapsing is a view change only --
+   * it never deletes a schedule, and it never brings the plain control back for
+   * a phase that has one. */
 
   function phaseOf(row) {
     var count = Math.max(1, (row.phase_values || []).length);
@@ -1157,28 +1166,33 @@
 
     var painters = [];
     if ((row.phase_values || []).length > 1) {
-      var strip = buildPhaseStrip(row, phase);
+      var strip = buildPhaseStrip(row, phase, open);
       node.appendChild(strip.node);
       painters.push(strip.paint);
     }
 
-    var weight = buildWeightLine({
-      value: currentValue(row, phase, schedule),
-      label: (row.name + " " + (S.phaseLabels[phase] || "strength")).trim(),
-      commit: function (value) { commitBase(row, phase, value); },
-      settle: flushSync
-    });
-    weight.node.classList.add("lb-weight-main");
-    node.appendChild(weight.node);
-    painters.push(function (next) {
-      var nextPhase = phaseOf(next);
-      weight.paint(currentValue(next, nextPhase, scheduleOf(next, nextPhase)));
-    });
-
     if (open) {
+      // Scheduler mode: the timeline and its own strength control, nothing else.
       var built = buildSchedule(row, phase, schedule);
       node.appendChild(built.node);
       if (built.paint) { painters.push(built.paint); }
+    } else if (schedule && schedule.active) {
+      // Collapsed, but this phase is still scheduled: say so instead of
+      // offering a strength that is not the one being applied.
+      node.appendChild(buildScheduleSummary(row, schedule));
+    } else {
+      var weight = buildWeightLine({
+        value: currentValue(row, phase, schedule),
+        label: (row.name + " " + (S.phaseLabels[phase] || "strength")).trim(),
+        commit: function (value) { commitBase(row, phase, value); },
+        settle: flushSync
+      });
+      weight.node.classList.add("lb-weight-main");
+      node.appendChild(weight.node);
+      painters.push(function (next) {
+        var nextPhase = phaseOf(next);
+        weight.paint(currentValue(next, nextPhase, scheduleOf(next, nextPhase)));
+      });
     }
 
     node.__lbPaint = function (next) {
@@ -1236,9 +1250,10 @@
       toggle.className = "lb-btn lb-schedule-toggle" + (open ? " lb-on" : "");
       toggle.textContent = "Schedule " + (open ? "▴" : "▾");
       toggle.title = open
-        ? "Hide the step schedule (it is kept)"
-        : "Show the step schedule for the selected phase";
+        ? "Leave the scheduler - the schedule is kept"
+        : "Schedule this phase over the run instead of one strength";
       toggle.setAttribute("aria-expanded", open ? "true" : "false");
+      toggle.setAttribute("aria-pressed", open ? "true" : "false");
       toggle.addEventListener("click", function () {
         var next = !S.scheduleOpenById[row.id];
         S.scheduleOpenById[row.id] = next;
@@ -1299,7 +1314,21 @@
 
   /* Phase chips: every effective phase, its current value, and which one the
      strength control and timeline are editing. */
-  function buildPhaseStrip(row, phase) {
+  /* What a phase chip says it is worth. A scheduled phase has no single value:
+     it is its regions, so the chip shows how many rather than a number that is
+     not applied anywhere. */
+  function chipReadout(row, index) {
+    var schedule = scheduleOf(row, index);
+    if (schedule && schedule.active) {
+      var count = (schedule.regions || []).length;
+      return { text: "∿" + count, title: "Scheduled - " + count + " region" + (count === 1 ? "" : "s") };
+    }
+    var values = row.phase_values || [];
+    var value = values[index] !== undefined ? values[index] : 1;
+    return { text: fmt(schedule ? schedule.base : value), title: "" };
+  }
+
+  function buildPhaseStrip(row, phase, scheduling) {
     var strip = document.createElement("div");
     strip.className = "lb-phase-strip";
     var values = row.phase_values || [];
@@ -1312,16 +1341,10 @@
       chip.setAttribute("aria-pressed", index === phase ? "true" : "false");
       chip.appendChild(document.createTextNode((S.phaseLabels[index] || ("Phase " + (index + 1))) + " "));
       var readout = document.createElement("strong");
-      readout.textContent = fmt(scheduleOf(row, index) ? scheduleOf(row, index).base : value);
+      var shown = chipReadout(row, index);
+      readout.textContent = shown.text;
       chip.appendChild(readout);
-      if (scheduleOf(row, index) && scheduleOf(row, index).active) {
-        var mark = document.createElement("span");
-        mark.className = "lb-chip-mark";
-        mark.textContent = "∿";        // this phase carries a schedule
-        mark.title = "Scheduled";
-        chip.appendChild(mark);
-      }
-      chip.title = "Edit " + (S.phaseLabels[index] || ("phase " + (index + 1)));
+      chip.title = shown.title || ("Edit " + (S.phaseLabels[index] || ("phase " + (index + 1))));
       chip.addEventListener("click", function () {
         if (S.selectedPhaseById[row.id] === index) { return; }
         S.selectedPhaseById[row.id] = index;
@@ -1342,7 +1365,9 @@
       sharedNote.textContent = "≡ Shared schedule";
       sharedNote.title = "One comma schedule spans the whole run, so every phase uses it";
       strip.appendChild(sharedNote);
-    } else if (values.length > 1) {
+    } else if (values.length > 1 && !scheduling) {
+      // Linking acts on the plain strength control, which scheduler mode does
+      // not have, so it is not offered there.
       var linked = !!S.linked[row.id];
       var link = document.createElement("button");
       link.type = "button";
@@ -1364,11 +1389,47 @@
       paint: function (next) {
         (next.phase_values || []).forEach(function (value, index) {
           if (!chipValues[index]) { return; }
-          var schedule = scheduleOf(next, index);
-          chipValues[index].textContent = fmt(schedule ? schedule.base : value);
+          chipValues[index].textContent = chipReadout(next, index).text;
         });
       }
     };
+  }
+
+  /* What a scheduled phase shows when its timeline is collapsed: what it is
+     doing, and a way back in. Deliberately not a control -- the strength this
+     phase applies varies over the run, so there is no one number to set. */
+  function buildScheduleSummary(row, schedule) {
+    var regions = schedule.regions || [];
+    var summary = document.createElement("button");
+    summary.type = "button";
+    summary.className = "lb-sched-summary";
+
+    var badge = document.createElement("span");
+    badge.className = "lb-chip-mark";
+    badge.textContent = "∿";
+    summary.appendChild(badge);
+
+    var label = document.createElement("span");
+    label.className = "lb-sched-summary-text";
+    label.textContent = regions.length
+      ? regions.map(function (region) {
+          return fmt(region.strength) + " at " + rangeLabel(region, schedule).toLowerCase();
+        }).join(",  ")
+      : "Scheduled";
+    summary.appendChild(label);
+
+    var hint = document.createElement("span");
+    hint.className = "lb-sched-summary-hint";
+    hint.textContent = "Edit schedule";
+    summary.appendChild(hint);
+
+    summary.title = "This phase is scheduled over " + schedule.slots
+      + " slots; slots no region covers are 0. Tap to edit it.";
+    summary.addEventListener("click", function () {
+      S.scheduleOpenById[row.id] = true;
+      renderRows(true);
+    });
+    return summary;
   }
 
   /* ------------------------------------------------- strength controls */
@@ -1669,16 +1730,12 @@
   function normalizeButton(row, phase, schedule) {
     var button = document.createElement("button");
     button.type = "button";
-    // A schedule keeps the length its token spells out, so changing the step
-    // counter afterwards can leave the two disagreeing. Re-gridding rewrites the
-    // multiplier, so it is offered here rather than done silently.
-    var mismatch = S.steps && schedule.active && schedule.slots !== S.steps;
-    button.className = "lb-btn" + (mismatch ? " lb-mismatch" : "");
+    // Editable timelines follow the step counter on their own now, so this is
+    // for choosing a resolution deliberately -- a read-only list too long to
+    // drag, or a schedule you want coarser than the run.
+    button.className = "lb-btn";
     button.textContent = "Slots: " + schedule.slots + " ▾";
-    button.title = mismatch
-      ? "This schedule has " + schedule.slots + " values but the run is now "
-        + S.steps + " steps - tap to re-grid it"
-      : "Change how many schedule values this phase uses";
+    button.title = "Change how many schedule values this phase uses";
     button.addEventListener("click", function (event) {
       var rect = button.getBoundingClientRect();
       openMenu(rect.left, rect.bottom, slotMenuItems(row, phase, schedule));
@@ -1740,10 +1797,14 @@
       timeline.appendChild(tick);
     });
 
-    var baseLine = document.createElement("div");
-    baseLine.className = "lb-baseline";
-    baseLine.textContent = "base " + fmt(schedule.base);
-    timeline.appendChild(baseLine);
+    // Uncovered slots are zero, and saying so is the difference between "the
+    // rest is off" and "the rest is some strength you cannot see".
+    var gapNote = document.createElement("div");
+    gapNote.className = "lb-baseline";
+    gapNote.textContent = (schedule.regions || []).length
+      ? "empty slots = " + fmt(schedule.gap_strength || 0)
+      : "nothing scheduled yet — this phase is " + fmt(schedule.base);
+    timeline.appendChild(gapNote);
 
     (schedule.regions || []).forEach(function (region) {
       timeline.appendChild(buildRegion(row, phase, schedule, region, selected));
@@ -2620,6 +2681,14 @@
     // while edits are still outstanding they keep winning, so a value the user
     // has just set does not flicker back to the one before it.
     if (settleSync()) { S.localValues = {}; }
+
+    // The step counter moved: bring every timeline to the new length before
+    // anything is drawn from it. Python decides what that means per schedule
+    // and answers with a payload where nothing is out of sync any more, so this
+    // settles after one round rather than looping.
+    if (payload.schedules_out_of_sync && !S.inFlight && !S.drag && !S.dragging) {
+      send({ type: "schedule_resync" });
+    }
 
     renderHeader();
     renderGrid();

@@ -324,6 +324,39 @@
 .__NS__ .lb-chip strong { font-variant-numeric: tabular-nums; }
 .__NS__ .lb-chip-mark { color: var(--color-accent, currentColor); }
 
+/* A scheduled phase, collapsed: a readout and a way in, never a scrubber. */
+.__NS__ .lb-sched-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: calc(100% - 14px);
+  margin: 0 7px 7px;
+  min-height: 40px;
+  padding: 4px 10px;
+  border: 1px dashed var(--border-color-primary);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--background-fill-primary);
+  color: var(--body-text-color);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.__NS__ .lb-sched-summary:hover { border-color: var(--border-color-accent, var(--color-accent)); }
+.__NS__ .lb-sched-summary-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.__NS__ .lb-sched-summary-hint {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--body-text-color-subdued, var(--body-text-color));
+}
+
 /* ------------------------------------------------------ strength control */
 
 /* [-] slider [number] [+] on one line at every width: the slider is the only
@@ -336,6 +369,9 @@
   padding: 0 7px 7px;
 }
 .__NS__ .lb-schedule .lb-weight { padding: 8px 0 0; }
+/* Scheduler mode owns the row, so its panel sits flush rather than as a
+   footnote under a control that is no longer there. */
+.__NS__ .lb-row > .lb-schedule { margin-top: 0; }
 .__NS__ .lb-weight input[type="range"] {
   width: 100%;
   min-height: 40px;

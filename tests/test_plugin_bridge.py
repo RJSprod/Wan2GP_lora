@@ -773,12 +773,12 @@ class TestScheduleActions:
         assert row["multiplier_kind"] == "scheduled"
         assert row["phase_values"] == [1.0, 0.7]
         first = row["phase_schedules"][0]
-        assert first["base"] == 1.0
+        # Every non-zero run is a region; the trailing 0 is a gap.
         assert [(r["start"], r["end"], r["strength"]) for r in first["regions"]] == [
-            (2, 2, 0.8), (3, 3, 0.4), (4, 4, 0.0)
+            (1, 1, 1.0), (2, 2, 0.8), (3, 3, 0.4)
         ]
+        assert first["gap_strength"] == 0
         second = row["phase_schedules"][1]
-        assert second["base"] == 0.7
         assert len(second["regions"]) == 3
 
     def test_rendering_an_imported_schedule_never_rewrites_it(self, plugin, state):
@@ -802,48 +802,57 @@ class TestScheduleActions:
         # Not yet part of what WanGP is told.
         assert schedule["active"] is False
 
-    def test_a_region_only_reaches_wangp_once_it_differs_from_the_base(self, plugin, state):
-        act(plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 0},
-            state, self.LORAS, "0.71;1.23 1;1")
+    def test_the_first_region_starts_at_the_strength_already_set(self, plugin, state):
+        _, mults, _ = act(
+            plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 0},
+            state, self.LORAS, "0.71;1.23 1;1", steps=20,
+        )
+        # Opening the scheduler writes nothing at all.
+        assert "value" not in mults
+
         _, mults, payload = act(
             plugin, {"type": "schedule_add_region", "id": "a.safetensors", "phase": 0},
-            state, self.LORAS, "0.71;1.23 1;1",
+            state, self.LORAS, "0.71;1.23 1;1", steps=20,
         )
-        assert "value" not in mults
         schedule = self._schedule(payload, "a.safetensors", 0)
-        assert len(schedule["regions"]) == 1
         region = schedule["regions"][0]
         assert region["strength"] == 0.71
         assert schedule["selected_region_id"] == region["id"]
 
-        _, mults, payload = act(
-            plugin,
-            {"type": "schedule_set_region_strength", "id": "a.safetensors", "phase": 0,
-             "region_id": region["id"], "value": 0.25},
-            state, self.LORAS, "0.71;1.23 1;1",
-        )
+        # Drawing it is already a schedule: covered slots carry the strength,
+        # every other slot is zero.
         token = mults["value"].split()[0]
-        assert token.startswith("0.25,0.25,0.25,0.25,0.71")
+        assert token.startswith("0.71,0.71,0.71,0.71,0,0")
         assert token.endswith(";1.23")
+        assert len(token.split(";")[0].split(",")) == 20
 
-    def test_a_base_edit_under_a_schedule_keeps_the_regions(self, plugin, state):
-        _, mults, payload = act(
-            plugin, {"type": "set_strength", "id": "a.safetensors", "phase": 0, "value": 0.9},
+    def test_a_scheduled_phase_refuses_a_plain_strength_edit(self, plugin, state):
+        _, mults, _ = act(
+            plugin, {"type": "set_strength", "id": "a.safetensors", "phase": 0, "value": 0.2},
             state, self.LORAS, "1,0.8,0.4,0;0.7,0.5,0.2,0 1;1",
         )
-        assert mults["value"].split()[0] == "0.9,0.8,0.4,0;0.7,0.5,0.2,0"
-        schedule = self._schedule(payload, "a.safetensors", 0)
-        assert schedule["base"] == 0.9
-        assert len(schedule["regions"]) == 3
+        assert "value" not in mults
+
+        _, mults, payload = act(
+            plugin, {"type": "schedule_set_base", "id": "a.safetensors", "phase": 0, "value": 0.2},
+            state, self.LORAS, "1,0.8,0.4,0;0.7,0.5,0.2,0 1;1",
+        )
+        assert "value" not in mults
+        assert payload["status_warn"] is True
+        assert "timeline" in payload["status"]
 
     def test_only_the_selected_phase_is_touched(self, plugin, state):
+        payload = payload_of(plugin, state, self.LORAS, "1,0.8;0.7,0.5 1;1")
+        region = self._schedule(payload, "a.safetensors", 1)["regions"][0]
         _, mults, _ = act(
-            plugin, {"type": "schedule_set_base", "id": "a.safetensors", "phase": 1, "value": 0.6},
+            plugin,
+            {"type": "schedule_set_region_strength", "id": "a.safetensors", "phase": 1,
+             "region_id": region["id"], "value": 0.6},
             state, self.LORAS, "1,0.8;0.7,0.5 1;1",
         )
         assert mults["value"].split()[0] == "1,0.8;0.6,0.5"
 
-    def test_clear_phase_returns_one_phase_to_its_base(self, plugin, state):
+    def test_clear_phase_returns_one_phase_to_a_plain_strength(self, plugin, state):
         _, mults, payload = act(
             plugin, {"type": "schedule_clear_phase", "id": "a.safetensors", "phase": 0},
             state, self.LORAS, "1,0.8,0.4;0.7,0.5,0.2 1;1",
@@ -854,7 +863,7 @@ class TestScheduleActions:
         assert self._schedule(payload, "a.safetensors", 0) is None
 
     def test_a_move_is_committed_with_collisions_resolved(self, plugin, state):
-        payload = payload_of(plugin, state, self.LORAS, "1,1,0.5,0.5,0.5,1,0.2,0.2 1;1")
+        payload = payload_of(plugin, state, self.LORAS, "0,0,0.5,0.5,0.5,0,0.2,0.2 1;1")
         schedule = self._schedule(payload, "a.safetensors", 0)
         assert [(r["id"], r["start"], r["end"]) for r in schedule["regions"]] == [
             ("r1", 3, 5), ("r2", 7, 8)
@@ -863,9 +872,9 @@ class TestScheduleActions:
             plugin,
             {"type": "schedule_commit_region", "id": "a.safetensors", "phase": 0,
              "region_id": "r1", "start": 5, "end": 7, "keep_width": True},
-            state, self.LORAS, "1,1,0.5,0.5,0.5,1,0.2,0.2 1;1",
+            state, self.LORAS, "0,0,0.5,0.5,0.5,0,0.2,0.2 1;1",
         )
-        assert mults["value"].split()[0] == "1,1,1,1,0.5,0.5,0.5,0.2"
+        assert mults["value"].split()[0] == "0,0,0,0,0.5,0.5,0.5,0.2"
         assert [(r["id"], r["start"], r["end"]) for r in
                 self._schedule(payload, "a.safetensors", 0)["regions"]] == [("r1", 5, 7), ("r2", 8, 8)]
 
@@ -874,52 +883,39 @@ class TestScheduleActions:
             plugin,
             {"type": "schedule_commit_region", "id": "a.safetensors", "phase": 0,
              "region_id": "r1", "start": 7, "end": 12, "keep_width": True},
-            state, self.LORAS, "1,0.4,0.4,1 1;1",
+            state, self.LORAS, "0,0.4,0.4,0 1;1",
         )
         # Four slots, two-wide region: it can only reach 3-4.
-        assert mults["value"].split()[0] == "1,1,0.4,0.4"
+        assert mults["value"].split()[0] == "0,0,0.4,0.4"
 
-    def test_deleting_a_region_keeps_the_rest(self, plugin, state):
+    def test_deleting_a_region_leaves_its_slots_at_zero(self, plugin, state):
         _, mults, payload = act(
             plugin,
             {"type": "schedule_delete_region", "id": "a.safetensors", "phase": 0, "region_id": "r1"},
-            state, self.LORAS, "1,0.5,1,0.2 1;1",
+            state, self.LORAS, "0,0.5,0,0.2 1;1",
         )
-        assert mults["value"].split()[0] == "1,1,1,0.2"
+        assert mults["value"].split()[0] == "0,0,0,0.2"
         regions = self._schedule(payload, "a.safetensors", 0)["regions"]
         assert [(r["start"], r["end"]) for r in regions] == [(4, 4)]
 
     def test_a_full_timeline_refuses_instead_of_overlapping(self, plugin, state):
-        # Stretch the only region across the whole timeline, then ask for another.
-        act(plugin,
+        # One region across the whole timeline, then ask for another.
+        _, mults, _ = act(
+            plugin,
             {"type": "schedule_commit_region", "id": "a.safetensors", "phase": 0,
              "region_id": "r1", "start": 1, "end": 3},
-            state, self.LORAS, "1,0.4,0.4 1;1")
+            state, self.LORAS, "0,0.4,0.4 1;1")
+        assert mults["value"].split()[0] == "0.4,0.4,0.4"
+
         _, mults, payload = act(
             plugin, {"type": "schedule_add_region", "id": "a.safetensors", "phase": 0},
-            state, self.LORAS, "0.4;0.4 1;1",
+            state, self.LORAS, "0.4,0.4,0.4 1;1",
         )
         assert "value" not in mults
         assert payload["status_warn"] is True
         assert "full" in payload["status"]
-        # The stretched region is still there, and still means one flat value.
         schedule = self._schedule(payload, "a.safetensors", 0)
         assert [(r["start"], r["end"]) for r in schedule["regions"]] == [(1, 3)]
-
-    def test_a_shared_timeline_survives_compiling_flat(self, plugin, state):
-        """A schedule that works out to one value collapses in the token only."""
-        _, mults, payload = act(
-            plugin,
-            {"type": "schedule_commit_region", "id": "a.safetensors", "phase": 0,
-             "region_id": "r1", "start": 1, "end": 3},
-            state, self.LORAS, "1,0.4,0.4 1;1",
-        )
-        assert mults["value"].split()[0] == "0.4;0.4"
-        schedule = self._schedule(payload, "a.safetensors", 0)
-        assert schedule["shared"] is True
-        assert schedule["slots"] == 3
-        assert [(r["start"], r["end"]) for r in schedule["regions"]] == [(1, 3)]
-        assert schedule["active"] is False
 
     def test_region_ids_survive_a_round_trip(self, plugin, state):
         multipliers = "1,0.5,1,0.2 1;1"
@@ -978,7 +974,7 @@ class TestScheduleActions:
 
     def test_a_drawn_timeline_keeps_its_own_length(self, plugin, state):
         """Its length is in the token; re-gridding it is an explicit choice."""
-        payload = payload_of(plugin, state, self.LORAS, "1,1,0.5,0.5;0.7 1;1", steps=30)
+        payload = payload_of(plugin, state, self.LORAS, "0,0,0.5,0.5;0.7 1;1", steps=30)
         schedule = self._schedule(payload, "a.safetensors", 0)
         assert schedule["slots"] == 4
         assert schedule["active"] is True
@@ -1009,13 +1005,13 @@ class TestScheduleActions:
         assert 2 <= region["end"] - region["start"] + 1 <= 6
 
     def test_drawing_stops_at_the_neighbouring_region(self, plugin, state):
-        # 1,1,0.5,0.5,1,1 -> one region at slots 3-4; drawing from slot 1 across
+        # 0,0,0.5,0.5,0,0 -> one region at slots 3-4; drawing from slot 1 across
         # it must stop at slot 2 rather than swallowing it.
         _, mults, payload = act(
             plugin,
             {"type": "schedule_add_region", "id": "a.safetensors", "phase": 0,
              "start": 1, "end": 5},
-            state, self.LORAS, "1,1,0.5,0.5,1,1;0.7 1;1", steps=6,
+            state, self.LORAS, "0,0,0.5,0.5,0,0;0.7 1;1", steps=6,
         )
         regions = [(r["start"], r["end"]) for r in
                    self._schedule(payload, "a.safetensors", 0)["regions"]]
@@ -1027,7 +1023,7 @@ class TestScheduleActions:
             plugin,
             {"type": "schedule_add_region", "id": "a.safetensors", "phase": 0,
              "start": 3, "end": 4},
-            state, self.LORAS, "1,1,0.5,0.5,1,1;0.7 1;1", steps=6,
+            state, self.LORAS, "0,0,0.5,0.5,0,0;0.7 1;1", steps=6,
         )
         regions = [(r["start"], r["end"]) for r in
                    self._schedule(payload, "a.safetensors", 0)["regions"]]
@@ -1093,3 +1089,235 @@ class TestScheduleActions:
         assert payload["nudge_step"] == 0.01
         assert payload["value_decimals"] == 4
         assert payload["schedule_slot_limits"]["max"] >= 30
+
+
+class TestImportSafety:
+    """What an existing install's multipliers go through when this build reads them.
+
+    Nothing here needs a converter: the panel derives regions from the token and
+    those regions say the same thing back, so a schedule written by WanGP, a
+    preset, an .lset file or a hand edit is rendered, never rewritten.
+    """
+
+    LORAS = ["a.safetensors", "b.safetensors"]
+
+    #: Shapes a real install can hold, including ones the editor's own model
+    #: would never produce.
+    CORPUS = [
+        "1;1",
+        "0.71;1.23",
+        "1,0.8,0.4,0;0.7,0.5,0.2,0",          # WanGP's documented form
+        "0.9,0.8;1.2,1.1",
+        "1;0.7,0.5,0.2",                       # scalar phase + scheduled phase
+        "0,0,0.5,0.5,0",                       # off, then on, then off
+        "0.5,0.5,0.5",                         # flat and non-zero
+        "0,0,0",                               # flat and off
+        "1.0,0.80,0.400;0.7",                  # trailing zeros the codec would trim
+        "1.4,-0.5;0.125",                      # out of range and fine decimals
+        "0.5:0.9;1",                           # branch syntax, never editable
+        "1,0.5,0.25",                          # shared across phases
+    ]
+
+    @pytest.mark.parametrize("token", CORPUS)
+    def test_rendering_never_touches_the_multiplier(self, plugin, state, token):
+        multipliers = token + " 1;1"
+        for _ in range(3):
+            payload = payload_of(plugin, state, self.LORAS, multipliers, steps=30)
+            assert row_of(payload, "a.safetensors")["multiplier_raw"] == token
+
+        # And no action that only looks at it writes anything back.
+        for action in (
+            {"type": "ready"},
+            {"type": "sort", "value": "recent"},
+            {"type": "zoom", "value": 120},
+        ):
+            choices, mults, _ = act(plugin, action, state, self.LORAS, multipliers, steps=30)
+            assert "value" not in choices and "value" not in mults
+
+    @pytest.mark.parametrize("token", CORPUS)
+    def test_what_the_editor_shows_is_what_the_token_says(self, plugin, state, token):
+        """Regions compiled back must equal the values WanGP was given."""
+        multipliers = token + " 1;1"
+        payload = payload_of(plugin, state, self.LORAS, multipliers, steps=30)
+        row = row_of(payload, "a.safetensors")
+        if row["multiplier_kind"] != "scheduled":
+            return
+
+        declared = [part.split(",") for part in token.split(";")]
+        for index, schedule in enumerate(row["phase_schedules"] or []):
+            if schedule is None:
+                continue
+            source = declared[0] if row["schedule_shared"] else declared[index]
+            if len(source) < 2:
+                continue
+            rebuilt = [schedule["gap_strength"]] * schedule["slots"]
+            for region in schedule["regions"]:
+                for slot in range(region["start"], region["end"] + 1):
+                    rebuilt[slot - 1] = region["strength"]
+            assert rebuilt == [float(value) for value in source]
+
+    def test_opening_the_scheduler_on_an_imported_schedule_writes_nothing(self, plugin, state):
+        multipliers = "1,0.8,0.4,0;0.7,0.5,0.2,0 1;1"
+        for phase in (0, 1):
+            choices, mults, payload = act(
+                plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": phase},
+                state, self.LORAS, multipliers, steps=30,
+            )
+            assert "value" not in choices and "value" not in mults
+            assert row_of(payload, "a.safetensors")["multiplier_raw"] == "1,0.8,0.4,0;0.7,0.5,0.2,0"
+
+    def test_an_accelerator_managed_stack_with_a_schedule_survives(self, plugin, state):
+        multipliers = "1;1|1,0.8,0.4,0"
+        payload = payload_of(plugin, state, self.LORAS, multipliers, steps=30)
+        assert row_of(payload, "b.safetensors")["multiplier_kind"] == "scheduled"
+        _, mults, _ = act(
+            plugin, {"type": "set_strength", "id": "a.safetensors", "phase": 0, "value": 0.5},
+            state, self.LORAS, multipliers, steps=30,
+        )
+        # The bar stayed put and the schedule to its right is untouched.
+        assert mults["value"] == "0.5;1|1,0.8,0.4,0"
+
+    def test_a_profile_and_a_disable_restore_cycle_preserve_zeros(self, plugin, state):
+        multipliers = "0,0,0.5,0.5,0;0.7 1;1"
+        act(plugin, {"type": "profile_save", "name": "zeros"}, state, self.LORAS, multipliers)
+        _, mults, _ = act(plugin, {"type": "profile_recall", "name": "zeros"}, state, [], "")
+        assert mults["value"].split()[0] == "0,0,0.5,0.5,0;0.7"
+
+        act(plugin, {"type": "disable_all"}, state, self.LORAS, multipliers)
+        _, mults, _ = act(plugin, {"type": "restore"}, state, [], "")
+        assert mults["value"].split()[0] == "0,0,0.5,0.5,0;0.7"
+
+    def test_editing_a_token_canonicalises_its_formatting_but_not_its_values(self, plugin, state):
+        """The one rewrite there is, and only once an edit actually happens."""
+        multipliers = "1.0,0.80,0.400;0.7 1;1"
+        payload = payload_of(plugin, state, self.LORAS, multipliers, steps=30)
+        assert row_of(payload, "a.safetensors")["multiplier_raw"] == "1.0,0.80,0.400;0.7"
+
+        _, mults, _ = act(
+            plugin, {"type": "set_strength", "id": "a.safetensors", "phase": 1, "value": 0.6},
+            state, self.LORAS, multipliers, steps=30,
+        )
+        written = mults["value"].split()[0]
+        assert written == "1,0.8,0.4;0.6"
+        # Same numbers, spelled the way the serialiser spells them.
+        assert [float(value) for value in written.split(";")[0].split(",")] == [1.0, 0.80, 0.400]
+
+
+class TestStepCountSync:
+    """Timelines follow num_inference_steps, live, without being asked."""
+
+    LORAS = ["a.safetensors", "b.safetensors"]
+
+    def _drawn(self, plugin, state, multipliers, steps):
+        """A schedule the panel authored, so it is step-aligned."""
+        payload = payload_of(plugin, state, self.LORAS, multipliers, steps=steps)
+        region = row_of(payload, "a.safetensors")["phase_schedules"][0]["regions"][0]
+        _, mults, _ = act(
+            plugin,
+            {"type": "schedule_set_region_strength", "id": "a.safetensors", "phase": 0,
+             "region_id": region["id"], "value": region["strength"]},
+            state, self.LORAS, multipliers, steps=steps,
+        )
+        return mults.get("value", multipliers)
+
+    def _resync(self, plugin, state, multipliers, steps):
+        _, mults, payload = act(
+            plugin, {"type": "schedule_resync"}, state, self.LORAS, multipliers, steps=steps
+        )
+        return mults.get("value", multipliers), payload
+
+    def test_a_longer_run_inherits_what_was_there(self, plugin, state):
+        multipliers = self._drawn(plugin, state, "1,0.8,0.4,0.2 1;1", 4)
+        written, _ = self._resync(plugin, state, multipliers, 5)
+        assert written.split()[0] == "1,0.8,0.4,0.2,0"
+
+    def test_a_shorter_run_drops_only_the_steps_that_are_gone(self, plugin, state):
+        multipliers = self._drawn(plugin, state, "1,0.8,0.4,0.2 1;1", 4)
+        written, _ = self._resync(plugin, state, multipliers, 3)
+        assert written.split()[0] == "1,0.8,0.4"
+
+    def test_a_region_straddling_the_new_end_is_clipped(self, plugin, state):
+        multipliers = self._drawn(plugin, state, "0,0.5,0.5,0.5,0.5 1;1", 5)
+        written, _ = self._resync(plugin, state, multipliers, 3)
+        assert written.split()[0] == "0,0.5,0.5"
+
+    def test_the_panel_asks_for_a_resync_and_then_stops(self, plugin, state):
+        """The flag drives one round trip, not a loop."""
+        multipliers = self._drawn(plugin, state, "1,0.8,0.4,0.2 1;1", 4)
+        assert payload_of(plugin, state, self.LORAS, multipliers, steps=9)["schedules_out_of_sync"]
+
+        written, payload = self._resync(plugin, state, multipliers, 9)
+        assert payload["schedules_out_of_sync"] is False
+        assert len(written.split()[0].split(",")) == 9
+
+        # Asking again changes nothing.
+        again, _ = self._resync(plugin, state, written, 9)
+        assert again.split()[0] == written.split()[0]
+
+    def test_every_lora_and_phase_follows_at_once(self, plugin, state):
+        multipliers = "1,0.8;0.5,0.5 0.2,0.2,0.2 "
+        # Author both so they are step-aligned, then move the counter.
+        for lora in self.LORAS:
+            payload = payload_of(plugin, state, self.LORAS, multipliers, steps=2)
+            row = row_of(payload, lora)
+            for phase, schedule in enumerate(row["phase_schedules"] or []):
+                if not schedule or not schedule["regions"]:
+                    continue
+                _, mults, _ = act(
+                    plugin,
+                    {"type": "schedule_set_region_strength", "id": lora, "phase": phase,
+                     "region_id": schedule["regions"][0]["id"],
+                     "value": schedule["regions"][0]["strength"]},
+                    state, self.LORAS, multipliers, steps=2,
+                )
+                multipliers = mults.get("value", multipliers)
+
+        written, payload = self._resync(plugin, state, multipliers, 4)
+        first, second = written.split()[0], written.split()[1]
+        assert [len(part.split(",")) for part in first.split(";")] == [4, 4]
+        assert len(second.split(";")[0].split(",")) == 4
+        assert payload["schedules_out_of_sync"] is False
+
+    def test_an_untouched_import_is_resampled_not_truncated(self, plugin, state):
+        """WanGP spreads it across the run; truncating would change the render."""
+        written, _ = self._resync(plugin, state, "1,0.8,0.4,0 1;1", 12)
+        assert written.split()[0] == "1,1,1,0.8,0.8,0.8,0.4,0.4,0.4,0,0,0"
+
+    def test_a_read_only_multiplier_is_never_refitted(self, plugin, state):
+        for token in ("0.5:0.9", "1;1"):
+            _, mults, _ = act(
+                plugin, {"type": "schedule_resync"}, state, self.LORAS,
+                token + " 1;1", steps=12,
+            )
+            assert "value" not in mults
+
+    def test_an_over_long_schedule_is_left_preserved(self, plugin, state):
+        long_token = ",".join(["0.5"] * 200)
+        _, mults, payload = act(
+            plugin, {"type": "schedule_resync"}, state, self.LORAS,
+            long_token + " 1;1", steps=12,
+        )
+        assert "value" not in mults
+        assert row_of(payload, "a.safetensors")["phase_schedules"][0]["editable"] is False
+
+    def test_a_step_count_beyond_the_ceiling_settles(self, plugin, state):
+        """It must stop asking rather than never matching."""
+        multipliers = self._drawn(plugin, state, "1,0.8,0.4,0.2 1;1", 4)
+        written, payload = self._resync(plugin, state, multipliers, 10_000)
+        assert payload["schedules_out_of_sync"] is False
+        assert len(written.split()[0].split(",")) == 120
+
+    def test_nothing_happens_when_the_step_count_is_unknown(self, plugin, state):
+        multipliers = "1,0.8,0.4,0.2 1;1"
+        payload = payload_of(plugin, state, self.LORAS, multipliers)
+        assert payload["schedules_out_of_sync"] is False
+        _, mults, _ = act(plugin, {"type": "schedule_resync"}, state, self.LORAS, multipliers)
+        assert "value" not in mults
+
+    def test_an_empty_timeline_needs_no_write_to_follow(self, plugin, state):
+        act(plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 0},
+            state, self.LORAS, "0.8;0.5 1;1", steps=10)
+        payload = payload_of(plugin, state, self.LORAS, "0.8;0.5 1;1", steps=25)
+        schedule = row_of(payload, "a.safetensors")["phase_schedules"][0]
+        assert schedule["slots"] == 25
+        assert payload["schedules_out_of_sync"] is False

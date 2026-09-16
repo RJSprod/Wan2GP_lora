@@ -332,15 +332,16 @@ class TestScheduleStateModel:
         stack = self._stack("1,0.8,0.4;0.7,0.7,0.2")
         first = self.schedules[("a.safetensors", 0)]
         second = self.schedules[("a.safetensors", 1)]
-        assert [(r.start, r.end) for r in first.regions] == [(2, 2), (3, 3)]
-        assert [(r.start, r.end) for r in second.regions] == [(3, 3)]
+        assert [(r.start, r.end) for r in first.regions] == [(1, 1), (2, 2), (3, 3)]
+        assert [(r.start, r.end) for r in second.regions] == [(1, 2), (3, 3)]
 
         up.schedule_delete_region(
             stack, "a.safetensors", 0, first.regions[0].id,
             self.phases, self.memory, self.schedules, self.context,
         )
-        assert [(r.start, r.end) for r in self.schedules[("a.safetensors", 1)].regions] == [(3, 3)]
-        assert stack.tokens[0] == "1,1,0.4;0.7,0.7,0.2"
+        # Deleting a region leaves its slots at zero, and phase 2 is untouched.
+        assert [(r.start, r.end) for r in self.schedules[("a.safetensors", 1)].regions] == [(1, 2), (3, 3)]
+        assert stack.tokens[0] == "0,0.8,0.4;0.7,0.7,0.2"
 
     def test_reopening_a_schedule_does_not_reset_it(self):
         stack = self._stack("0.6;0.9")
@@ -353,23 +354,51 @@ class TestScheduleStateModel:
         up.schedule_enable(stack, "a.safetensors", 0, self.phases, self.memory, self.schedules, self.context)
         assert [(r.id, r.start, r.end) for r in self.schedules[("a.safetensors", 0)].regions] == before
 
-    def test_linked_edits_move_bases_and_never_copy_regions(self):
+    def test_a_scheduled_phase_has_no_plain_strength_to_edit(self):
+        """The timeline owns every slot, so a stray strength edit does nothing."""
         stack = self._stack("1,0.8,0.4;0.5")
-        up.schedule_set_base(
+        with pytest.raises(sch.ScheduleError):
+            up.schedule_set_base(
+                stack, "a.safetensors", 0, 0.9, self.phases, self.memory,
+                self.schedules, self.context,
+            )
+        assert up.set_phase_value(
+            stack, "a.safetensors", 0, 0.9, self.phases, self.memory, schedules=self.schedules
+        ) is False
+        assert stack.tokens[0] == "1,0.8,0.4;0.5"
+
+    def test_a_linked_edit_skips_a_scheduled_phase(self):
+        stack = self._stack("0.4;0.5")
+        # Phase 1 gets a schedule; phase 2 stays a plain scalar.
+        up.schedule_enable(stack, "a.safetensors", 0, self.phases, self.memory, self.schedules, self.context)
+        up.schedule_add_region(stack, "a.safetensors", 0, self.phases, self.memory, self.schedules, self.context)
+        scheduled = stack.tokens[0]
+
+        up.set_phase_value(
             stack, "a.safetensors", 0, 0.9, self.phases, self.memory,
-            self.schedules, self.context, linked=True,
+            linked=True, schedules=self.schedules,
         )
-        # Both phases took the new value; phase 1 kept its schedule, phase 2
-        # stayed a plain scalar rather than inheriting regions.
-        assert stack.tokens[0] == "0.9,0.8,0.4;0.9"
-        assert ("a.safetensors", 1) not in self.schedules
+        # Phase 2 followed the link; phase 1's schedule is untouched.
+        assert stack.tokens[0].split(";")[0] == scheduled.split(";")[0]
+        assert stack.tokens[0].split(";")[1] == "0.9"
+
+    def test_an_empty_timeline_still_takes_a_strength(self):
+        """Nothing is drawn yet, so the phase is worth one value."""
+        stack = self._stack("0.4;0.5")
+        up.schedule_enable(stack, "a.safetensors", 0, self.phases, self.memory, self.schedules, self.context)
+        up.schedule_set_base(
+            stack, "a.safetensors", 0, 0.8, self.phases, self.memory, self.schedules, self.context
+        )
+        assert stack.tokens[0] == "0.8;0.5"
 
     def test_an_edit_to_one_phase_leaves_a_hidden_phase_alone(self):
         one = up.resolve_phases(H3_MODEL_DEF, 1)
         stack = up.Stack.from_native(["a.safetensors"], "1,0.8,0.4;0.65")
         up.sync_schedules(stack, one, self.schedules, self.context)
-        up.schedule_set_base(
-            stack, "a.safetensors", 0, 0.5, one, self.memory, self.schedules, self.context
+        first = self.schedules[("a.safetensors", 0)]
+        up.schedule_set_region_strength(
+            stack, "a.safetensors", 0, first.regions[0].id, 0.5,
+            one, self.memory, self.schedules, self.context,
         )
         assert stack.tokens[0] == "0.5,0.8,0.4;0.65"
 
@@ -391,10 +420,27 @@ class TestScheduleStateModel:
 
     def test_a_material_edit_marks_the_schedule_dirty(self):
         stack = self._stack("1,0.5,0.2;0.4")
-        up.schedule_set_base(
-            stack, "a.safetensors", 0, 0.9, self.phases, self.memory, self.schedules, self.context
+        schedule = self.schedules[("a.safetensors", 0)]
+        up.schedule_set_region_strength(
+            stack, "a.safetensors", 0, schedule.regions[0].id, 0.9,
+            self.phases, self.memory, self.schedules, self.context,
         )
         assert self.schedules[("a.safetensors", 0)].dirty is True
+
+    def test_a_gap_is_zero_not_a_hidden_strength(self):
+        """Boxes over 1-2 and 4-6 mean slot 3 is off."""
+        stack = self._stack("0.9;0.5")
+        up.schedule_enable(stack, "a.safetensors", 0, self.phases, self.memory, self.schedules, self.context)
+        self.schedules[("a.safetensors", 0)].slots = 6
+        up.schedule_add_region(
+            stack, "a.safetensors", 0, self.phases, self.memory, self.schedules, self.context,
+            start=1, end=2,
+        )
+        up.schedule_add_region(
+            stack, "a.safetensors", 0, self.phases, self.memory, self.schedules, self.context,
+            start=4, end=6,
+        )
+        assert stack.tokens[0] == "0.9,0.9,0,0.9,0.9,0.9;0.5"
 
     def test_editing_a_scheduled_lora_leaves_its_neighbours_alone(self):
         stack = self._stack("1,0.5 0.5:0.9 0.8;0.8", ids=("a.safetensors", "b.safetensors", "c.safetensors"))
