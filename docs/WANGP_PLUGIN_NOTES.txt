@@ -232,6 +232,32 @@ WHY IT TOOK FOUR ROUNDS
       plugin offers step schedules only in One Phase: with more, "0.8,0.8,0.8,0"
       at 4 steps renders [0.8, 0.8, 0.64, 0.64], not what was drawn.
 
+    LTX-2 IS DIFFERENT: ITS PHASES ARE STAGES (models/ltx2/ltx_pipelines)
+      The LTX-2 handler sets guidance_max_phases = 2 and no lora_multiplier_
+      phases, and defaults guidance_phases to 2 ("Phases: Two Phases"). Phase 1
+      is stage 1 (the low-resolution denoise) and phase 2 is stage 2 (the
+      refinement after the spatial upscale); guidance_phases == 1 sets
+      skip_stage_2 and stage 1 runs at full resolution instead. Each stage calls
+          update_loras_slists(transformer, slists, stage_N_steps, ...)
+      with its OWN step count, so phase 1's list is expanded over stage 1 only
+      and phase 2's over stage 2 only -- knowable while editing:
+          stage 1: len(DISTILLED_SIGMA_VALUES) - 1 = 8 on the distilled
+                   pipeline (ltx2_pipeline == "distilled", or JoyAI Echo), and on
+                   the Dev pipeline with sample_solver distilled_8_steps[_ancestral];
+                   otherwise num_inference_steps (LTX2Scheduler, steps + 1 sigmas)
+          stage 2: 3, always (both stage-2 sigma tables have four values)
+      A comma-only token is expanded in BOTH stages: over stage 1's steps, then
+      again squeezed into stage 2's three. The distilled checkpoints hide the
+      step slider (lock_inference_steps) and ignore its value.
+
+    A ';' TOKEN CAN OUTLIVE ITS MODE
+      lora_multiplier_phases defaults to guidance_phases, so on LTX-2 (and any
+      model without a fixed lora_multiplier_phases) switching Two Phases to One
+      makes every "a;b" token invalid: parse_loras_multipliers answers "there
+      should be at most 1 phases for this multiplier" and WanGP refuses the
+      whole string. Nothing in WanGP rewrites it; the plugin's resync does
+      (ui_payloads.fit_phase_structure).
+
     SCHEDULE GRAMMAR IS PHASE-MAJOR
       In "1,0.8,0.4,0;0.7,0.5,0.2,0" the ';' is the outer separator: phase 1 is
       scheduled 1 -> 0.8 -> 0.4 -> 0 and phase 2 is scheduled separately. Emit
@@ -274,6 +300,12 @@ WHY IT TOOK FOUR ROUNDS
     which is how a tuned Phase 2 survives a trip through One Phase. For models
     whose capacity follows the guidance mode, the token must shrink and you have
     to remember the hidden value yourself.
+
+    The one thing model_def cannot tell you is how long each phase runs; that
+    lives in the family's pipeline code. LTX-2 is the only family where it is
+    knowable while editing (see 3.4), so PhaseConfig.staged is set for it alone,
+    recognised by architecture ("ltx2*", "joyai_echo") with the "ltx2_22B_class"
+    key the LTX-2 handler adds to every definition it builds as the backstop.
 
 3.6 LoRA identity
     setup_loras() stores LoRAs as paths RELATIVE to the model's LoRA dir, via

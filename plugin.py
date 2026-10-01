@@ -56,6 +56,13 @@ MODAL_IMAGE_MAX_DIM = 1400
 #: an explicit click, so this bounds the cost without exposing a static route.
 MEDIA_INLINE_LIMIT = 32 * 1024 * 1024
 
+#: Data-URI types for formats ``catalogue.sniff_media`` recognises.
+_SNIFFED_MIME = {
+    ".jpg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
+    ".avif": "image/avif", ".mp4": "video/mp4", ".mov": "video/mp4", ".webm": "video/webm",
+    ".mkv": "video/webm",
+}
+
 NATIVE_CHOICES_ELEM_ID = "wgp_lora_browser_native_choices"
 NATIVE_MULTIPLIERS_ELEM_ID = "wgp_lora_browser_native_multipliers"
 
@@ -69,6 +76,14 @@ def _read_asset(name: str) -> str:
         return ""
 
 
+def _follow_note(context: up.ScheduleContext) -> str:
+    """What a resync that moved some timeline says it did."""
+    if len(context.phase_steps) >= 2:
+        first, second = context.phase_steps[0], context.phase_steps[1]
+        return f"Schedules follow the stages: {first} steps, then {second} to refine."
+    return f"Schedules follow {context.phase_length(0)} steps."
+
+
 class InstanceState:
     """Per media-generator tab state. WanGP can build the tab more than once."""
 
@@ -80,6 +95,10 @@ class InstanceState:
         #: Phase values the current mode cannot show, kept so switching modes
         #: does not erase a carefully chosen phase 2.
         self.phase_memory: dict[str, list[float]] = {}
+        #: lora id -> the ";" parts a narrower phase mode cut from its token,
+        #: verbatim -- a stage-2 schedule as much as a scalar -- so the mode
+        #: coming back restores them. See ui_payloads.fit_phase_structure.
+        self.hidden_phases: up.HiddenPhases = {}
         #: Snapshot taken by "Disable all"; invalidated when native state moves
         #: on its own, so Restore never overwrites newer settings unnoticed.
         self.restore_snapshot: tuple[list[str], str] | None = None
@@ -132,10 +151,12 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         # generate_media_tab; the plugin manager resolves them from that scope.
         # num_inference_steps is optional: it only decides whether a shared
         # schedule may label its slots with real step numbers, so a WanGP build
-        # that does not expose it still gets a working timeline.
+        # that does not expose it still gets a working timeline. sample_solver
+        # is optional for the same reason: on LTX-2 Dev a distilled sampler
+        # runs eight first-stage steps whatever the counter says.
         for component in (
             "loras_choices", "loras_multipliers", "guidance_phases", "state",
-            "lset_name", "main", "num_inference_steps",
+            "lset_name", "main", "num_inference_steps", "sample_solver",
         ):
             self.request_component(component)
 
@@ -173,6 +194,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             instance.model_key = ""
             instance.inventory_ids = []
             instance.phase_memory.clear()
+            instance.hidden_phases.clear()
             instance.catalogue_cache.clear()
             instance.schedules.clear()
             instance.restore_snapshot = None
@@ -250,6 +272,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         guidance_phases = components.get("guidance_phases")
         lset_name = components.get("lset_name")
         num_inference_steps = components.get("num_inference_steps")
+        sample_solver = components.get("sample_solver")
 
         instance_id = getattr(loras_multipliers, "_id", id(loras_multipliers))
         instance = self._instance(instance_id)
@@ -284,7 +307,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         for placeholder, value in ids.items():
             script = script.replace(placeholder, value)
 
-        # Gradio passes inputs positionally, and either optional component may be
+        # Gradio passes inputs positionally, and any optional component may be
         # absent in a given WanGP build, so the tail is unpacked by name.
         sync_inputs = [state, loras_choices, loras_multipliers]
         optional: list[str] = []
@@ -294,21 +317,26 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         if num_inference_steps is not None:
             sync_inputs.append(num_inference_steps)
             optional.append("steps")
+        if sample_solver is not None:
+            sync_inputs.append(sample_solver)
+            optional.append("sampler")
 
         def unpack(extra):
-            values = {"guidance": None, "steps": None}
+            values = {"guidance": None, "steps": None, "sampler": None}
             for name, value in zip(optional, extra):
                 values[name] = value
-            return values["guidance"], values["steps"]
+            return values["guidance"], values["steps"], values["sampler"]
 
         def sync(state_value, selected, multipliers, *extra):
-            guidance, steps = unpack(extra)
-            return self._build_payload(instance, state_value, selected, multipliers, guidance, steps)
+            guidance, steps, sampler = unpack(extra)
+            return self._build_payload(
+                instance, state_value, selected, multipliers, guidance, steps, sampler
+            )
 
         def act(action_json, state_value, selected, multipliers, *extra):
-            guidance, steps = unpack(extra)
+            guidance, steps, sampler = unpack(extra)
             return self._apply_action(
-                instance, action_json, state_value, selected, multipliers, guidance, steps
+                instance, action_json, state_value, selected, multipliers, guidance, steps, sampler
             )
 
         def serve_media(request_json, state_value):
@@ -351,7 +379,10 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         # presets, .lset files, imported media settings, accelerator profiles
         # and queue edits all resynchronise without being special-cased.
         watched = [loras_choices, loras_multipliers]
-        watched += [component for component in (guidance_phases, num_inference_steps) if component is not None]
+        watched += [
+            component for component in (guidance_phases, num_inference_steps, sample_solver)
+            if component is not None
+        ]
         for component in watched:
             if hasattr(component, "change"):
                 component.change(fn=sync, inputs=sync_inputs, outputs=[payload_box], show_progress="hidden")
@@ -431,30 +462,35 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             index[entry.id] = record
         return index
 
-    def _context(self, instance: InstanceState, state_value, selected, multipliers, guidance, steps=None):
+    def _context(
+        self, instance: InstanceState, state_value, selected, multipliers, guidance, steps=None,
+        sampler=None,
+    ):
         model_type = self._model_type(state_value)
         model_def = self._model_def(model_type)
         phases = up.resolve_phases(model_def, guidance)
         lora_dir = self._lora_dir(model_type)
         inventory = build_inventory(self._native_loras(state_value, selected), lora_dir)
         stack = up.Stack.from_native(selected, multipliers)
-        context = up.ScheduleContext.from_native(steps)
+        context = up.ScheduleContext.from_native(steps, model_def, phases, sampler)
 
         instance.model_key = model_type
         instance.lora_dir = lora_dir
         instance.inventory_ids = inventory.ids
         up.remember_hidden_phases(stack, phases, instance.phase_memory)
+        up.forget_superseded_phases(stack, instance.hidden_phases)
         # Bring the region editor back in line with the native tokens before
         # anything reads or writes them.
         up.sync_schedules(stack, phases, instance.schedules, context)
         return model_type, inventory, stack, phases, context
 
     def _build_payload(
-        self, instance: InstanceState, state_value, selected, multipliers, guidance, steps=None
+        self, instance: InstanceState, state_value, selected, multipliers, guidance, steps=None,
+        sampler=None,
     ) -> str:
         try:
             model_type, inventory, stack, phases, context = self._context(
-                instance, state_value, selected, multipliers, guidance, steps
+                instance, state_value, selected, multipliers, guidance, steps, sampler
             )
             status, warn = instance.take_status()
 
@@ -508,15 +544,19 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 "value_decimals": up.VALUE_DECIMALS,
                 # Schedule coordinates: how long the run is, and whether the
                 # plugin may claim exact step numbers for a phase-specific
-                # schedule (it may not, until WanGP exposes phase boundaries).
+                # schedule -- only where each phase is a stage of known length
+                # (LTX-2), and then how long each one is.
                 "steps": context.steps,
                 "phase_boundaries_known": context.boundaries_known,
+                "phase_steps": list(context.phase_steps),
                 # The frontend commits a resync when it sees this, so the
-                # timelines follow the step counter without the user asking.
+                # timelines follow the step counter, and the tokens the phase
+                # mode, without the user asking.
                 "schedules_out_of_sync": up.schedules_need_resync(
                     stack, phases, instance.schedules, context
-                ),
-                # Step schedules only mean what they show in One Phase guidance.
+                ) or up.phase_structure_needs_fit(stack, phases, instance.hidden_phases),
+                # Step schedules only mean what they show in One Phase guidance,
+                # or on a model whose phases are stages of known length.
                 "scheduling_enabled": up.scheduling_allowed(phases),
                 "scheduling_disabled_reason": up.SCHEDULING_DISABLED_REASON,
                 "schedule_slot_limits": {
@@ -545,7 +585,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
     # ----------------------------------------------------------- actions
 
     def _apply_action(
-        self, instance: InstanceState, action_json, state_value, selected, multipliers, guidance, steps=None
+        self, instance: InstanceState, action_json, state_value, selected, multipliers, guidance,
+        steps=None, sampler=None,
     ):
         no_change = (gr.update(), gr.update())
         try:
@@ -553,24 +594,25 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         except (TypeError, ValueError):
             return no_change + (gr.update(),)
 
+        native = (guidance, steps, sampler)
         try:
             model_type, inventory, stack, phases, context = self._context(
-                instance, state_value, selected, multipliers, guidance, steps
+                instance, state_value, selected, multipliers, *native
             )
             changed = self._dispatch(instance, action, stack, inventory, phases, model_type, context)
 
             if not changed:
-                payload = self._build_payload(instance, state_value, selected, multipliers, guidance, steps)
+                payload = self._build_payload(instance, state_value, selected, multipliers, *native)
                 return no_change + (payload,)
 
             up.normalize_stack_tokens(stack, phases, instance.phase_memory)
             values, multiplier_text = stack.to_native(inventory)
-            payload = self._build_payload(instance, state_value, values, multiplier_text, guidance, steps)
+            payload = self._build_payload(instance, state_value, values, multiplier_text, *native)
             return gr.update(value=values), gr.update(value=multiplier_text), payload
         except Exception as error:
             traceback.print_exc()
             instance.note(f"Action failed: {error}", True)
-            payload = self._build_payload(instance, state_value, selected, multipliers, guidance, steps)
+            payload = self._build_payload(instance, state_value, selected, multipliers, *native)
             return no_change + (payload,)
 
     def _dispatch(self, instance, action, stack, inventory, phases, model_type, context=None) -> bool:
@@ -719,16 +761,26 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 return up.schedule_clear_phase(stack, lora_id, phase, *args)
 
             if kind == "schedule_resync":
+                # First the phase structure: a token declaring more phases than
+                # this mode runs is one WanGP refuses outright. The timelines
+                # are then re-derived from what it became before they move.
+                fitted = up.fit_phase_structure(stack, phases, instance.hidden_phases)
+                if fitted:
+                    up.sync_schedules(stack, phases, instance.schedules, context)
                 changed = up.refit_schedules(
                     stack, phases, instance.schedules, instance.phase_memory, context
                 )
                 if changed:
                     instance.note(
-                        f"Schedules follow {context.steps} steps."
+                        _follow_note(context)
                         if up.scheduling_allowed(phases)
                         else "Guidance uses more than one phase; scheduled LoRAs were reset to 0."
                     )
-                return changed
+                elif fitted:
+                    instance.note(
+                        "Multipliers now match the phase mode; anything it hides comes back with it."
+                    )
+                return changed or fitted
 
             if kind == "schedule_normalize":
                 changed = up.schedule_normalize(stack, lora_id, phase, action.get("slots"), *args)
@@ -1115,10 +1167,15 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             if os.path.getsize(path) > MEDIA_INLINE_LIMIT:
                 return ""
             with open(path, "rb") as handle:
-                payload = base64.b64encode(handle.read()).decode("ascii")
+                raw = handle.read()
         except OSError:
             return ""
-        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        payload = base64.b64encode(raw).decode("ascii")
+        # Typed by what the bytes are, not the name: a WebM saved as .mp4 by an
+        # older catalogue still plays. QuickTime is labelled MP4 because that is
+        # what browsers will play an H.264 .mov as.
+        _, sniffed = cat.sniff_media(raw[: cat.SNIFF_BYTES])
+        mime = _SNIFFED_MIME.get(sniffed) or mimetypes.guess_type(path)[0] or "application/octet-stream"
         return f"data:{mime};base64,{payload}"
 
     def _serve_thumbnails(self, instance: InstanceState, request, state_value) -> str:

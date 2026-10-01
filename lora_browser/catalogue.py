@@ -290,7 +290,56 @@ def _media_files(media_dir: str) -> dict[int, str]:
     return found
 
 
+#: How many leading bytes ``sniff_media`` needs: the longest signature it looks
+#: for, plus room for a Matroska DocType near the start.
+SNIFF_BYTES = 64
+
+
+def sniff_media(head: bytes) -> tuple[str, str]:
+    """``(kind, extension)`` that the leading bytes of a file actually are.
+
+    ``("", "")`` when they are none of the formats a preview arrives in.  The
+    name a file was given is a claim; this is what a decoder will find.
+    Civitai names every video ``<id>.mp4`` whatever was uploaded, and a
+    catalogue built by an older script may hold a video under an image name,
+    so both downloading and showing media ask the bytes.
+    """
+    head = bytes(head or b"")[:SNIFF_BYTES]
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image", ".jpg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image", ".png"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image", ".gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image", ".webp"
+    if head[4:8] == b"ftyp":
+        brand = head[8:12]
+        if brand in (b"avif", b"avis"):
+            return "image", ".avif"
+        if brand in (b"heic", b"heix", b"hevc", b"mif1", b"msf1"):
+            # HEIF stills share the box; nothing here can show them, so the
+            # name decides rather than a video player.
+            return "", ""
+        return "video", ".mov" if brand == b"qt  " else ".mp4"
+    if head[:4] == b"\x1a\x45\xdf\xa3":
+        return "video", ".mkv" if b"matroska" in head else ".webm"
+    return "", ""
+
+
+def _read_head(path: str) -> bytes:
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(SNIFF_BYTES)
+    except OSError:
+        return b""
+
+
 def _media_kind(path: str) -> str:
+    """Image or video, by the bytes when they say, else by the name."""
+    kind, _ = sniff_media(_read_head(path))
+    if kind:
+        return kind
     extension = os.path.splitext(path)[1].lower()
     return "video" if extension in VIDEO_EXTENSIONS else "image"
 

@@ -785,3 +785,208 @@ class TestScheduleStateModel:
             self.schedules, self.context, with_schedules=False,
         )
         assert fields["phase_schedules"] == []
+
+
+# ---------------------------------------------------------------- LTX-2
+#
+# Model definitions as WanGP's get_model_def returns them once the LTX-2
+# handler's query_model_def has been merged in: two phases at most, the
+# distilled checkpoints locking the step counter, and no lora_multiplier_phases
+# -- so the token's phase count follows the guidance mode.
+
+LTX23_DISTILLED = {
+    "architecture": "ltx2_22B", "ltx2_pipeline": "distilled", "guidance_max_phases": 2,
+    "visible_phases": 0, "lock_inference_steps": True, "ltx2_22B_class": True,
+}
+LTX25_DEV = {
+    "architecture": "ltx2_25_22B", "guidance_max_phases": 2, "visible_phases": 1,
+    "ltx2_22B_class": True,
+}
+JOYAI_ECHO = {"architecture": "joyai_echo", "guidance_max_phases": 2, "ltx2_22B_class": False}
+
+
+class TestLtxStages:
+    """LTX-2's phases are pipeline stages of known length, so they schedule."""
+
+    def setup_method(self):
+        self.schedules = {}
+        self.memory = {}
+
+    @pytest.mark.parametrize("model_def", [LTX23_DISTILLED, LTX25_DEV, JOYAI_ECHO])
+    def test_ltx2_is_recognised_and_staged(self, model_def):
+        two = up.resolve_phases(model_def, 2)
+        assert (two.capacity, two.effective, two.staged) == (2, 2, True)
+        one = up.resolve_phases(model_def, 1)
+        assert (one.capacity, one.effective, one.staged) == (1, 1, True)
+        assert up.scheduling_allowed(two) is True
+
+    def test_other_two_phase_models_still_do_not_schedule(self):
+        """Their phase 2 starts at a switch step nobody knows while editing."""
+        assert up.resolve_phases(H3_MODEL_DEF, 2).staged is False
+        assert up.scheduling_allowed(up.resolve_phases(H3_MODEL_DEF, 2)) is False
+        assert up.resolve_phases({"architecture": "ltxv_13B", "guidance_max_phases": 2}, 2).staged is False
+
+    @pytest.mark.parametrize("model_def, guidance, steps, sampler, expected", [
+        (LTX23_DISTILLED, 2, 8, "", (8, 3)),
+        (LTX23_DISTILLED, 2, 30, "", (8, 3)),        # the counter is locked, and ignored
+        (LTX23_DISTILLED, 1, 8, "", (8,)),           # One Phase skips the refinement
+        (LTX25_DEV, 2, 30, "euler", (30, 3)),
+        (LTX25_DEV, 2, 40, "res2s", (40, 3)),
+        (LTX25_DEV, 2, 30, "distilled_8_steps_ancestral", (8, 3)),
+        (LTX25_DEV, 1, 30, "distilled_8_steps", (8,)),
+        (LTX25_DEV, 2, 0, "euler", ()),              # no counter, nothing to follow
+        (JOYAI_ECHO, 2, 20, "", (8, 3)),
+        (H3_MODEL_DEF, 2, 30, "", ()),
+    ])
+    def test_each_stage_runs_a_known_number_of_steps(self, model_def, guidance, steps, sampler, expected):
+        phases = up.resolve_phases(model_def, guidance)
+        context = up.ScheduleContext.from_native(steps, model_def, phases, sampler)
+        assert context.phase_steps == expected
+        assert context.boundaries_known is bool(expected)
+
+    def _at(self, model_def, guidance, steps, sampler=""):
+        phases = up.resolve_phases(model_def, guidance)
+        return phases, up.ScheduleContext.from_native(steps, model_def, phases, sampler)
+
+    def _settle(self, stack, phases, context):
+        """A payload round in plugin.py's order, resync included."""
+        up.sync_schedules(stack, phases, self.schedules, context)
+        if up.schedules_need_resync(stack, phases, self.schedules, context):
+            up.refit_schedules(stack, phases, self.schedules, self.memory, context)
+            up.sync_schedules(stack, phases, self.schedules, context)
+
+    def test_each_stage_gets_a_timeline_of_its_own_length(self):
+        phases, context = self._at(LTX23_DISTILLED, 2, 8)
+        stack = up.Stack.from_native(["a.safetensors"], "1;1")
+        self._settle(stack, phases, context)
+        for phase, start, end in ((0, 1, 4), (1, 1, 2)):
+            up.schedule_enable(stack, "a.safetensors", phase, phases, self.memory, self.schedules, context)
+            up.schedule_add_region(
+                stack, "a.safetensors", phase, phases, self.memory, self.schedules, context,
+                start=start, end=end,
+            )
+        assert self.schedules[("a.safetensors", 0)].slots == 8
+        assert self.schedules[("a.safetensors", 1)].slots == 3
+        assert stack.tokens[0] == "1,1,1,1,0,0,0,0;1,1,0"
+
+        fields = up.multiplier_fields(stack.tokens[0], phases, "a.safetensors", self.memory, self.schedules, context)
+        first, second = fields["phase_schedules"]
+        assert (first["coordinate_mode"], first["stage"], first["stage_steps"]) == (up.COORD_STAGE_EXACT, 1, 8)
+        assert (second["coordinate_mode"], second["stage"], second["stage_steps"]) == (up.COORD_STAGE_EXACT, 2, 3)
+
+    def test_two_phases_keep_a_schedule_instead_of_zeroing_it(self):
+        """What leaving One Phase still does to every other model."""
+        phases, context = self._at(LTX23_DISTILLED, 2, 8)
+        stack = up.Stack.from_native(["a.safetensors"], "1,1,1,1,0,0,0,0;1,1,0")
+        self._settle(stack, phases, context)
+        assert stack.tokens[0] == "1,1,1,1,0,0,0,0;1,1,0"
+
+    def test_the_step_counter_moves_stage_1_only(self):
+        phases, context = self._at(LTX25_DEV, 2, 30, "euler")
+        stack = up.Stack.from_native(["a.safetensors"], "1;1")
+        self._settle(stack, phases, context)
+        up.schedule_add_region(
+            stack, "a.safetensors", 0, phases, self.memory, self.schedules, context, start=1, end=10,
+        )
+        up.schedule_add_region(
+            stack, "a.safetensors", 1, phases, self.memory, self.schedules, context, start=3, end=3,
+        )
+        assert stack.tokens[0].split(";")[1] == "0,0,1"
+
+        phases, context = self._at(LTX25_DEV, 2, 20, "euler")
+        self._settle(stack, phases, context)
+        stage_1, stage_2 = stack.tokens[0].split(";")
+        assert stage_1 == ",".join(["1"] * 10 + ["0"] * 10)
+        assert stage_2 == "0,0,1"
+
+    def test_a_distilled_sampler_runs_eight_first_stage_steps_whatever_the_counter(self):
+        phases, context = self._at(LTX25_DEV, 2, 30, "distilled_8_steps")
+        stack = up.Stack.from_native(["a.safetensors"], "1;1")
+        self._settle(stack, phases, context)
+        up.schedule_enable(stack, "a.safetensors", 0, phases, self.memory, self.schedules, context)
+        assert self.schedules[("a.safetensors", 0)].slots == 8
+
+    def test_an_imported_stage_2_list_is_resampled_the_way_wangp_plays_it(self):
+        """Six values over a three-step stage: WanGP plays values 1, 3 and 5."""
+        phases, context = self._at(LTX23_DISTILLED, 2, 8)
+        stack = up.Stack.from_native(["a.safetensors"], "1,1,1,1,1,1,1,1;1,1,0.5,0.5,0,0")
+        self._settle(stack, phases, context)
+        assert stack.tokens[0] == "1,1,1,1,1,1,1,1;1,0.5,0"
+
+    def test_a_shared_list_follows_stage_1(self):
+        """No ';' means both stages, each stretched to its own length; the
+        timeline is where it runs one value per step -- stage 1."""
+        phases, context = self._at(LTX23_DISTILLED, 2, 8)
+        stack = up.Stack.from_native(["a.safetensors"], "1,1,1,1,0,0,0,0")
+        self._settle(stack, phases, context)
+        schedule = self.schedules[("a.safetensors", up.SHARED_PHASE)]
+        assert schedule.slots == 8
+        fields = up.multiplier_fields(stack.tokens[0], phases, "a.safetensors", self.memory, self.schedules, context)
+        assert fields["phase_schedules"][0]["coordinate_mode"] == up.COORD_STAGE_EXACT
+        assert stack.tokens[0] == "1,1,1,1,0,0,0,0"
+
+
+class TestPhaseStructureFit:
+    """Switching to fewer phases must leave every token one WanGP accepts."""
+
+    def setup_method(self):
+        self.hidden = {}
+
+    def _fit(self, multipliers, model_def, guidance, ids=("a.safetensors",)):
+        stack = up.Stack.from_native(list(ids), multipliers)
+        phases = up.resolve_phases(model_def, guidance)
+        up.forget_superseded_phases(stack, self.hidden)
+        needed = up.phase_structure_needs_fit(stack, phases, self.hidden)
+        changed = up.fit_phase_structure(stack, phases, self.hidden)
+        assert needed is changed
+        assert up.phase_structure_needs_fit(stack, phases, self.hidden) is False
+        return codec.serialize(stack.tokens, stack.separator_index)
+
+    def test_a_stage_2_schedule_survives_a_trip_through_one_phase(self):
+        one = self._fit("1,1,1,1,0,0,0,0;1,1,0 0.7;0.3", LTX23_DISTILLED, 1, ids=("a.safetensors", "b.safetensors"))
+        # WanGP refuses "x;y" in One Phase; these it accepts.
+        assert one == "1,1,1,1,0,0,0,0 0.7"
+        two = self._fit(one, LTX23_DISTILLED, 2, ids=("a.safetensors", "b.safetensors"))
+        assert two == "1,1,1,1,0,0,0,0;1,1,0 0.7;0.3"
+
+    def test_an_edit_in_one_phase_keeps_what_two_phases_held(self):
+        assert self._fit("0.8;0.4", LTX23_DISTILLED, 1) == "0.8"
+        # Edited while One Phase hid phase 2: still the shape the cut left.
+        assert self._fit("0.5", LTX23_DISTILLED, 2) == "0.5;0.4"
+
+    def test_a_token_that_already_fits_is_not_touched(self):
+        for token in ("1;1", "0.8", "1,0.5;0.2", "1,0.5"):
+            assert self._fit(token, LTX23_DISTILLED, 2) == token
+        assert self._fit("1,0.5", LTX23_DISTILLED, 1) == "1,0.5"
+
+    def test_branch_syntax_and_malformed_tokens_are_never_recut(self):
+        for token in ("0.5:0.9;1", "abc;1"):
+            assert self._fit(token, LTX23_DISTILLED, 1) == token
+
+    def test_a_rewritten_token_forgets_what_was_cut_from_the_old_one(self):
+        """A preset arriving in between must not get somebody else's phase 2."""
+        three = {"guidance_max_phases": 3}
+        assert self._fit("0.9;0.8;0.7", three, 2) == "0.9;0.8"
+        assert self._fit("0.4", three, 2) == "0.4"          # a different token now
+        assert self._fit("0.4", three, 3) == "0.4"          # nothing appended
+
+    def test_narrowing_twice_remembers_everything(self):
+        three = {"guidance_max_phases": 3}
+        assert self._fit("0.9;0.8;0.7", three, 2) == "0.9;0.8"
+        assert self._fit("0.9;0.8", three, 1) == "0.9"
+        assert self._fit("0.9", three, 3) == "0.9;0.8;0.7"
+
+    def test_a_late_event_with_the_old_token_does_not_erase_the_memory(self):
+        """The token the cut was made from, arriving after it, is no rewrite."""
+        assert self._fit("1,1,0;0,0.5,1", LTX23_DISTILLED, 1) == "1,1,0"
+        late = up.Stack.from_native(["a.safetensors"], "1,1,0;0,0.5,1")
+        up.forget_superseded_phases(late, self.hidden)
+        assert self._fit("1,1,0", LTX23_DISTILLED, 2) == "1,1,0;0,0.5,1"
+
+    def test_a_late_token_cut_again_keeps_everything_it_stood_for(self):
+        three = {"guidance_max_phases": 3}
+        assert self._fit("0.9;0.8;0.7", three, 2) == "0.9;0.8"
+        assert self._fit("0.9;0.8", three, 1) == "0.9"
+        # The two-phase token arriving late and being cut once more.
+        assert self._fit("0.9;0.8", three, 1) == "0.9"
+        assert self._fit("0.9", three, 3) == "0.9;0.8;0.7"

@@ -101,15 +101,17 @@ def state():
     return {"model_type": "minimax_h3", "loras": list(LORAS)}
 
 
-def payload_of(plugin, state, selected, multipliers, guidance=2, steps=None):
+def payload_of(plugin, state, selected, multipliers, guidance=2, steps=None, sampler=None):
     instance = plugin._instance("test")
-    return json.loads(plugin._build_payload(instance, state, selected, multipliers, guidance, steps))
+    return json.loads(
+        plugin._build_payload(instance, state, selected, multipliers, guidance, steps, sampler)
+    )
 
 
-def act(plugin, action, state, selected, multipliers, guidance=2, steps=None):
+def act(plugin, action, state, selected, multipliers, guidance=2, steps=None, sampler=None):
     instance = plugin._instance("test")
     choices, mults, payload = plugin._apply_action(
-        instance, json.dumps(action), state, selected, multipliers, guidance, steps
+        instance, json.dumps(action), state, selected, multipliers, guidance, steps, sampler
     )
     return choices, mults, json.loads(payload)
 
@@ -175,6 +177,9 @@ class TestSetup:
         instance = plugin_module.LoraBrowserPlugin()
         instance.setup_ui()
         for name in ("loras_choices", "loras_multipliers", "guidance_phases", "state", "main"):
+            assert name in instance._component_requests
+        # Optional, but what decides the length of an LTX-2 schedule.
+        for name in ("num_inference_steps", "sample_solver"):
             assert name in instance._component_requests
 
     def test_declares_itself_an_extension(self):
@@ -695,6 +700,13 @@ class TestMediaBridge:
         (lora_dir / "a.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
         result = self.ask(plugin, state, {"kind": "video", "id": "a.safetensors"})
         assert result["data"].startswith("data:video/mp4;base64,")
+
+    def test_a_video_is_typed_by_its_bytes_not_its_name(self, plugin, state, tmp_path):
+        """Civitai names every video .mp4; a WebM saved that way must still play."""
+        lora_dir = self._library(tmp_path)
+        (lora_dir / "a.mp4").write_bytes(b"\x1a\x45\xdf\xa3\x9f\x42\x82\x84webm" + b"\x00" * 64)
+        result = self.ask(plugin, state, {"kind": "video", "id": "a.safetensors"})
+        assert result["data"].startswith("data:video/webm;base64,")
 
     def test_an_oversized_file_is_refused_rather_than_inlined(self, plugin, state, tmp_path, monkeypatch):
         lora_dir = self._library(tmp_path)
@@ -1368,3 +1380,94 @@ class TestStepCountSync:
         schedule = row_of(payload, "a.safetensors")["phase_schedules"][0]
         assert schedule["slots"] == 25
         assert payload["schedules_out_of_sync"] is False
+
+
+LTX23_DISTILLED = {
+    "architecture": "ltx2_22B", "ltx2_pipeline": "distilled", "guidance_max_phases": 2,
+    "visible_phases": 0, "lock_inference_steps": True, "ltx2_22B_class": True,
+}
+LTX25_DEV = {
+    "architecture": "ltx2_25_22B", "guidance_max_phases": 2, "visible_phases": 1,
+    "ltx2_22B_class": True,
+}
+
+
+class TestLtxScheduling:
+    """LTX-2 through the bridge, in WanGP's own default of Two Phases."""
+
+    LORAS = ["a.safetensors", "b.safetensors"]
+
+    @pytest.fixture
+    def ltx(self, plugin):
+        plugin.get_model_def = lambda model_type: LTX23_DISTILLED
+        return plugin
+
+    def _settle(self, plugin, state, multipliers, guidance, steps, sampler=None):
+        """A payload, and the resync the browser answers it with."""
+        payload = payload_of(plugin, state, self.LORAS, multipliers, guidance, steps, sampler)
+        if payload["schedules_out_of_sync"]:
+            _, mults, payload = act(
+                plugin, {"type": "schedule_resync"}, state, self.LORAS, multipliers,
+                guidance, steps, sampler,
+            )
+            multipliers = mults.get("value", multipliers)
+        return multipliers, payload
+
+    def _draw(self, plugin, state, multipliers, phase, start, end, guidance=2, steps=8, sampler=None):
+        act(plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": phase},
+            state, self.LORAS, multipliers, guidance, steps, sampler)
+        _, mults, payload = act(
+            plugin,
+            {"type": "schedule_add_region", "id": "a.safetensors", "phase": phase,
+             "start": start, "end": end},
+            state, self.LORAS, multipliers, guidance, steps, sampler,
+        )
+        return mults.get("value", multipliers), payload
+
+    def test_two_phases_offer_a_timeline_per_stage(self, ltx, state):
+        payload = payload_of(ltx, state, self.LORAS, "1;1 1;1", guidance=2, steps=8)
+        assert payload["scheduling_enabled"] is True
+        assert payload["phase_steps"] == [8, 3]
+        assert payload["phase_boundaries_known"] is True
+
+        multipliers, _ = self._draw(ltx, state, "1;1 1;1", 0, 1, 4)
+        multipliers, payload = self._draw(ltx, state, multipliers, 1, 2, 3)
+        assert multipliers.split()[0] == "1,1,1,1,0,0,0,0;0,1,1"
+
+        first, second = row_of(payload, "a.safetensors")["phase_schedules"]
+        assert (first["slots"], first["stage"], first["stage_count"]) == (8, 1, 2)
+        assert (second["slots"], second["stage"], second["stage_steps"]) == (3, 2, 3)
+        assert first["coordinate_mode"] == second["coordinate_mode"] == "stage_exact"
+
+    def test_a_schedule_is_never_reset_by_two_phases(self, ltx, state):
+        multipliers, payload = self._settle(ltx, state, "1,1,1,1,0,0,0,0;1,1,0 1;1", 2, 8)
+        assert multipliers.split()[0] == "1,1,1,1,0,0,0,0;1,1,0"
+        assert row_of(payload, "a.safetensors")["multiplier_kind"] == "scheduled"
+
+    def test_one_phase_and_back_keeps_every_token_valid_and_restores_stage_2(self, ltx, state):
+        start = "1,1,1,1,0,0,0,0;1,1,0 0.7;0.3"
+        one, payload = self._settle(ltx, state, start, guidance=1, steps=8)
+        # WanGP refuses a ';' token in One Phase; these it accepts.
+        assert one == "1,1,1,1,0,0,0,0 0.7"
+        schedule = row_of(payload, "a.safetensors")["phase_schedules"][0]
+        assert (schedule["slots"], schedule["coordinate_mode"]) == (8, "global_exact")
+        assert payload["schedules_out_of_sync"] is False
+
+        two, _ = self._settle(ltx, state, one, guidance=2, steps=8)
+        assert two == start
+
+    def test_the_distilled_counter_is_ignored_and_the_dev_one_followed(self, plugin, state):
+        plugin.get_model_def = lambda model_type: LTX23_DISTILLED
+        multipliers, _ = self._draw(plugin, state, "1;1 1;1", 0, 1, 2, steps=30)
+        assert len(multipliers.split()[0].split(";")[0].split(",")) == 8
+
+        plugin.get_model_def = lambda model_type: LTX25_DEV
+        plugin.on_model_change(state, "ltx2_25_22B")
+        multipliers, _ = self._draw(plugin, state, "1;1 1;1", 0, 1, 2, steps=30, sampler="euler")
+        assert len(multipliers.split()[0].split(";")[0].split(",")) == 30
+
+        # A distilled sampler runs eight first-stage steps whatever the counter.
+        multipliers, payload = self._settle(plugin, state, multipliers, 2, 30, "distilled_8_steps")
+        assert multipliers.split()[0].split(";")[0] == "1,1,0,0,0,0,0,0"
+        assert payload["phase_steps"] == [8, 3]
+        assert payload["status"] == "Schedules follow the stages: 8 steps, then 3 to refine."
