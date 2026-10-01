@@ -130,16 +130,23 @@ class ScheduleContext:
         return cls(steps=max(0, steps))
 
     def target_slots(self) -> int:
-        """One slot per inference step, or 0 when the step count is unknown.
+        """One slot per inference step, or 0 when there is no count to follow.
 
         Clamped, so a step count beyond what a timeline can hold settles at the
         ceiling instead of never matching and asking to be refitted forever.
+
+        A single step is not followed either.  Cutting a schedule to one step
+        would leave a scalar in the token, which nothing could tell from a plain
+        strength, so the next step count could not bring the rest back -- and
+        WanGP runs a one-step job on the first value of any list, so leaving the
+        list as it is changes nothing that renders.  It matters more than it
+        sounds: typing ``12`` into the step box passes through ``1``.
         """
-        return sch.clamp_slots(self.steps) if self.steps else 0
+        return sch.clamp_slots(self.steps) if self.steps >= sch.MIN_WINDOW else 0
 
     def default_slots(self, shared: bool = False) -> int:
         """Timeline length for a freshly opened schedule."""
-        return self.target_slots() or sch.DEFAULT_SLOTS
+        return sch.clamp_slots(self.steps) if self.steps else sch.DEFAULT_SLOTS
 
 
 def scheduling_allowed(phases: PhaseConfig) -> bool:
@@ -490,7 +497,17 @@ def schedule_payload(
 
     Region ids travel with it; they are an editor concept and never appear in
     the native token.
+
+    Only what the run reaches is sent: a region crossing the end of the run
+    arrives cut there, and one past it not at all, so the timeline shows
+    exactly what WanGP is given.  ``drawn_past_end`` says how far the rest
+    goes, so the panel can say it is kept.
     """
+    shown = sch.visible_regions(schedule)
+    selected = schedule.selected_region_id
+    if not any(region.id == selected for region in shown):
+        selected = shown[0].id if shown else None
+    last = sch.last_drawn_step(schedule)
     return {
         "base": round(float(schedule.base), VALUE_DECIMALS),
         "slots": sch.held_slots(schedule.slots),
@@ -503,9 +520,11 @@ def schedule_payload(
                 "end": int(region.end),
                 "strength": round(float(region.strength), VALUE_DECIMALS),
             }
-            for region in sch.sort_regions(schedule.regions)
+            for region in shown
         ],
-        "selected_region_id": schedule.selected_region_id,
+        "selected_region_id": selected,
+        # The last step drawn on when that is past the end of the run, else 0.
+        "drawn_past_end": last if last > sch.held_slots(schedule.slots) else 0,
         # Every slot no region covers is worth this. It is not a fill the base
         # hides behind: a scheduled phase applies the LoRA only where it is drawn.
         "gap_strength": sch.GAP_STRENGTH,
@@ -720,10 +739,22 @@ def sync_schedules(
 ) -> None:
     """Reconcile held region state with the native tokens.
 
-    Kept when the stored regions still compile to exactly the values in the
-    token -- that is what makes region ids stable across a round trip -- and
-    rebuilt from the token otherwise.  Nothing here writes to the token: an
-    imported schedule is rendered, never re-serialised.
+    Kept when the token is what the stored regions say -- that is what makes
+    region ids stable across a round trip -- and rebuilt from the token
+    otherwise.  Nothing here writes to the token: an imported schedule is
+    rendered, never re-serialised.
+
+    "What the stored regions say" is read at the token's own length, not the
+    schedule's, and against the versions the panel recently wrote as well as
+    the current one.  Both are about the same fact: every event Gradio sends
+    carries the multiplier text as it stood when the event was *sent*.  The step
+    slider fires on every value it passes through, so while it is dragged, or
+    while a step count is typed, the token in hand is routinely a step or a
+    write behind.  Rebuilding the schedule from such a token is how a step
+    change used to stretch it: the rebuild could not know the schedule had been
+    drawn one slot per step, judged it an import because its length disagreed
+    with the counter, and the resync that followed resampled it.  A token that
+    is a window onto this schedule, or onto a version of it, is that schedule.
     """
     live: set[tuple[str, int]] = set()
     if not scheduling_allowed(phases):
@@ -732,6 +763,7 @@ def sync_schedules(
         schedules.clear()
         return
 
+    target = (context or ScheduleContext()).target_slots()
     for position, lora_id in enumerate(stack.ids):
         info = codec.classify(stack.tokens[position], phases.capacity)
         if info.kind == codec.ADVANCED:
@@ -742,13 +774,24 @@ def sync_schedules(
             key = schedule_key(lora_id, phase, shared)
             values = _phase_values(info, phases, lora_id, phase)
             stored = schedules.get(key)
+            held = _recognise(stored, values) if stored is not None else None
 
-            if stored is not None and _tracks(stored, values):
+            if held is not None:
                 live.add(key)
-                if not stored.regions:
+                schedules[key] = held
+                if not held.regions:
                     # Nothing has been drawn yet, so the timeline is free to
                     # follow the step counter the user is currently looking at.
-                    stored.slots = (context or ScheduleContext()).default_slots()
+                    held.slots = (context or ScheduleContext()).default_slots()
+                    continue
+                # The window is wherever the token says it is.  When that is a
+                # step behind the counter, schedules_need_resync says so and
+                # the resync moves it -- from these regions, not this token.
+                held.slots = sch.held_slots(len(values))
+                if target and sch.clamp_slots(held.slots) == target:
+                    # One value per step, on screen right now: whatever this
+                    # schedule's history, slot i is step i from here on.
+                    held.step_aligned = True
                 continue
 
             if len(values) > 1:
@@ -756,20 +799,22 @@ def sync_schedules(
                 # WanGP is the truth, so derive the timeline from the token.
                 live.add(key)
                 rebuilt = sch.reconstruct_schedule(values, raw=info.raw)
-                # Whether slot *i* is step *i* is decided HERE, and it has to
-                # be: this is the last moment the step count that produced the
-                # token is still the one on screen. A token carrying one value
-                # per step was authored against this counter -- by the panel,
-                # in practice -- so a later change to the counter moves the end
-                # of its timeline and leaves every region where it is. A token
-                # of some other length was authored at its own resolution and
-                # is spread across the whole run by WanGP, so it is resampled
-                # into alignment instead, once.
+                # A token the panel did not write: one value per step means it
+                # runs one value per step, so a later change to the counter
+                # moves the end of its timeline and leaves every region where
+                # it is.  A token of some other length was authored at its own
+                # resolution and is spread across the whole run by WanGP, so it
+                # is resampled into alignment instead, once.
                 #
-                # Asking ``dirty`` instead meant asking "has the panel touched
-                # it since it was read", which is false for everything after a
-                # reload -- including a schedule the user drew themselves.
-                rebuilt.step_aligned = len(values) == (context or ScheduleContext()).target_slots()
+                # The panel's own recent tokens do not get here -- _recognise
+                # knows them at any length -- and that is the point: judging
+                # those by their length is what stretched a drawn schedule
+                # whenever a step change arrived in more than one event.
+                rebuilt.step_aligned = len(values) == target
+                if stored is not None:
+                    # Carry the memory over, so a late event with a token the
+                    # panel wrote before this one is still recognised.
+                    rebuilt.history = stored.history
                 schedules[key] = rebuilt
 
     for key in [key for key in schedules if key not in live]:
@@ -834,8 +879,9 @@ def refit_schedules(
     Two different operations, because a slot means two different things:
 
     * a schedule drawn in the panel is step-aligned -- slot *i* is step *i* --
-      so it is **truncated or extended** at the end.  Steps that still exist keep
-      exactly what they had and a new step arrives undefined.
+      so only the **end of its window moves**.  Steps that still exist keep
+      exactly what they had, a new step arrives empty unless something was
+      drawn there before, and steps cut off are hidden rather than deleted.
     * a schedule that arrived from a preset, an .lset file or a hand edit was
       authored at its own resolution, and WanGP spreads it across the whole run.
       Truncating that would change what it renders, so it is **resampled** into
@@ -845,8 +891,7 @@ def refit_schedules(
     truthfully at all, so instead of refitting them this clears them -- see
     ``_clear_schedules_for_phase_mode``.
 
-    ``dirty`` is what tells them apart: it is set the moment the panel edits a
-    schedule, and clear for one that has only ever been read.
+    ``step_aligned`` is what tells them apart; ``sync_schedules`` decides it.
     """
     if not scheduling_allowed(phases):
         return _clear_schedules_for_phase_mode(stack, phases, schedules, memory)
@@ -907,14 +952,49 @@ def _phase_values(info: codec.TokenInfo, phases: PhaseConfig, lora_id: str, phas
     return []
 
 
+def _recognise(stored: sch.PhaseSchedule, values: list[float]) -> sch.PhaseSchedule | None:
+    """The schedule ``values`` came from: ``stored``, a recent version, or None.
+
+    The newest version that fits wins.  A version is put back as a copy that
+    still shares the history, so recognising an old token costs nothing that a
+    newer one would need.
+    """
+    if _tracks(stored, values):
+        return stored
+    # A copy: Gradio runs handlers on worker threads, and an edit appending a
+    # version mid-loop is no reason to miss one.
+    for version in reversed(list(stored.history)):
+        if _tracks(version, values):
+            restored = version.copy()
+            restored.history = stored.history
+            return restored
+    return None
+
+
 def _tracks(schedule: sch.PhaseSchedule, values: list[float]) -> bool:
-    """True when ``schedule`` still says exactly what the token says.
+    """True when the token says what ``schedule`` says, at the token's length.
 
     Compared against what the schedule would *emit*, so a timeline that is open
     but not yet doing anything keeps its slot count and regions instead of being
     rebuilt from the scalar it currently compiles to.
+
+    Compared at the token's own length because the step count is only a window
+    onto a drawn schedule: the same regions read through one step more or less
+    are still the same schedule, and a token a step behind the counter is the
+    normal state of affairs while the step slider moves.  Other lengths stop at
+    what the panel could have written: the editor never cuts a drawn schedule
+    down to one step, so a scalar is somebody's plain strength, and nothing it
+    writes is longer than a timeline can be.
     """
-    emitted = sch.native_values(schedule)
+    if not values:
+        return False
+    own = len(values) == sch.held_slots(schedule.slots)
+    if not schedule.regions:
+        emitted = [float(schedule.base)]
+    elif own or sch.MIN_WINDOW <= len(values) <= sch.MAX_SLOTS:
+        emitted = sch.compile_window(schedule, len(values))
+    else:
+        return False
     if len(emitted) != len(values):
         return False
     return all(_close(left, right) for left, right in zip(emitted, values))
@@ -1058,6 +1138,9 @@ def _commit(
 
     changed = stack.token_for(lora_id) != token
     stack.set_token(lora_id, token)
+    # So that this token, arriving late in some event after a newer one, is
+    # known for the schedule it came from.
+    sch.remember(target.schedule)
     return changed
 
 
@@ -1256,16 +1339,30 @@ def schedule_commit_region(
 
     The frontend sends where the region ended up, not how it got there: the
     gesture is presentation, the bounds are the contract.
+
+    A region crossing the end of the run is dragged as the panel shows it, cut
+    at the end.  If it still reaches the end afterwards -- its left edge moved,
+    or it was put back where it was -- the part past the end, which the gesture
+    could not see, stays as it was.  Moved away from the end or shortened from
+    the right, it is the region the user drew and nothing more.
     """
     target = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=False)
     schedule = target.schedule
     region = schedule.region(region_id)
     if region is None:
         raise sch.ScheduleError("That region no longer exists.")
+    slots = sch.clamp_slots(schedule.slots)
+    if int(region.start) > slots:
+        raise sch.ScheduleError(
+            "That region is past the last step; raise the step count to edit it."
+        )
 
+    shown_width = min(int(region.end), slots) - int(region.start) + 1
     first, last = sch.clamp_region(
-        start, end, schedule.slots, keep_width=keep_width, width=region.width
+        start, end, slots, keep_width=keep_width, width=shown_width
     )
+    if int(region.end) > slots and last == slots:
+        last = int(region.end)
     winner = sch.Region(id=region.id, start=first, end=last, strength=region.strength)
     schedule.regions = sch.resolve_collision(schedule.regions, winner)
     schedule.selected_region_id = winner.id

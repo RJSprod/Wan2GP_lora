@@ -1266,6 +1266,26 @@ class TestStepCountSync:
         written, _ = self._resync(plugin, state, multipliers, 3)
         assert written.split()[0] == "0,0.5,0.5"
 
+    def test_a_shorter_run_and_back_gives_the_schedule_back(self, plugin, state):
+        """Lowering the count hides the end of a schedule; it does not delete it."""
+        multipliers = self._drawn(plugin, state, "1,0.8,0.4,0.2 1;1", 4)
+        shorter, _ = self._resync(plugin, state, multipliers, 2)
+        assert shorter.split()[0] == "1,0.8"
+        restored, _ = self._resync(plugin, state, shorter, 4)
+        assert restored.split()[0] == "1,0.8,0.4,0.2"
+
+    def test_the_timeline_shows_only_what_the_run_reaches(self, plugin, state):
+        """The rest is kept, and the payload says how far it goes."""
+        multipliers = self._drawn(plugin, state, "0,0.5,0.5,0.5,0.5 1;1", 5)
+        written, payload = self._resync(plugin, state, multipliers, 3)
+        schedule = row_of(payload, "a.safetensors")["phase_schedules"][0]
+        assert schedule["slots"] == 3
+        assert [(r["start"], r["end"]) for r in schedule["regions"]] == [(2, 3)]
+        assert schedule["drawn_past_end"] == 5
+
+        _, payload = self._resync(plugin, state, written, 5)
+        assert row_of(payload, "a.safetensors")["phase_schedules"][0]["drawn_past_end"] == 0
+
     def test_the_panel_asks_for_a_resync_and_then_stops(self, plugin, state):
         """The flag drives one round trip, not a loop."""
         multipliers = self._drawn(plugin, state, "1,0.8,0.4,0.2 1;1", 4)

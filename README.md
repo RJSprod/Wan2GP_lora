@@ -197,11 +197,20 @@ How a schedule follows depends on where it came from, because a slot means two
 different things:
 
 - A schedule **drawn in the panel** is step-aligned — slot *i* is step *i* — so
-  it is truncated or extended at the end. Going 4 → 5 steps keeps steps 1–4
-  exactly as they were and leaves step 5 undefined (so, 0, until you draw on it);
-  going 5 → 3 drops steps 4–5 and keeps the rest. A region straddling the new end
-  is clipped to it; one entirely beyond it is gone, and does not come back if you
-  lengthen the run again.
+  the step count only moves where the run ends; nothing on the timeline moves or
+  stretches. Going 4 → 5 steps keeps steps 1–4 exactly as they were and adds an
+  empty step 5 (so, 0, until you draw on it). Going 5 → 3 stops the run after
+  step 3: WanGP is given three values, and a region crossing the new end shows
+  only up to it.
+- **A lower step count hides; it does not delete.** What a shorter run no longer
+  reaches is kept — the timeline says `+2 steps kept` — and raising the count
+  brings it back exactly as it was. So 5 → 3 → 5 is the schedule you started
+  with, and typing `12` over `4`, which passes through `1`, loses nothing.
+  Editing at the lower count still works: a region crossing the end is one
+  region, so a new strength or a delete reaches the part past the end too, while
+  moving it or pulling its right edge in lets that part go. The memory lasts
+  while WanGP runs; a restart or a model switch starts again from the
+  multipliers as they stand.
 - A schedule **that arrived from a preset, an `.lset` file or a hand edit** was
   authored at its own resolution, and WanGP spreads it across the whole run.
   Truncating that would change what it renders, so it is resampled into step
@@ -230,7 +239,8 @@ you make a material edit.
 
 `Slots:` re-grids a schedule to a different resolution by resampling it — what
 you want when a schedule should keep its shape at a different granularity, as
-opposed to the step counter moving, which keeps the steps that still exist.
+opposed to the step counter moving, which never resamples anything. A re-grid
+works on what the run reaches, so it lets go of anything kept past the end.
 
 ### Phases
 

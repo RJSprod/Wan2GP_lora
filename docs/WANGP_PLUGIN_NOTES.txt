@@ -293,6 +293,19 @@ WHY IT TOOK FOUR ROUNDS
     settings recovered from generated media, queue edits and model switches -
     no need to special-case each upstream button.
 
+    Every event's inputs are read when the event is SENT, not when it runs.
+    Gradio 5.29's Slider dispatches "change" from `$: value, handle_change()`,
+    i.e. for every value it passes: each tick of a drag, each keystroke in its
+    number box (typing 12 over 4 sends 1, then 12). A Textbox fires on every
+    programmatic update too. So one step change is a burst of events, separate
+    listeners run in parallel, and the multiplier text a handler is given is
+    routinely a write or two behind what WanGP holds by then. Never infer
+    anything from how a token's length compares with the step count in the
+    same event: recognise the schedule the token came from instead
+    (ui_payloads.sync_schedules) and make every write a pure function of the
+    held state, so a late event can only cause a redundant, identical write.
+    (WanGP's HierarchySelector, loras_choices, only fires on user clicks.)
+
 3.9 Noise you can ignore
     "Too many arguments provided for the endpoint." is a stock Gradio 5.29
     client-side warning emitted for ANY event that passes `inputs`. Reproducible
@@ -375,7 +388,8 @@ ALWAYS RUN THE NEGATIVE TEST
     schedule.py              step-schedule regions: compile, reconstruct,
                              place, resolve collisions (pure, heavily tested).
                              Uncovered slots are 0 -- a scheduled phase applies
-                             the LoRA only where a region says so.
+                             the LoRA only where a region says so. The step
+                             count is a window onto the regions, not a resize.
     ui_payloads.py           state model, phase resolution, action application
     inventory.py             native LoRA list -> displayable entries
     thumbnails.py            preview matching, first-frame decode, cache

@@ -266,9 +266,14 @@ class TestClampAndValidate:
         with pytest.raises(sch.ScheduleError):
             sch.validate_regions([region("A", 1, 5), region("B", 4, 8)], 20)
         with pytest.raises(sch.ScheduleError):
-            sch.validate_regions([region("A", 1, 25)], 20)
+            sch.validate_regions([region("A", 1, sch.MAX_SLOTS + 1)], 20)
         with pytest.raises(sch.ScheduleError):
             sch.validate_regions([region("A", 0, 3)], 20)
+
+    def test_a_region_past_the_end_of_the_run_is_valid(self):
+        """It is kept for a longer run, not out of bounds."""
+        sch.validate_regions([region("A", 1, 25)], 20)
+        sch.validate_regions([region("A", 2, 3), region("B", 22, 25)], 20)
 
     def test_validation_accepts_an_adjacent_pair(self):
         sch.validate_regions([region("A", 1, 4), region("B", 5, 9)], 20)
@@ -316,7 +321,7 @@ class TestNormalisation:
 
 
 class TestRefit:
-    """Slot i is step i, so a step-count change is a tail operation."""
+    """Slot i is step i, so the step count is a window onto the schedule."""
 
     def test_growing_leaves_the_steps_that_existed_alone(self):
         schedule = sch.reconstruct_schedule([1, 0.8, 0.4, 0.2])
@@ -332,25 +337,50 @@ class TestRefit:
         schedule = sch.reconstruct_schedule([1, 0.8, 0.4, 0.2])
         assert sch.compile_schedule(sch.refit_schedule(schedule, 3)) == [1, 0.8, 0.4]
 
-    def test_a_region_straddling_the_new_end_is_clipped(self):
+    def test_a_region_straddling_the_new_end_is_cut_where_the_run_ends(self):
         schedule = sch.PhaseSchedule(base=0.5, slots=6, regions=[region("r1", 2, 5, 0.5)])
         refitted = sch.refit_schedule(schedule, 3)
-        assert [(r.id, r.start, r.end) for r in refitted.regions] == [("r1", 2, 3)]
+        assert sch.compile_schedule(refitted) == [0, 0.5, 0.5]
+        assert bounds(sch.visible_regions(refitted)) == [("r1", 2, 3)]
+        # Cut where WanGP sees it, kept whole here.
+        assert bounds(refitted.regions) == [("r1", 2, 5)]
 
-    def test_a_region_entirely_beyond_the_new_end_is_gone(self):
+    def test_a_region_entirely_beyond_the_new_end_is_hidden_not_deleted(self):
         schedule = sch.PhaseSchedule(
             base=0.5, slots=8,
             regions=[region("r1", 1, 2, 0.5), region("r2", 6, 8, 0.9)],
         )
         refitted = sch.refit_schedule(schedule, 4)
-        assert [(r.id, r.start, r.end) for r in refitted.regions] == [("r1", 1, 2)]
+        assert bounds(sch.visible_regions(refitted)) == [("r1", 1, 2)]
         assert sch.compile_schedule(refitted) == [0.5, 0.5, 0, 0]
+        assert bounds(refitted.regions) == [("r1", 1, 2), ("r2", 6, 8)]
+        assert sch.last_drawn_step(refitted) == 8
 
-    def test_shrinking_past_everything_empties_the_timeline(self):
+    def test_shrinking_past_everything_leaves_nothing_in_view(self):
         schedule = sch.PhaseSchedule(base=0.5, slots=8, regions=[region("r1", 5, 8, 0.9)])
         refitted = sch.refit_schedule(schedule, 3)
-        assert refitted.regions == []
+        assert sch.visible_regions(refitted) == []
         assert refitted.selected_region_id is None
+        # The run never reaches the region, so the LoRA is off for all of it.
+        assert sch.compile_schedule(refitted) == [0, 0, 0]
+
+    def test_raising_the_count_again_brings_back_what_was_cut(self):
+        """The cut is a window, so any path of step counts is reversible."""
+        drawn = sch.PhaseSchedule(
+            base=0.5, slots=6, regions=[region("r1", 1, 2, 0.5), region("r2", 4, 6, 0.9)],
+        )
+        before = sch.compile_schedule(drawn)
+        schedule = drawn
+        for steps in (4, 1, 2, 5, 3, 12, 6):
+            schedule = sch.refit_schedule(schedule, steps)
+        assert sch.compile_schedule(schedule) == before
+        assert bounds(schedule.regions) == bounds(drawn.regions)
+
+    def test_a_longer_run_than_anything_drawn_is_empty_past_it(self):
+        schedule = sch.refit_schedule(
+            sch.PhaseSchedule(base=0.5, slots=4, regions=[region("r1", 3, 6, 0.9)]), 8
+        )
+        assert sch.compile_schedule(schedule) == [0, 0, 0.9, 0.9, 0.9, 0.9, 0, 0]
 
     def test_the_selected_region_survives_when_it_does(self):
         schedule = sch.PhaseSchedule(
