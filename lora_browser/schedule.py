@@ -23,6 +23,14 @@ testable functions rather than inside pointer event handlers.
 Coordinates are 1-based inclusive slot numbers: a region ``start=2, end=5``
 covers the 2nd through 5th value of the phase's list.  Slot numbers are not
 necessarily inference steps -- see ``ui_payloads.coordinate_mode``.
+
+A schedule drawn one slot per step is not resized by the step count; the step
+count is a *window* onto it.  ``slots`` is how much of the schedule the run
+reaches, and a region may lie wholly or partly past it: lowering the step count
+hides what is past the new end rather than deleting it, and raising it again
+brings that back exactly as it was.  So no sequence of step-count changes can
+move or lose anything drawn -- see ``refit_schedule``.  Only what is inside the
+window is ever compiled into the token or shown on the timeline.
 """
 
 from __future__ import annotations
@@ -47,6 +55,16 @@ HARD_MAX_SLOTS = 4096
 #: Used when no better resolution is available: no ``num_inference_steps`` and
 #: no phase boundaries to derive a length from.
 DEFAULT_SLOTS = 20
+
+#: The shortest window a drawn schedule is ever cut to.  One value is a scalar:
+#: written to the token it would be indistinguishable from a plain strength
+#: someone set, so the step count after it could not tell a schedule had been
+#: cut short and bring the rest back.
+MIN_WINDOW = 2
+
+#: Versions of one phase's schedule remembered so that an event arriving with
+#: an older token is recognised rather than rebuilt from; see ``remember``.
+HISTORY_DEPTH = 16
 
 #: "+ Region" aims for roughly a fifth of the timeline (spec: 20-25%).
 REGION_WIDTH_FRACTION = 0.22
@@ -88,7 +106,11 @@ class PhaseSchedule:
     #: strength a new region starts at. Never painted into the gaps between
     #: regions -- those are ``GAP_STRENGTH``.
     base: float = 1.0
+    #: How much of the schedule the run reaches: the length of the value list
+    #: in the token, and of the timeline on screen.
     slots: int = DEFAULT_SLOTS
+    #: May reach past ``slots``. What lies past the end of the run is kept, so
+    #: that raising the step count again brings it back; see ``refit_schedule``.
     regions: list[Region] = field(default_factory=list)
     selected_region_id: str | None = None
     #: The values this schedule was imported from; ``None`` when it was created
@@ -117,6 +139,13 @@ class PhaseSchedule:
     normalization_required: bool = False
     #: Why the schedule is read-only, shown verbatim in the panel.
     reason: str = ""
+    #: Recent versions of this phase's schedule as the panel wrote them, oldest
+    #: first.  Every object that stands for the same phase shares the one list
+    #: (``copy`` and ``replace`` pass it along), so whichever of them an edit
+    #: lands on, the version is recorded where the next sync will look.  Memory
+    #: only: it lasts as long as the process does, which is as long as anything
+    #: past the end of the run needs remembering.
+    history: list["PhaseSchedule"] = field(default_factory=list, repr=False, compare=False)
 
     def region(self, region_id: str) -> Region | None:
         for region in self.regions:
@@ -130,6 +159,12 @@ class PhaseSchedule:
             regions=[replace(region) for region in self.regions],
             source_values=list(self.source_values) if self.source_values is not None else None,
         )
+
+    def snapshot(self) -> "PhaseSchedule":
+        """A copy detached from ``history``, fit to be stored in it."""
+        detached = self.copy()
+        detached.history = []
+        return detached
 
 
 def clamp_slots(slots) -> int:
@@ -192,7 +227,17 @@ def compile_schedule(schedule: PhaseSchedule) -> list[float]:
     regions still gets a deterministic result -- but committed region sets are
     validated to be disjoint, so that case only arises mid-gesture.
     """
-    slots = held_slots(schedule.slots)
+    return compile_window(schedule, schedule.slots)
+
+
+def compile_window(schedule: PhaseSchedule, slots) -> list[float]:
+    """The value list this schedule means over its first ``slots`` steps.
+
+    ``compile_schedule`` is this at the schedule's own window.  Any other
+    window is the same schedule at another step count: a region past the end
+    is simply not reached, and one crossing it contributes the part inside.
+    """
+    slots = held_slots(slots)
     if not schedule.regions:
         return [float(schedule.base)] * slots
 
@@ -203,6 +248,27 @@ def compile_schedule(schedule: PhaseSchedule) -> list[float]:
         for slot in range(start, end + 1):
             values[slot - 1] = float(region.strength)
     return values
+
+
+def visible_regions(schedule: PhaseSchedule) -> list[Region]:
+    """The regions inside the window, cut at its end: what the timeline shows.
+
+    A region the run does not reach is left out, and one crossing the end shows
+    only the part the run reaches.  The cut is a view -- the regions themselves
+    are untouched, which is what lets a longer run bring the rest back.
+    """
+    slots = held_slots(schedule.slots)
+    shown = []
+    for region in sort_regions(schedule.regions):
+        if int(region.start) > slots:
+            continue
+        shown.append(replace(region, end=min(int(region.end), slots)))
+    return shown
+
+
+def last_drawn_step(schedule: PhaseSchedule) -> int:
+    """The last step any region covers, wherever the window ends; 0 if none."""
+    return max((int(region.end) for region in schedule.regions), default=0)
 
 
 def native_values(schedule: PhaseSchedule) -> list[float]:
@@ -474,12 +540,18 @@ def clamp_region(
 
 
 def validate_regions(regions: list[Region], slots: int) -> None:
-    """Raise unless ``regions`` could be committed as-is."""
-    slots = held_slots(slots)
+    """Raise unless ``regions`` could be committed as-is.
+
+    A region may run past ``slots``: that is a schedule kept past the end of a
+    shorter run (see ``refit_schedule``), not an error.  No region can reach
+    past the longest timeline there is, though, because none could have been
+    drawn there.
+    """
+    limit = max(held_slots(slots), MAX_SLOTS)
     previous: Region | None = None
     for region in sort_regions(regions):
-        if int(region.start) < 1 or int(region.end) > slots:
-            raise ScheduleError(f"Region {region.id} lies outside slots 1-{slots}.")
+        if int(region.start) < 1 or int(region.end) > limit:
+            raise ScheduleError(f"Region {region.id} lies outside slots 1-{limit}.")
         if int(region.start) > int(region.end):
             raise ScheduleError(f"Region {region.id} has no length.")
         if not is_finite_number(region.strength):
@@ -510,34 +582,31 @@ def normalize_values(values: list[float], target_slots: int) -> list[float]:
 
 
 def refit_schedule(schedule: PhaseSchedule, target_slots: int) -> PhaseSchedule:
-    """Change the slot count without moving anything that stays.
+    """Move the end of the timeline to ``target_slots``.  Nothing drawn moves.
 
     This is what a change to the inference step count means: slot *i* is step
-    *i*, so growing adds undefined slots at the end and shrinking drops the ones
-    that no longer exist.  A region straddling the new end is clipped to it, and
-    one entirely beyond it is gone.
+    *i*, so the step count only decides how much of the schedule the run
+    reaches.  More steps arrive at the end, empty unless something was drawn
+    there before; fewer steps cut the run short, so the token stops at the new
+    end and the timeline shows a region crossing it only up to there.
+
+    The cut is not a deletion.  Every region is kept as drawn, so raising the
+    step count again brings back exactly what the lower one hid -- and a step
+    count that is only passed through on the way to another, as typing ``12``
+    passes through ``1``, costs nothing.
 
     Deliberately not ``normalize_schedule``: resampling would slide every region
     along the timeline to keep its *proportion* of the run, which is right for a
     schedule spread across the whole run and wrong for one drawn step by step.
     """
     target = clamp_slots(target_slots)
-    kept: list[Region] = []
-    for region in sort_regions(schedule.regions):
-        if int(region.start) > target:
-            continue
-        kept.append(replace(region, end=min(int(region.end), target)))
-
-    rebuilt = replace(
-        schedule,
-        slots=target,
-        regions=kept,
-        selected_region_id=(
-            schedule.selected_region_id
-            if any(region.id == schedule.selected_region_id for region in kept)
-            else (kept[0].id if kept else None)
-        ),
-    )
+    rebuilt = schedule.copy()
+    rebuilt.slots = target
+    shown = visible_regions(rebuilt)
+    if not any(region.id == rebuilt.selected_region_id for region in shown):
+        # The selection is a region the panel can show, so a hidden one hands
+        # it to whatever is still in view.
+        rebuilt.selected_region_id = shown[0].id if shown else None
     rebuilt.dirty = True
     rebuilt.step_aligned = True
     return rebuilt
@@ -548,7 +617,9 @@ def normalize_schedule(schedule: PhaseSchedule, target_slots: int) -> PhaseSched
 
     Resampled from the whole schedule, including the part beyond what a
     timeline would show: an imported list too long to edit must not lose its
-    tail by being re-gridded.
+    tail by being re-gridded.  What is kept past the end of the run is a
+    different thing -- the run does not reach it, so there is nothing of it in
+    the list to resample, and a re-grid lets it go.
     """
     target = clamp_slots(target_slots)
     values = normalize_values(compile_schedule(schedule), target)
@@ -561,4 +632,20 @@ def normalize_schedule(schedule: PhaseSchedule, target_slots: int) -> PhaseSched
     rebuilt.editable = True
     rebuilt.normalization_required = False
     rebuilt.reason = ""
+    rebuilt.history = schedule.history
     return rebuilt
+
+
+def remember(schedule: PhaseSchedule) -> None:
+    """Record ``schedule`` as a version the panel has written to the token.
+
+    WanGP answers every write with change events, and each event carries the
+    multiplier text as it stood when the event was *sent* -- which, while the
+    step slider is being dragged or a strength is being tapped, is routinely a
+    write or two behind.  A token the panel wrote is recognised from here when
+    it comes back late, so the schedule it came from is put back whole,
+    including anything past the end of the run, instead of being rebuilt from
+    the token, which keeps only what the run reaches.
+    """
+    schedule.history.append(schedule.snapshot())
+    del schedule.history[:-HISTORY_DEPTH]

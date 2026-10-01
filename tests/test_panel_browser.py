@@ -16,6 +16,7 @@ import os
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import unquote
 
 import pytest
 
@@ -176,6 +177,10 @@ def _serve(host):
                 host.guidance = int(self.path.rsplit("=", 1)[-1])
                 self._send(json.dumps({"guidance": host.guidance}))
                 return
+            if self.path.startswith("/multipliers"):
+                host.multipliers = unquote(self.path.split("v=", 1)[-1])
+                self._send(json.dumps({"multipliers": host.multipliers}))
+                return
             if self.path == "/":
                 page = PAGE.replace("__CSS__", _asset("lora_browser.css").replace("__NS__", NS))
                 page = page.replace("__SCRIPT__", _asset("lora_browser.js"))
@@ -294,6 +299,24 @@ def repaint(page, ms=1800):
 def set_guidance(page, count):
     """Move WanGP's guidance-phase dropdown."""
     page.evaluate("(n) => fetch('/guidance?n=' + n)", count)
+    settle(page, 250)
+    repaint(page)
+
+
+def set_steps(page, count):
+    """Move WanGP's step counter, then push a payload as its change event does."""
+    page.evaluate("(n) => fetch('/steps?n=' + n)", count)
+    settle(page, 250)
+    repaint(page)
+
+
+def set_token(page, position, token):
+    """Write one LoRA's multiplier the way a preset or a hand edit would."""
+    tokens = native(page).split()
+    tokens[position] = token
+    page.evaluate(
+        "(v) => fetch('/multipliers?v=' + encodeURIComponent(v))", " ".join(tokens)
+    )
     settle(page, 250)
     repaint(page)
 
@@ -731,45 +754,49 @@ class TestPanelInTheBrowser:
 
     def test_the_timeline_follows_the_step_counter(self, panel):
         """The reported issue: change the steps in WanGP, live, and the
-        schedule has to come with it."""
-        page, host, _ = panel
+        schedule has to come with it -- with nothing on it moving."""
+        page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
-
-        def set_steps(count):
-            """Move the counter, then push a payload as WanGP's change does."""
-            page.evaluate("(n) => fetch('/steps?n=' + n)", count)
-            settle(page, 250)
-            page.evaluate("""() => fetch('/payload').then(r => r.json()).then(d => {
-                window.__native = d.multipliers; window.__push(d.payload); })""")
-            settle(page, 1800)
 
         def phase_one():
             return native(page).split()[1].split(";")[0].split(",")
 
         try:
-            # A schedule drawn against a four-step run, as the user described.
-            set_steps(4)
-            draw_region(page, row, at=0.1)
+            # A schedule one value per step of a four-step run, the last step
+            # different so a stretch or a lost step would show.
+            set_steps(page, 4)
+            set_token(page, 1, "0.5,0.5,0.3,0.8;0.7")
+            open_timeline(page, row)
             drawn = schedule_of(page, "lora_02.safetensors")
             assert drawn["slots"] == 4
-            assert drawn["regions"]
-            at_four = phase_one()
-            assert at_four == expected_values(drawn)
+            assert phase_one() == ["0.5", "0.5", "0.3", "0.8"]
+            assert phase_one() == expected_values(drawn)
             assert row.locator(".lb-tick").last.inner_text() == "4"
 
-            # Longer: what was there is inherited, the new step arrives undefined.
-            set_steps(5)
+            # Longer: everything stays where it was, the new step arrives empty.
+            set_steps(page, 5)
             grown = schedule_of(page, "lora_02.safetensors")
             assert grown["slots"] == 5
-            assert phase_one() == at_four + ["0"]
+            assert phase_one() == ["0.5", "0.5", "0.3", "0.8", "0"]
             assert grown["regions"] == drawn["regions"]
+            assert row.locator(".lb-pill-kept").count() == 0
 
-            # Shorter: the steps that are gone are dropped, the rest untouched.
-            set_steps(3)
+            # Shorter: the run stops sooner, and the step it no longer reaches
+            # is kept -- and the timeline says so.
+            set_steps(page, 3)
             assert schedule_of(page, "lora_02.safetensors")["slots"] == 3
-            assert phase_one() == at_four[:3]
+            assert phase_one() == ["0.5", "0.5", "0.3"]
+            kept = row.locator(".lb-pill-kept")
+            assert kept.count() == 1
+            assert kept.inner_text() == "+1 step kept"
+
+            # Back up: exactly what was there at four steps.
+            set_steps(page, 4)
+            assert phase_one() == ["0.5", "0.5", "0.3", "0.8"]
+            assert schedule_of(page, "lora_02.safetensors")["regions"] == drawn["regions"]
+            assert row.locator(".lb-pill-kept").count() == 0
         finally:
-            set_steps(STEPS)
+            set_steps(page, STEPS)
 
     def test_leaving_one_phase_resets_a_scheduled_lora(self, panel):
         """No single strength carries a schedule over, so it switches off."""

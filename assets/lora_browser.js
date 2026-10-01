@@ -1112,7 +1112,7 @@
       var phase = phaseOf(row);
       var schedule = scheduleOf(row, phase);
       var shape = schedule
-        ? schedule.slots + "/" + schedule.editable + "/" +
+        ? schedule.slots + "/" + schedule.editable + "/" + (schedule.drawn_past_end || 0) + "/" +
           (schedule.regions || []).map(function (region) {
             return region.id + "@" + region.start + "-" + region.end;
           }).join(",")
@@ -1683,6 +1683,8 @@
       titles.appendChild(pill(S.phaseLabels[phase] || ("Phase " + (phase + 1))));
     }
     if (schedule) { titles.appendChild(pill(coordinateLabel(schedule))); }
+    var kept = schedule ? keptPastEndPill(schedule) : null;
+    if (kept) { titles.appendChild(kept); }
     head.appendChild(titles);
 
     var actions = document.createElement("div");
@@ -1749,6 +1751,20 @@
     actions.appendChild(close);
     head.appendChild(actions);
     return head;
+  }
+
+  /* A lower step count hides the end of a schedule rather than deleting it,
+     so the timeline says when something is waiting past its last slot. */
+  function keptPastEndPill(schedule) {
+    var last = Number(schedule.drawn_past_end) || 0;
+    if (last <= schedule.slots) { return null; }
+    var more = last - schedule.slots;
+    var label = pill("+" + more + (more === 1 ? " step kept" : " steps kept"));
+    label.className += " lb-pill-kept";
+    label.title = "Steps " + (schedule.slots + 1) + "-" + last + " are past the end of this "
+      + schedule.slots + "-step run. They are kept, not deleted: raise the step count "
+      + "and they come back as they were.";
+    return label;
   }
 
   function coordinateLabel(schedule) {

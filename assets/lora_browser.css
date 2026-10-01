@@ -53,6 +53,12 @@
   color: var(--body-text-color-subdued, var(--body-text-color));
   white-space: nowrap;
 }
+/* Part of the schedule is past the end of the run: kept, not lost. */
+.__NS__ .lb-pill.lb-pill-kept {
+  border-style: dashed;
+  border-color: var(--border-color-accent, var(--color-accent, currentColor));
+  cursor: help;
+}
 .__NS__ .lb-actions {
   display: flex;
   flex-wrap: wrap;

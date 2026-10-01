@@ -405,9 +405,10 @@ class TestScheduleStateModel:
         if up.schedules_need_resync(stack, self.phases, self.schedules, context):
             up.refit_schedules(stack, self.phases, self.schedules, self.memory, context)
             up.sync_schedules(stack, self.phases, self.schedules, context)
+        # What the timeline shows: the run's end cuts it, whatever is kept past.
         return [
             (r.start, r.end, r.strength)
-            for r in sch.sort_regions(self.schedules[("a.safetensors", 0)].regions)
+            for r in sch.visible_regions(self.schedules[("a.safetensors", 0)])
         ]
 
     def test_more_steps_adds_undefined_slots_and_moves_nothing(self):
@@ -437,6 +438,224 @@ class TestScheduleStateModel:
         assert stack.tokens[0] == "0.5,0.5,0.3;0.64"
         assert self._steps(stack, 2) == [(1, 2, 0.5)]
         assert stack.tokens[0] == "0.5,0.5;0.64"
+
+        # The cut was a window, not a deletion: back up, and it is all there.
+        assert self._steps(stack, 4) == [(1, 2, 0.5), (3, 4, 0.3)]
+        assert stack.tokens[0] == "0.5,0.5,0.3,0.3;0.64"
+
+    # -- events as Gradio actually delivers them --------------------------
+    #
+    # Every event carries the multiplier text as it stood when it was *sent*.
+    # The step slider fires for every value it passes, so a step change is a
+    # burst of events, and the token one of them carries is routinely a step or
+    # a write behind the one WanGP holds by the time it is handled.
+
+    KEY = ("a.safetensors", 0)
+
+    def _event(self, multipliers, steps):
+        """A payload build for an event carrying ``multipliers``, current or not.
+
+        Returns whether the payload asks the browser for a resync.
+        """
+        stack = up.Stack.from_native(["a.safetensors"], multipliers)
+        context = up.ScheduleContext(steps=steps)
+        up.sync_schedules(stack, self.phases, self.schedules, context)
+        return up.schedules_need_resync(stack, self.phases, self.schedules, context)
+
+    def _resync(self, multipliers, steps):
+        """The browser's answer: one resync action, built from ``multipliers``
+        the way plugin.py builds it. Returns the multiplier text it writes."""
+        stack = up.Stack.from_native(["a.safetensors"], multipliers)
+        context = up.ScheduleContext(steps=steps)
+        up.sync_schedules(stack, self.phases, self.schedules, context)
+        up.refit_schedules(stack, self.phases, self.schedules, self.memory, context)
+        return codec.serialize(stack.tokens, stack.separator_index)
+
+    def _edit(self, multipliers, steps, apply):
+        """A panel edit made at ``steps``; ``apply`` gets the stack, the visible
+        regions and the context. Returns the multiplier text it writes."""
+        stack = up.Stack.from_native(["a.safetensors"], multipliers)
+        context = up.ScheduleContext(steps=steps)
+        up.sync_schedules(stack, self.phases, self.schedules, context)
+        apply(stack, sch.visible_regions(self.schedules[self.KEY]), context)
+        return codec.serialize(stack.tokens, stack.separator_index)
+
+    def test_a_drag_through_several_counts_never_stretches(self):
+        """The reported bug, as it actually arrives.
+
+        The drag reaches 6 before the resync for 5 has landed, so the event for
+        6 carries the 4-step token. That token used to be rebuilt from, judged
+        an import because four values disagree with six steps, and resampled
+        by the next resync: 0.5,0.5,0.5,0.3,0.3,0 -- and back at 4 the stretched
+        copy was cut, 0.5,0.5,0.5,0.3, never the schedule that was drawn.
+        """
+        stack = self._load("0.5,0.5,0.3,0.3;0.64", 4)
+        drawn = stack.tokens[0]
+        assert self._event(drawn, 5)
+        five = self._resync(drawn, 5)
+        assert five == "0.5,0.5,0.3,0.3,0;0.64"
+
+        self._event(drawn, 6)              # sent before `five` reached WanGP
+        assert self._event(five, 6)
+        six = self._resync(five, 6)
+        assert six == "0.5,0.5,0.3,0.3,0,0;0.64"
+
+        # And dragging back down lands exactly where it started.
+        self._event(six, 5)
+        assert self._event(six, 4)
+        assert self._resync(six, 4) == drawn
+
+    def test_no_order_of_late_events_changes_where_a_drag_lands(self):
+        """Whatever order a burst of step changes lands in, and however late
+        the token each event carries, the run ends on the schedule as drawn,
+        cut or extended at the final count -- never resampled."""
+        import random
+
+        rng = random.Random(20261001)
+        drawn = [0.5, 0.5, 0, 0.3, 0.8, 0.8]
+        start = codec.build_schedule([drawn, [0.64]])
+        for _ in range(300):
+            self.schedules.clear()
+            self._load(start, 6)
+            held = [start]          # every token WanGP has held, oldest first
+            for _ in range(rng.randint(1, 14)):
+                steps = rng.randint(0, 14)
+                if self._event(rng.choice(held[-4:]), steps):
+                    # The resync is built from whatever was current when it
+                    # was sent, which may itself be a write behind.
+                    held.append(self._resync(rng.choice(held[-3:]), steps))
+
+            final = rng.randint(2, 14)
+            self._event(held[-1], final)
+            landed = self._resync(held[-1], final)
+            assert landed == codec.build_schedule([(drawn + [0] * final)[:final], [0.64]])
+
+    def test_typing_a_two_digit_count_loses_nothing(self):
+        """Typing 12 over 4 passes through 1, and 1 used to cut it to one step."""
+        stack = self._load("0.5,0.5,0.3,0.3;0.64", 4)
+        drawn = stack.tokens[0]
+        assert self._event(drawn, 1) is False
+        # Even asked outright, a one-step count is not followed.
+        assert self._resync(drawn, 1) == drawn
+        assert self._event(drawn, 12)
+        assert self._resync(drawn, 12) == "0.5,0.5,0.3,0.3,0,0,0,0,0,0,0,0;0.64"
+
+    def test_lowering_then_raising_the_count_restores_what_was_cut(self):
+        stack = self._load("0.5,0.5,0.3,0.3,0.8;0.64", 5)
+        drawn = stack.tokens[0]
+        four = self._resync(drawn, 4)
+        assert four == "0.5,0.5,0.3,0.3;0.64"
+        assert self._resync(four, 3) == "0.5,0.5,0.3;0.64"
+        assert self._resync("0.5,0.5,0.3;0.64", 5) == drawn
+
+    def test_an_edit_at_the_lower_count_keeps_what_is_past_the_end(self):
+        """What comes back is what was not changed -- next to what was."""
+        stack = self._load("0.5,0.5,0,0.3,0.3,0.3;0.64", 6)
+        four = self._resync(stack.tokens[0], 4)
+        assert four == "0.5,0.5,0,0.3;0.64"
+
+        def strengthen_first(stack, shown, context):
+            up.schedule_set_region_strength(
+                stack, "a.safetensors", 0, shown[0].id, 0.9,
+                self.phases, self.memory, self.schedules, context,
+            )
+
+        edited = self._edit(four, 4, strengthen_first)
+        assert edited == "0.9,0.9,0,0.3;0.64"
+        assert self._resync(edited, 6) == "0.9,0.9,0,0.3,0.3,0.3;0.64"
+
+    def test_a_region_crossing_the_end_is_still_one_region(self):
+        """A new strength reaches the part past the end; a deletion takes it."""
+        stack = self._load("0.9,0,0.5,0.5,0.5;0.64", 5)
+        four = self._resync(stack.tokens[0], 4)
+        assert four == "0.9,0,0.5,0.5;0.64"
+
+        def soften_last(stack, shown, context):
+            up.schedule_set_region_strength(
+                stack, "a.safetensors", 0, shown[-1].id, 0.7,
+                self.phases, self.memory, self.schedules, context,
+            )
+
+        softer = self._edit(four, 4, soften_last)
+        assert self._resync(softer, 5) == "0.9,0,0.7,0.7,0.7;0.64"
+
+        def delete_last(stack, shown, context):
+            up.schedule_delete_region(
+                stack, "a.safetensors", 0, shown[-1].id,
+                self.phases, self.memory, self.schedules, context,
+            )
+
+        four = self._resync("0.9,0,0.7,0.7,0.7;0.64", 4)
+        gone = self._edit(four, 4, delete_last)
+        assert gone == "0.9,0,0,0;0.64"
+        assert self._resync(gone, 5) == "0.9,0,0,0,0;0.64"
+
+    def _commit_last(self, start, end, keep_width):
+        def commit(stack, shown, context):
+            up.schedule_commit_region(
+                stack, "a.safetensors", 0, shown[-1].id, start, end,
+                self.phases, self.memory, self.schedules, context, keep_width=keep_width,
+            )
+        return commit
+
+    def test_moving_a_region_off_the_end_lets_the_rest_go(self):
+        """Moved, it is the region the user placed -- what the run did not
+        reach did not come with it."""
+        stack = self._load("0.9,0,0,0.5,0.5,0.5;0.64", 6)
+        four = self._resync(stack.tokens[0], 4)
+        moved = self._edit(four, 4, self._commit_last(3, 3, keep_width=True))
+        assert moved == "0.9,0,0.5,0;0.64"
+        assert self._resync(moved, 6) == "0.9,0,0.5,0,0,0;0.64"
+
+    def test_a_region_left_reaching_the_end_keeps_the_part_past_it(self):
+        """Its left edge moved or it was put back: the right was never touched."""
+        stack = self._load("0.9,0,0,0.5,0.5,0.5;0.64", 6)
+        four = self._resync(stack.tokens[0], 4)
+
+        widened = self._edit(four, 4, self._commit_last(3, 4, keep_width=False))
+        assert widened == "0.9,0,0.5,0.5;0.64"
+        assert self._resync(widened, 6) == "0.9,0,0.5,0.5,0.5,0.5;0.64"
+
+        four = self._resync("0.9,0,0.5,0.5,0.5,0.5;0.64", 4)
+        unmoved = self._edit(four, 4, self._commit_last(3, 4, keep_width=True))
+        assert unmoved == four
+        assert self._resync(unmoved, 6) == "0.9,0,0.5,0.5,0.5,0.5;0.64"
+
+    def test_a_late_token_from_before_an_edit_keeps_what_is_past_the_end(self):
+        """The edit's own write and an older event land in either order.
+
+        The older token is not what the schedule says any more, so without a
+        memory of what the panel wrote it was rebuilt from -- and a token only
+        carries what the run reaches.
+        """
+        stack = self._load("0.5,0.5,0,0.3,0.3,0.3;0.64", 6)
+        four = self._resync(stack.tokens[0], 4)
+
+        def strengthen_first(stack, shown, context):
+            up.schedule_set_region_strength(
+                stack, "a.safetensors", 0, shown[0].id, 0.9,
+                self.phases, self.memory, self.schedules, context,
+            )
+
+        edited = self._edit(four, 4, strengthen_first)
+        self._event(four, 4)               # sent before the edit landed
+        self._event(edited, 4)
+        assert self._resync(edited, 6) == "0.9,0.9,0,0.3,0.3,0.3;0.64"
+
+    def test_a_plain_strength_is_not_taken_for_a_schedule_cut_short(self):
+        """A preset setting 0.5 is a plain 0.5, even where step 1 says 0.5."""
+        stack = self._load("0.5,0.5,0.3,0.3;0.64", 4)
+        self._resync(self._resync(stack.tokens[0], 5), 4)    # some history
+        assert self._event("0.5;0.64", 4) is False
+        assert self.schedules == {}
+
+    def test_a_list_that_comes_to_fit_the_run_is_step_aligned_from_then_on(self):
+        """A token that lands before its step count does is not an import."""
+        stack = self._load("0.5,0.5,0.3,0.3;0.64", 30)
+        assert self.schedules[self.KEY].step_aligned is False
+        assert self._event(stack.tokens[0], 4) is False
+        assert self.schedules[self.KEY].step_aligned is True
+        assert self._resync(stack.tokens[0], 5) == "0.5,0.5,0.3,0.3,0;0.64"
 
     def test_a_list_authored_at_another_resolution_is_resampled_once(self):
         """The case the other branch is for, and it still works.
