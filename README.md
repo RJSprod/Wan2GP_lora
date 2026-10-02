@@ -26,9 +26,9 @@ thumbnail browser and a real-time strength editor.
   value; tapping one chooses what the strength control and the timeline edit.
 - **Step schedules you can draw.** WanGP's comma multipliers (`1,0.8,0.4,0`) are
   a first-class editing surface: regions you draw, move, resize and re-weight on
-  an inline timeline, one slot per inference step, per phase. Scheduling is a
-  *mode* — it replaces the plain strength control rather than sitting under it.
-  See [Step schedules](#step-schedules).
+  an inline timeline, one slot per inference step, per phase — and on LTX-2, per
+  pipeline stage. Scheduling is a *mode* — it replaces the plain strength
+  control rather than sitting under it. See [Step schedules](#step-schedules).
 - **Image previews first, video previews as a still.** A LoRA with only a video
   preview gets its *first frame* decoded server-side and cached; the video itself
   is never loaded in the browser.
@@ -147,11 +147,30 @@ so a four-slot schedule drawn against a four-step run would be squeezed into
 however many steps phase 1 turns out to be. Rather than draw something WanGP is
 not going to do, the panel does not offer scheduling there at all.
 
-Switching guidance to two or more phases therefore resets a scheduled LoRA to
-**0**: the schedule said the multiplier varies over the run, and no single number
-carries that over, so the LoRA switches off and waits for you to set what you
-want. LoRAs on a plain strength are untouched — that means the same thing in any
-phase mode. Coming back to One Phase keeps each phase's own value.
+**LTX-2 schedules in both modes.** On LTX-2, 2.3 and 2.5 the two phases are not
+cut out of one run at a switch step: they are the pipeline's two stages, each
+running its own fixed sigma table, so each phase's length is known while you
+edit. Phase 1 is the first denoising pass and phase 2 the refinement after the
+upscale, and each gets a timeline of exactly its own length:
+
+| LTX-2 checkpoint | Phase 1 (stage 1) | Phase 2 (stage 2, refine) |
+| --- | --- | --- |
+| Distilled (2.3, 2.5, MSR, JoyAI Echo) | 8 steps, whatever the counter says | 3 steps |
+| Dev, Euler or res2s sampler | the step counter | 3 steps |
+| Dev, a *Distilled 8 Steps* sampler | 8 steps | 3 steps |
+
+One Phase skips the refinement, so phase 1 is the whole run. The timeline header
+says which stage it is (`stage 1 • 8 steps`, `stage 2 (refine) • 3 steps`), and
+the step counter moves stage 1 only. A list with no `;` runs in both stages —
+one value per step in stage 1, squeezed into stage 2's three — so it follows
+stage 1 and is labelled `stages 1+2`.
+
+On every other model, switching guidance to two or more phases resets a
+scheduled LoRA to **0**: the schedule said the multiplier varies over the run,
+and no single number carries that over, so the LoRA switches off and waits for
+you to set what you want. LoRAs on a plain strength are untouched — that means
+the same thing in any phase mode. Coming back to One Phase keeps each phase's
+own value.
 
 **Scheduling replaces the plain strength control.** While a phase is scheduled
 the row has no slider, `+`/`-` or numeric field of its own — the region's
@@ -255,9 +274,15 @@ from a hardcoded model list. For MiniMax H3 that yields:
 | Two Phases with Tiling | Phase 1 + Phase 2 (tiling does not add a third phase) |
 
 Because H3 declares two multiplier phases regardless of guidance mode, a phase 2
-you tuned survives a trip through One Phase inside the native token itself. For
-models whose capacity follows the guidance mode, the plugin remembers the hidden
-value and restores it when the mode comes back.
+you tuned survives a trip through One Phase inside the native token itself.
+
+On models whose phase count follows the guidance mode — LTX-2 among them —
+WanGP refuses a multiplier that names more phases than the mode runs (`1;1` in
+One Phase is an error, not a strength). So the moment the mode narrows, the
+panel rewrites every token to what WanGP accepts, without waiting for an edit,
+and keeps what it cut for the session: switch back and a phase 2 strength or a
+stage-2 schedule returns as it was. Branch syntax and anything else preserved as
+imported is never cut.
 
 WanGP manages H3's phase-two Turbo LoRA itself; the plugin does not compete with
 that. LoRAs WanGP places on the accelerator side of the multiplier string are
@@ -345,6 +370,13 @@ Two things are worth knowing. Only prompts the uploader actually published come
 down — many video LoRAs have none, and those media show without a caption. And
 media is only ever fetched from Civitai's own hosts, with the filename chosen
 here rather than taken from the URL.
+
+Video LoRAs — the LTX-2 line especially — often have nothing but videos on
+Civitai, and Civitai's API names every video `<id>.mp4` whatever was uploaded.
+Each download is therefore saved as what its bytes are, so a WebM stays a WebM
+and plays; a web page or an empty response is reported as a failure rather than
+saved, so the next fetch tries again instead of counting it as done. A tile with
+only a video preview gets its first frame as the thumbnail.
 
 ### Civitai API key
 

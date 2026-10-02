@@ -42,12 +42,24 @@ VALUE_DECIMALS = 4
 #: How schedule slot numbers may be labelled.
 #:
 #: ``GLOBAL_EXACT``  - the timeline really is inference steps 1..N.
+#: ``STAGE_EXACT``   - the timeline is one pipeline stage's steps 1..N, and the
+#:                      plugin knows that stage's length (LTX-2).
 #: ``PHASE_RELATIVE`` - slots inside one phase, whose global step numbers depend
 #:                      on runtime phase boundaries the plugin cannot see.
 #: ``NORMALIZED_READONLY`` - preserved, but not offered for dragging.
 COORD_GLOBAL_EXACT = "global_exact"
+COORD_STAGE_EXACT = "stage_exact"
 COORD_PHASE_RELATIVE = "phase_relative"
 COORD_NORMALIZED_READONLY = "normalized_readonly"
+
+#: LTX-2's stage lengths, as WanGP's ``models/ltx2/ltx_pipelines`` run them.
+#: The first stage runs the eight-step distilled sigma table on a distilled
+#: checkpoint -- or on the Dev checkpoint with a distilled sampler -- and the
+#: step counter otherwise; the refinement stage after the upscale always runs
+#: the three-step stage-2 table, whatever the counter says.
+LTX2_DISTILLED_STEPS = 8
+LTX2_REFINE_STEPS = 3
+LTX2_DISTILLED_SAMPLERS = frozenset({"distilled_8_steps", "distilled_8_steps_ancestral"})
 
 #: Field separator used only inside the canonical fingerprint below.
 _SIGNATURE_SEP = "\x1f"
@@ -68,10 +80,65 @@ class PhaseConfig:
     capacity: int = 1
     #: Sliders the editor shows for the current guidance mode.
     effective: int = 1
+    #: True when every phase is a pipeline stage that runs a known number of
+    #: steps -- LTX-2, where phase 1 is the first denoising pass and phase 2 the
+    #: refinement after the upscale.  Elsewhere a second phase starts at a switch
+    #: step the sampler only settles at generation time.
+    staged: bool = False
 
     @property
     def hidden(self) -> int:
         return max(0, self.capacity - self.effective)
+
+
+def is_ltx2(model_def: dict | None) -> bool:
+    """WanGP's LTX-2 family: LTX-2, 2.3, 2.5 and the checkpoints built on them.
+
+    Recognised by architecture, with the key the LTX-2 handler adds to every
+    model definition it builds as the backstop -- JoyAI Echo runs the same
+    pipelines under an architecture of its own.
+    """
+    model_def = model_def or {}
+    architecture = str(model_def.get("architecture", "") or "")
+    return (
+        architecture.startswith("ltx2")
+        or architecture == "joyai_echo"
+        or "ltx2_22B_class" in model_def
+    )
+
+
+def ltx2_runs_distilled_steps(model_def: dict | None, sampler: Any = "") -> bool:
+    """Whether an LTX-2 first stage runs the fixed distilled table.
+
+    Mirrors the handler: a distilled checkpoint (``ltx2_pipeline`` set to
+    ``distilled``, which JoyAI Echo always is) ignores the step counter, and so
+    does the Dev checkpoint on one of the distilled samplers.
+    """
+    model_def = model_def or {}
+    distilled = (
+        model_def.get("ltx2_pipeline") == "distilled"
+        or str(model_def.get("architecture", "") or "") == "joyai_echo"
+        or bool(model_def.get("joyai_echo", False))
+    )
+    return distilled or str(sampler or "").strip().lower() in LTX2_DISTILLED_SAMPLERS
+
+
+def phase_step_counts(
+    model_def: dict | None, phases: PhaseConfig, steps: int, sampler: Any = ""
+) -> tuple[int, ...]:
+    """How many steps each LoRA phase runs, when the model makes that knowable.
+
+    Empty for everything but LTX-2.  There WanGP expands phase 1's list over
+    the first stage and phase 2's over the refinement stage, each at its own
+    length -- see ``update_loras_slists`` in its two LTX-2 pipelines -- so a
+    timeline per phase can be exact.  One Phase skips the refinement stage.
+    """
+    if not phases.staged:
+        return ()
+    first = LTX2_DISTILLED_STEPS if ltx2_runs_distilled_steps(model_def, sampler) else int(steps or 0)
+    if first <= 0:
+        return ()
+    return (first,) if phases.effective <= 1 else (first, LTX2_REFINE_STEPS)
 
 
 def resolve_phases(model_def: dict | None, guidance_phases_value: Any) -> PhaseConfig:
@@ -104,7 +171,11 @@ def resolve_phases(model_def: dict | None, guidance_phases_value: Any) -> PhaseC
         capacity = guidance_count or 1
     capacity = max(1, capacity)
 
-    return PhaseConfig(capacity=capacity, effective=max(1, min(capacity, guidance_count or 1)))
+    return PhaseConfig(
+        capacity=capacity,
+        effective=max(1, min(capacity, guidance_count or 1)),
+        staged=is_ltx2(model_def),
+    )
 
 
 @dataclass(frozen=True)
@@ -112,25 +183,45 @@ class ScheduleContext:
     """What the editor knows about schedule time coordinates.
 
     ``steps`` is WanGP's ``num_inference_steps`` when the plugin could obtain
-    the component, else 0.  ``boundaries_known`` stays False in v2: a
-    phase-specific schedule is expanded inside a runtime phase interval that
-    depends on model switching and guidance, and labelling slots with global
-    step numbers the plugin cannot verify would be a lie.
+    the component, else 0.  ``phase_steps`` is how many steps each phase runs
+    where the model makes that knowable (``phase_step_counts``: LTX-2's
+    stages); elsewhere it is empty, a phase-specific schedule is expanded inside
+    a runtime interval that depends on model switching, and labelling its slots
+    with step numbers the plugin cannot verify would be a lie.
+    ``boundaries_known`` says which of the two this is.
     """
 
     steps: int = 0
     boundaries_known: bool = False
+    phase_steps: tuple[int, ...] = ()
 
     @classmethod
-    def from_native(cls, steps_value: Any) -> "ScheduleContext":
+    def from_native(
+        cls,
+        steps_value: Any,
+        model_def: dict | None = None,
+        phases: PhaseConfig | None = None,
+        sampler: Any = "",
+    ) -> "ScheduleContext":
         try:
-            steps = int(float(steps_value))
+            steps = max(0, int(float(steps_value)))
         except (TypeError, ValueError):
             steps = 0
-        return cls(steps=max(0, steps))
+        phase_steps = phase_step_counts(model_def, phases, steps, sampler) if phases else ()
+        return cls(steps=steps, boundaries_known=bool(phase_steps), phase_steps=phase_steps)
 
-    def target_slots(self) -> int:
-        """One slot per inference step, or 0 when there is no count to follow.
+    def phase_length(self, phase: int = 0) -> int:
+        """Steps ``phase`` runs, or 0 when nobody can say.
+
+        Without stages only phase 1 has a length, the run's -- which it is only
+        in One Phase, the one mode that schedules then.
+        """
+        if self.phase_steps:
+            return self.phase_steps[phase] if 0 <= phase < len(self.phase_steps) else 0
+        return self.steps if phase == 0 else 0
+
+    def target_slots(self, phase: int = 0) -> int:
+        """One slot per step of ``phase``, or 0 when there is no count to follow.
 
         Clamped, so a step count beyond what a timeline can hold settles at the
         ceiling instead of never matching and asking to be refitted forever.
@@ -142,11 +233,17 @@ class ScheduleContext:
         list as it is changes nothing that renders.  It matters more than it
         sounds: typing ``12`` into the step box passes through ``1``.
         """
-        return sch.clamp_slots(self.steps) if self.steps >= sch.MIN_WINDOW else 0
+        length = self.phase_length(phase)
+        return sch.clamp_slots(length) if length >= sch.MIN_WINDOW else 0
 
-    def default_slots(self, shared: bool = False) -> int:
-        """Timeline length for a freshly opened schedule."""
-        return sch.clamp_slots(self.steps) if self.steps else sch.DEFAULT_SLOTS
+    def default_slots(self, shared: bool = False, phase: int = 0) -> int:
+        """Timeline length for a freshly opened schedule.
+
+        A shared list is stretched over every stage it runs in, so it follows
+        the first: that is where it runs one value per step.
+        """
+        length = self.phase_length(0 if shared else phase)
+        return sch.clamp_slots(length) if length else sch.DEFAULT_SLOTS
 
 
 def scheduling_allowed(phases: PhaseConfig) -> bool:
@@ -160,15 +257,20 @@ def scheduling_allowed(phases: PhaseConfig) -> bool:
     covers every step: a list of ``num_inference_steps`` values runs one value
     per step, exactly as drawn.
 
-    With two or more guidance phases, phase 1 covers only up to
+    With two or more guidance phases, phase 1 usually covers only up to
     ``model_switch_step`` -- derived at generation time from the sampler's
     timesteps and the switch threshold, and not knowable while editing.  A
     four-slot schedule drawn against a four-step run would be squeezed into
     however many steps phase 1 turns out to be, so the timeline would be showing
     something WanGP is not going to do.  Rather than draw that, the editor does
     not offer scheduling at all there.
+
+    LTX-2 is the exception, and it is why ``staged`` exists.  Its phases are
+    not cut out of one run at a switch step; each is a pipeline stage that
+    runs its own sigma table, with a length known while editing.  A list as
+    long as its stage runs one value per step there, in either mode.
     """
-    return phases.effective <= 1
+    return phases.effective <= 1 or phases.staged
 
 
 SCHEDULING_DISABLED_REASON = (
@@ -480,7 +582,7 @@ def _visible_schedules(
     for phase in range(max(1, phases.effective)):
         stored = schedules.get(schedule_key(lora_id, phase, shared))
         result.append(
-            schedule_payload(stored, shared=shared, phases=phases, context=context)
+            schedule_payload(stored, shared=shared, phases=phases, context=context, phase=phase)
             if stored is not None else None
         )
     return result
@@ -492,6 +594,7 @@ def schedule_payload(
     shared: bool,
     phases: PhaseConfig,
     context: ScheduleContext | None,
+    phase: int = 0,
 ) -> dict[str, Any]:
     """One phase's schedule, as the frontend consumes it.
 
@@ -502,17 +605,29 @@ def schedule_payload(
     arrives cut there, and one past it not at all, so the timeline shows
     exactly what WanGP is given.  ``drawn_past_end`` says how far the rest
     goes, so the panel can say it is kept.
+
+    On a staged model the schedule also says which stage it drives and how
+    long that stage is, so the timeline can be labelled with what runs.
     """
     shown = sch.visible_regions(schedule)
     selected = schedule.selected_region_id
     if not any(region.id == selected for region in shown):
         selected = shown[0].id if shown else None
     last = sch.last_drawn_step(schedule)
+    stage = 0 if shared else phase
+    staged = bool(phases.staged and context and context.phase_steps)
     return {
         "base": round(float(schedule.base), VALUE_DECIMALS),
         "slots": sch.held_slots(schedule.slots),
-        "coordinate_mode": coordinate_mode(schedule, shared=shared, phases=phases, context=context),
+        "coordinate_mode": coordinate_mode(
+            schedule, shared=shared, phases=phases, context=context, phase=phase
+        ),
         "steps": int(context.steps) if context else 0,
+        # 1-based stage this timeline drives, the stages that run, and how many
+        # steps this one is; all 0 where the model has no stages to speak of.
+        "stage": stage + 1 if staged else 0,
+        "stage_count": len(context.phase_steps) if staged else 0,
+        "stage_steps": context.phase_length(stage) if staged else 0,
         "regions": [
             {
                 "id": region.id,
@@ -545,6 +660,7 @@ def coordinate_mode(
     shared: bool,
     phases: PhaseConfig,
     context: ScheduleContext | None,
+    phase: int = 0,
 ) -> str:
     """Decide what slot numbers may claim to be.
 
@@ -552,13 +668,20 @@ def coordinate_mode(
     whole run at one slot per step.  Everything else says so: guessing phase
     boundaries from equal percentages would mislabel every model whose switch
     point is not exactly halfway.
+
+    A staged model's phase is a stage of known length, so a timeline exactly
+    that long is exact within its stage -- and when the stage is the whole run
+    (LTX-2 in One Phase), within the run.
     """
     if not schedule.editable:
         return COORD_NORMALIZED_READONLY
+    slots = sch.held_slots(schedule.slots)
+    if phases.staged and context and context.phase_steps:
+        if slots != context.phase_length(0 if shared else phase):
+            return COORD_PHASE_RELATIVE
+        return COORD_GLOBAL_EXACT if len(context.phase_steps) == 1 else COORD_STAGE_EXACT
     steps = int(context.steps) if context else 0
-    if shared and steps and sch.held_slots(schedule.slots) == steps:
-        return COORD_GLOBAL_EXACT
-    if context and context.boundaries_known and steps:
+    if shared and steps and slots == steps:
         return COORD_GLOBAL_EXACT
     return COORD_PHASE_RELATIVE
 
@@ -616,6 +739,133 @@ def normalize_stack_tokens(stack: "Stack", phases: PhaseConfig, memory: dict[str
             stack.tokens[position] = token
             changed = True
     return changed
+
+
+# ------------------------------------------------------- phase structure
+#
+# On a model whose LoRA phases follow the guidance mode -- LTX-2 among them --
+# switching Two Phases to One leaves every "a;b" token declaring a phase the
+# run no longer has, and WanGP refuses the whole multiplier string for it
+# ("there should be at most 1 phases").  normalize_stack_tokens fixes simple
+# tokens, but only on the next edit, and it never touches a schedule.  These
+# fit every token to the mode as soon as the mode changes, and keep what they
+# cut so the mode coming back restores it.
+
+
+def _value_list(part: str) -> bool:
+    """A phase part WanGP reads as numbers: one value or a comma list."""
+    entries = [entry.strip() for entry in str(part).split(",")]
+    return bool(entries) and all(is_finite_number(entry) for entry in entries)
+
+
+#: lora id -> (parts the cut kept, the parts it removed, in order).
+HiddenPhases = dict[str, tuple[int, list[str]]]
+
+
+def _phase_parts(token: str) -> list[str] | None:
+    """The ``;`` parts of a token this may re-cut, or ``None`` to leave it be.
+
+    Branch syntax and anything malformed are never re-cut: those stay exactly
+    as imported.
+    """
+    raw = str(token or "").strip()
+    if not raw or ":" in raw:
+        return None
+    parts = [part.strip() for part in raw.split(";")]
+    return parts if all(_value_list(part) for part in parts) else None
+
+
+def _remembered_phases(parts: list[str] | None, memory) -> list[str] | None:
+    """Every phase ``parts`` stands for, given what a cut took -- or ``None``
+    when the memory is not about this token.
+
+    It is about the token the cut left (exactly ``kept`` parts) and about any
+    longer form of it whose extra parts are the ones the cut removed: the
+    token the cut was made from, arriving late in some event.
+    """
+    if parts is None or memory is None:
+        return None
+    kept, removed = memory
+    extra = len(parts) - kept
+    if extra < 0 or parts[kept:] != list(removed[:extra]):
+        return None
+    return parts + list(removed[extra:])
+
+
+def _fitted_token(token: str, lora_id: str, phases: PhaseConfig, hidden: HiddenPhases):
+    """``(token, memory)`` for this phase mode, or ``None`` when it fits.
+
+    Parts beyond the mode are cut, and the memory says how many parts were
+    kept and what went -- including anything an earlier, narrower cut took.
+    A token the memory is about gets the cut parts back once the mode is wide
+    enough for them.  Anything else with fewer parts than the mode is left
+    alone: WanGP spreads its last part over the phases it does not name, which
+    is valid and was someone's choice.
+    """
+    parts = _phase_parts(token)
+    if parts is None:
+        return None
+
+    capacity = max(1, phases.capacity)
+    full = _remembered_phases(parts, hidden.get(normalize_id(lora_id))) or parts
+    if len(parts) > capacity:
+        return ";".join(parts[:capacity]), (capacity, full[capacity:])
+    if len(full) > len(parts) and capacity > len(parts):
+        restored, rest = full[:capacity], full[capacity:]
+        return ";".join(restored), ((len(restored), rest) if rest else None)
+    return None
+
+
+def phase_structure_needs_fit(stack: "Stack", phases: PhaseConfig, hidden: HiddenPhases) -> bool:
+    """True when some token declares phases the mode does not run, or could
+    get back what a narrower mode took from it."""
+    return any(
+        _fitted_token(token, lora_id, phases, hidden) is not None
+        for lora_id, token in zip(stack.ids, stack.tokens)
+    )
+
+
+def fit_phase_structure(stack: "Stack", phases: PhaseConfig, hidden: HiddenPhases) -> bool:
+    """Make every token declare a phase structure WanGP accepts in this mode.
+
+    Returns ``True`` when any token changed.  What a cut removes is kept in
+    ``hidden`` verbatim -- a stage-2 schedule as readily as a scalar -- and
+    handed back when the mode widens again.
+    """
+    changed = False
+    for position, lora_id in enumerate(stack.ids):
+        fitted = _fitted_token(stack.tokens[position], lora_id, phases, hidden)
+        if fitted is None:
+            continue
+        token, memory = fitted
+        key = normalize_id(lora_id)
+        if memory is not None:
+            hidden[key] = memory
+        else:
+            hidden.pop(key, None)
+        if token != stack.tokens[position]:
+            stack.tokens[position] = token
+            changed = True
+    return changed
+
+
+def forget_superseded_phases(stack: "Stack", hidden: HiddenPhases) -> None:
+    """Drop the memory of a cut whose token no longer looks as the cut left it.
+
+    Something else rewrote it -- an edit filling every phase, a preset, a
+    profile -- and parts cut from the old token must not be appended to a new
+    one that has nothing to do with them.
+
+    The token the cut was made from is not "something else": an event sent
+    before the cut landed carries it, and it is recognisable -- its extra parts
+    are exactly the ones removed.  Forgetting on that would lose a stage-2
+    schedule to nothing more than event timing.
+    """
+    for lora_id, token in zip(stack.ids, stack.tokens):
+        key = normalize_id(lora_id)
+        memory = hidden.get(key)
+        if memory is not None and _remembered_phases(_phase_parts(token), memory) is None:
+            del hidden[key]
 
 
 def set_phase_value(
@@ -763,7 +1013,7 @@ def sync_schedules(
         schedules.clear()
         return
 
-    target = (context or ScheduleContext()).target_slots()
+    context = context or ScheduleContext()
     for position, lora_id in enumerate(stack.ids):
         info = codec.classify(stack.tokens[position], phases.capacity)
         if info.kind == codec.ADVANCED:
@@ -775,6 +1025,7 @@ def sync_schedules(
             values = _phase_values(info, phases, lora_id, phase)
             stored = schedules.get(key)
             held = _recognise(stored, values) if stored is not None else None
+            target = context.target_slots(phase)
 
             if held is not None:
                 live.add(key)
@@ -782,7 +1033,7 @@ def sync_schedules(
                 if not held.regions:
                     # Nothing has been drawn yet, so the timeline is free to
                     # follow the step counter the user is currently looking at.
-                    held.slots = (context or ScheduleContext()).default_slots()
+                    held.slots = context.default_slots(shared, phase)
                     continue
                 # The window is wherever the token says it is.  When that is a
                 # step behind the counter, schedules_need_resync says so and
@@ -850,7 +1101,7 @@ def schedules_need_resync(
     schedules: dict[tuple[str, int], sch.PhaseSchedule],
     context: ScheduleContext | None,
 ) -> bool:
-    """True when some timeline is not the length the step counter says."""
+    """True when some timeline is not the length its phase runs."""
     if not scheduling_allowed(phases):
         # Any schedule still in a token has to go; see refit_schedules.
         return any(
@@ -858,13 +1109,12 @@ def schedules_need_resync(
             for token in stack.tokens
         )
 
-    target = (context or ScheduleContext()).target_slots()
-    if not target:
-        return False
-    return any(
-        sch.clamp_slots(schedule.slots) != target
-        for _, _, _, schedule in _drawn_schedules(stack, phases, schedules)
-    )
+    context = context or ScheduleContext()
+    for _, phase, _, schedule in _drawn_schedules(stack, phases, schedules):
+        target = context.target_slots(phase)
+        if target and sch.clamp_slots(schedule.slots) != target:
+            return True
+    return False
 
 
 def refit_schedules(
@@ -896,13 +1146,13 @@ def refit_schedules(
     if not scheduling_allowed(phases):
         return _clear_schedules_for_phase_mode(stack, phases, schedules, memory)
 
-    target = (context or ScheduleContext()).target_slots()
-    if not target:
-        return False
-
+    context = context or ScheduleContext()
     changed = False
     for lora_id, phase, key, schedule in list(_drawn_schedules(stack, phases, schedules)):
-        if sch.clamp_slots(schedule.slots) == target:
+        # Each phase follows its own length: on LTX-2 the refinement stage is
+        # three steps whatever the counter says.
+        target = context.target_slots(phase)
+        if not target or sch.clamp_slots(schedule.slots) == target:
             continue
         schedules[key] = (
             sch.refit_schedule(schedule, target) if schedule.step_aligned
@@ -1062,7 +1312,7 @@ def _resolve(
         base = float(values[0]) if values else 1.0
         schedule = sch.PhaseSchedule(
             base=base,
-            slots=(context or ScheduleContext()).default_slots(shared),
+            slots=(context or ScheduleContext()).default_slots(shared, index),
             regions=[],
             # Opened at the step count, so it is step-aligned before anything
             # is drawn on it.

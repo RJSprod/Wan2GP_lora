@@ -207,9 +207,35 @@ def _atomic_write_json(path: str, payload: Any) -> None:
     _atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
 
 
-def _extension_for(url: str, content_type: str, declared_kind: str) -> str:
-    """Pick a safe extension from the URL, the Content-Type, then the record."""
+#: Extensions that name the same format, so a ``.jpeg`` URL serving JPEG bytes
+#: keeps the name it was given.
+_SAME_FORMAT = {".jpeg": ".jpg", ".m4v": ".mp4"}
+
+
+def _same_format(left: str, right: str) -> bool:
+    return _SAME_FORMAT.get(left, left) == _SAME_FORMAT.get(right, right)
+
+
+def _looks_like_a_page(head: bytes) -> bool:
+    """An HTML or JSON document where media was expected: an error page or a
+    login wall served with a 200, which must not be saved as if it were media
+    -- on disk it would count as downloaded and never be fetched again."""
+    text = bytes(head or b"").lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    return text.startswith((b"<!doctype", b"<html", b"<?xml", b"<head", b"<body", b"{", b"["))
+
+
+def _extension_for(url: str, content_type: str, declared_kind: str, head: bytes = b"") -> str:
+    """Pick a safe extension: the bytes, then the URL, the Content-Type, the record.
+
+    What the first bytes are decides when they are recognisable -- the URL's
+    own extension is kept only when it names that same format -- because
+    Civitai names every video ``<id>.mp4`` whatever was uploaded, and a WebM
+    or QuickTime file saved as ``.mp4`` is a video the panel then mislabels.
+    """
     suffix = os.path.splitext(urlparse(url).path)[1].lower()
+    _, sniffed = cat.sniff_media(head)
+    if sniffed:
+        return suffix if suffix in _MEDIA_EXTENSIONS and _same_format(suffix, sniffed) else sniffed
     if suffix in _MEDIA_EXTENSIONS:
         return suffix
 
@@ -269,8 +295,16 @@ def download_media(
             request = Request(url, headers=headers, method="GET")
 
             with urlopen(request, timeout=timeout) as response:
+                # The first chunk is read before anything is named, so the
+                # bytes can say what they are.
+                chunk = response.read(DOWNLOAD_CHUNK)
+                if not chunk:
+                    return "", "Civitai sent an empty file"
+                if _looks_like_a_page(chunk[: cat.SNIFF_BYTES]):
+                    return "", "Civitai sent a web page instead of the media"
                 extension = _extension_for(
-                    url, response.headers.get("Content-Type", ""), declared_kind
+                    url, response.headers.get("Content-Type", ""), declared_kind,
+                    chunk[: cat.SNIFF_BYTES],
                 )
                 if not extension:
                     return "", "unrecognised media type"
@@ -279,14 +313,12 @@ def download_media(
                 partial = destination + ".part"
                 written = 0
                 with open(partial, "wb") as out:
-                    while True:
-                        chunk = response.read(DOWNLOAD_CHUNK)
-                        if not chunk:
-                            break
+                    while chunk:
                         written += len(chunk)
                         if written > MEDIA_SIZE_LIMIT:
                             raise _TooLarge
                         out.write(chunk)
+                        chunk = response.read(DOWNLOAD_CHUNK)
 
             os.replace(partial, destination)
             partial = ""

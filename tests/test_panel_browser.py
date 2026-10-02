@@ -15,6 +15,7 @@ import json
 import os
 import socket
 import threading
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote
 
@@ -226,28 +227,62 @@ def _chromium():
 
 
 @pytest.fixture(scope="module")
-def panel(tmp_path_factory):
+def chromium():
+    """One browser for the module: Playwright's sync API allows a single
+    session per thread, so every panel opens a page in this one."""
     executable = _chromium()
     if not executable:
         pytest.skip("no Chromium build available for Playwright")
-
-    host = _Host(tmp_path_factory.mktemp("browser"))
-    server, url = _serve(host)
     with sync_playwright() as pw:
         browser = pw.chromium.launch(executable_path=executable, args=["--no-sandbox"])
-        page = browser.new_page(viewport={"width": 1100, "height": 1000})
-        problems = []
-        page.on("console", lambda msg: problems.append(msg.text)
-                if msg.type == "error" and "favicon" not in msg.text and "404" not in msg.text
-                else None)
-        page.on("pageerror", lambda error: problems.append(str(error)))
-        page.on("dialog", lambda dialog: dialog.accept())
+        yield browser
+        browser.close()
+
+
+@contextmanager
+def _open_panel(browser, host):
+    """A page on the harness, serving ``host``."""
+    server, url = _serve(host)
+    page = browser.new_page(viewport={"width": 1100, "height": 1000})
+    problems = []
+    page.on("console", lambda msg: problems.append(msg.text)
+            if msg.type == "error" and "favicon" not in msg.text and "404" not in msg.text
+            else None)
+    page.on("pageerror", lambda error: problems.append(str(error)))
+    page.on("dialog", lambda dialog: dialog.accept())
+    try:
         page.goto(url)
         page.wait_for_selector(".lb-row", timeout=15000)
         page.wait_for_timeout(400)
         yield page, host, problems
-        browser.close()
-    server.shutdown()
+    finally:
+        page.close()
+        server.shutdown()
+
+
+@pytest.fixture(scope="module")
+def panel(chromium, tmp_path_factory):
+    with _open_panel(chromium, _Host(tmp_path_factory.mktemp("browser"))) as opened:
+        yield opened
+
+
+#: LTX-2.3 Distilled as WanGP's get_model_def describes it: two phases at most,
+#: and they are the pipeline's stages.
+LTX_MODEL_DEF = {
+    "architecture": "ltx2_22B", "ltx2_pipeline": "distilled", "guidance_max_phases": 2,
+    "visible_phases": 0, "lock_inference_steps": True, "ltx2_22B_class": True,
+}
+
+
+@pytest.fixture(scope="module")
+def ltx_panel(chromium, tmp_path_factory):
+    """The same harness on LTX-2.3 Distilled, in WanGP's default Two Phases."""
+    host = _Host(tmp_path_factory.mktemp("browser-ltx"))
+    host.plugin.get_model_def = lambda model_type: LTX_MODEL_DEF
+    host.steps, host.guidance = 8, 2
+    host.multipliers = "1;1 1;1 0.5:0.9"
+    with _open_panel(chromium, host) as opened:
+        yield opened
 
 
 def native(page):
@@ -835,4 +870,49 @@ class TestPanelInTheBrowser:
 
     def test_nothing_raised_in_the_browser(self, panel):
         page, _, problems = panel
+        assert problems == []
+
+
+class TestLtxInTheBrowser:
+    """LTX-2 in the real frontend: its phases are stages, each a timeline."""
+
+    def test_each_stage_is_a_timeline_of_its_own_length(self, ltx_panel):
+        page, _, problems = ltx_panel
+        row = page.locator('.lb-row[data-id="lora_01.safetensors"]')
+        assert row.locator(".lb-phase-strip .lb-chip").count() >= 2
+
+        select_phase(page, row, 0)
+        open_timeline(page, row)
+        assert "stage 1 • 8 steps" in row.locator(".lb-sched-titles").inner_text()
+        assert row.locator(".lb-tick").last.inner_text() == "8"
+
+        select_phase(page, row, 1)
+        settle(page, 900)
+        assert "stage 2 (refine) • 3 steps" in row.locator(".lb-sched-titles").inner_text()
+        assert row.locator(".lb-tick").last.inner_text() == "3"
+
+        # A tap on the refinement's last step lands in the token's second part.
+        timeline = row.locator(".lb-timeline")
+        timeline.scroll_into_view_if_needed()
+        settle(page, 200)
+        box = timeline.bounding_box()
+        page.mouse.click(box["x"] + box["width"] * 0.85, box["y"] + box["height"] / 2)
+        settle(page, 1300)
+        assert native(page).split()[0] == "1;0,0,1"
+        assert problems == []
+
+    def test_one_phase_and_back_restores_the_refinement_schedule(self, ltx_panel):
+        page, _, problems = ltx_panel
+        set_token(page, 1, "1,1,1,1,0,0,0,0;0,0.5,1")
+        try:
+            set_guidance(page, 1)
+            settle(page, 900)
+            # The only token WanGP accepts in One Phase: stage 1's schedule.
+            assert native(page).split()[1] == "1,1,1,1,0,0,0,0"
+            schedule = schedule_of(page, "lora_02.safetensors")
+            assert (schedule["slots"], schedule["coordinate_mode"]) == (8, "global_exact")
+        finally:
+            set_guidance(page, 2)
+            settle(page, 900)
+        assert native(page).split()[1] == "1,1,1,1,0,0,0,0;0,0.5,1"
         assert problems == []

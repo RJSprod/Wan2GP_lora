@@ -474,3 +474,172 @@ class TestSummaryRoundTrip:
         fields, words = cat.parse_summary(text)
         assert words == []
         assert fields["civitai_name"] == "Live Wallpaper Style"
+
+
+# --------------------------------------------------------------------- LTX-2
+#
+# Shaped on what Civitai's API actually returns for a version looked up by
+# hash (src/pages/api/v1/model-versions/[id].ts, prepareModelVersionResponse):
+# up to ten media records, each with its type, size and generation ``meta``,
+# and a URL built by getEdgeUrl with ``original=true`` and a name of
+# ``<image id>`` plus ``.mp4`` for a video or ``.jpeg`` for an image -- whatever
+# the uploaded file was. LTX-2 LoRAs are video LoRAs, so their media is often
+# nothing but videos, and a prompt is only there when the uploader's file
+# carried one.
+
+EDGE = "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA"
+
+LTX_VERSION = {
+    "id": 2300001,
+    "modelId": 1900001,
+    "name": "v1.0 LTX-2.3",
+    "baseModel": "LTXV 2.3",
+    "trainedWords": ["dolly zoom", "vertigo effect"],
+    "description": "<p>Trained on <b>LTX-2.3</b> 22B. Use <i>1.0</i> in stage 1.</p>",
+    "model": {"name": "Vertigo Dolly Zoom", "type": "LORA"},
+    "images": [
+        {
+            "url": f"{EDGE}/0b7d1c3e-aaaa-4c1f-9a5b-1111/original=true/88001.mp4",
+            "type": "video", "width": 1280, "height": 704, "nsfwLevel": 1,
+            "hasMeta": True,
+            "meta": {"prompt": "dolly zoom on a man in a corridor", "negativePrompt": "static"},
+        },
+        {
+            "url": f"{EDGE}/0b7d1c3e-bbbb-4c1f-9a5b-2222/original=true/88002.mp4",
+            "type": "video", "width": 1280, "height": 704, "nsfwLevel": 1,
+            "hasMeta": True,
+            "meta": {"prompt": "vertigo effect, a lighthouse at dusk"},
+        },
+        {
+            "url": f"{EDGE}/0b7d1c3e-cccc-4c1f-9a5b-3333/original=true/88003.mp4",
+            "type": "video", "width": 704, "height": 1280, "nsfwLevel": 1,
+            "hasMeta": False,
+            "meta": None,
+        },
+    ],
+}
+
+LTX_MODEL = {
+    "id": 1900001,
+    "name": "Vertigo Dolly Zoom",
+    "description": "<h3>Vertigo</h3><p>Camera effect LoRA for LTX-2.3.</p><ul><li>stage 1</li></ul>",
+    "creator": {"username": "frames"},
+}
+
+MP4 = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2avc1mp41" + b"\x00" * 32
+WEBM = b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01\x42\xf7\x81\x01\x42\xf2\x81\x04\x42\xf3\x81\x08\x42\x82\x84webm"
+
+
+class LtxCivitai(FakeCivitai):
+    """LTX-shaped API documents; media bytes chosen per URL."""
+
+    def __init__(self, bodies=None, **kwargs):
+        super().__init__(version=kwargs.get("version", LTX_VERSION), model=kwargs.get("model", LTX_MODEL))
+        self.bodies = bodies or {}
+
+    def __call__(self, request, timeout=None):
+        url = request.full_url
+        for marker, (body, content_type) in self.bodies.items():
+            if marker in url:
+                self.urls.append(url)
+                return _Response(body, content_type)
+        if "image.civitai.com" in url:
+            self.urls.append(url)
+            return _Response(MP4, "video/mp4")
+        return super().__call__(request, timeout)
+
+
+@pytest.fixture
+def ltx_lora(tmp_path):
+    root = tmp_path / "loras" / "ltx2"
+    root.mkdir(parents=True)
+    path = root / "vertigo_dolly_zoom_ltx23.safetensors"
+    path.write_bytes(b"pretend LTX-2.3 weights")
+    return path
+
+
+class TestLtxCatalogue:
+    def test_videos_prompts_and_description_all_arrive(self, ltx_lora, monkeypatch):
+        monkeypatch.setattr(civitai, "urlopen", LtxCivitai())
+        report = civitai.fetch_sidecar(str(ltx_lora))
+        assert report.ok is True
+        assert (report.downloaded, report.failed) == (3, 0)
+
+        detail = cat.read_detail(str(ltx_lora))
+        assert [item.kind for item in detail.media] == ["video", "video", "video"]
+        assert [item.prompt for item in detail.media] == [
+            "dolly zoom on a man in a corridor",
+            "vertigo effect, a lighthouse at dusk",
+            "",
+        ]
+        assert detail.media[0].negative_prompt == "static"
+        assert (detail.media[2].width, detail.media[2].height) == (704, 1280)
+        assert detail.civitai_name == "Vertigo Dolly Zoom"
+        assert detail.base_model == "LTXV 2.3"
+        assert detail.creator == "frames"
+        assert detail.trained_words == ["dolly zoom", "vertigo effect"]
+        assert detail.description == "Vertigo\n\nCamera effect LoRA for LTX-2.3.\n\nstage 1"
+        assert detail.version_description == "Trained on LTX-2.3 22B. Use 1.0 in stage 1."
+        assert detail.civitai_url == "https://civitai.com/models/1900001?modelVersionId=2300001"
+
+    def test_a_video_only_lora_still_gets_a_tile_preview(self, ltx_lora, monkeypatch):
+        from lora_browser.thumbnails import find_preview
+
+        monkeypatch.setattr(civitai, "urlopen", LtxCivitai())
+        civitai.fetch_sidecar(str(ltx_lora))
+        assert (ltx_lora.parent / f"{ltx_lora.stem}.mp4").exists()
+        preview = find_preview(str(ltx_lora), str(ltx_lora.parent))
+        assert preview is not None and preview.kind == "video"
+
+    def test_a_webm_that_civitai_names_mp4_is_saved_as_webm(self, ltx_lora, monkeypatch):
+        """getEdgeUrl names every video .mp4; the bytes say what it is."""
+        monkeypatch.setattr(civitai, "urlopen", LtxCivitai(bodies={"88002": (WEBM, "video/webm")}))
+        civitai.fetch_sidecar(str(ltx_lora))
+        media = sorted(os.listdir(ltx_lora.parent / ltx_lora.stem / "media"))
+        assert "002.webm" in media and "002.mp4" not in media
+        assert cat.read_detail(str(ltx_lora)).media[1].kind == "video"
+
+    def test_a_web_page_is_never_saved_as_media(self, ltx_lora, monkeypatch):
+        """Saved, it would count as downloaded and never be fetched again."""
+        page = b"<!DOCTYPE html><html><body>Just a moment...</body></html>"
+        monkeypatch.setattr(civitai, "urlopen", LtxCivitai(bodies={"88001": (page, "text/html")}))
+        report = civitai.fetch_sidecar(str(ltx_lora))
+        assert report.failed == 1
+        media_dir = ltx_lora.parent / ltx_lora.stem / "media"
+        assert not [name for name in os.listdir(media_dir) if name.startswith("001.") and not name.endswith(".json")]
+        assert "media" in civitai.missing_parts(str(ltx_lora))
+
+    def test_an_empty_download_is_not_saved(self, ltx_lora, monkeypatch):
+        monkeypatch.setattr(civitai, "urlopen", LtxCivitai(bodies={"88003": (b"", "video/mp4")}))
+        report = civitai.fetch_sidecar(str(ltx_lora))
+        assert report.failed == 1
+        assert not civitai.existing_media(str(ltx_lora.parent / ltx_lora.stem / "media"), 3)
+
+
+class TestSniffing:
+    @pytest.mark.parametrize("head, expected", [
+        (b"\xff\xd8\xff\xe0", ("image", ".jpg")),
+        (b"\x89PNG\r\n\x1a\n", ("image", ".png")),
+        (b"GIF89a", ("image", ".gif")),
+        (b"RIFF\x00\x00\x00\x00WEBPVP8 ", ("image", ".webp")),
+        (b"\x00\x00\x00\x1cftypavif", ("image", ".avif")),
+        (MP4, ("video", ".mp4")),
+        (b"\x00\x00\x00\x14ftypqt  ", ("video", ".mov")),
+        (WEBM, ("video", ".webm")),
+        (b"\x1a\x45\xdf\xa3\x93\x42\x82\x88matroska", ("video", ".mkv")),
+        (b"\x00\x00\x00\x18ftypheic", ("", "")),     # a HEIF still, not a video
+        (b"<!DOCTYPE html>", ("", "")),
+        (b"", ("", "")),
+    ])
+    def test_the_bytes_say_what_a_file_is(self, head, expected):
+        assert cat.sniff_media(head) == expected
+
+    def test_a_jpeg_url_serving_jpeg_keeps_its_name(self):
+        assert civitai._extension_for(f"{EDGE}/x/original=true/1.jpeg", "image/jpeg", "image", b"\xff\xd8\xff") == ".jpeg"
+
+    def test_a_video_kept_under_an_image_name_still_reads_as_a_video(self, ltx_lora):
+        """A catalogue an older script built may have done exactly this."""
+        media_dir = ltx_lora.parent / ltx_lora.stem / "media"
+        media_dir.mkdir(parents=True)
+        (media_dir / "001.jpg").write_bytes(MP4)
+        assert cat.read_detail(str(ltx_lora)).media[0].kind == "video"

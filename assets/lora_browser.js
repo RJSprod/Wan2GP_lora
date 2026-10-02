@@ -57,8 +57,12 @@
     valueMax: 10,
     valueDecimals: 4,
     steps: 0,
+    //: Steps each LoRA phase runs, where the model's phases are stages of
+    //  known length (LTX-2); empty elsewhere.
+    phaseSteps: [],
     slotLimits: { min: 1, max: 120, default: 20 },
-    //: Step schedules only mean what they show in One Phase guidance.
+    //: Step schedules only mean what they show in One Phase guidance, or where
+    //  every phase is a stage of known length (LTX-2).
     schedulingEnabled: true,
     schedulingDisabledReason: "",
     profiles: [],
@@ -1098,8 +1102,10 @@
     return found || regions[0] || null;
   }
 
-  /* One phase only: with more, WanGP squeezes each phase's values into that
-     phase, so a timeline would be drawing something it cannot promise. */
+  /* One phase only, unless every phase is a stage of known length (LTX-2): with
+     more, WanGP squeezes each phase's values into a phase whose length nothing
+     knows while editing, so a timeline would be drawing something it cannot
+     promise. */
   function schedulingNote() {
     var note = document.createElement("div");
     note.className = "lb-preserved-note";
@@ -1125,7 +1131,7 @@
     // The step count is in here because the schedule header compares itself
     // against it; a run length change has to reach the row.
     }).join("|") + "#" + S.phases.effective + "#" + S.nameMode + "#" + S.steps
-      + "#" + (S.schedulingEnabled ? "sched" : "nosched");
+      + "#" + S.phaseSteps.join(",") + "#" + (S.schedulingEnabled ? "sched" : "nosched");
   }
 
   function renderRows(force) {
@@ -1384,7 +1390,9 @@
       var sharedNote = document.createElement("span");
       sharedNote.className = "lb-chip lb-chip-static";
       sharedNote.textContent = "≡ Shared schedule";
-      sharedNote.title = "One comma schedule spans the whole run, so every phase uses it";
+      sharedNote.title = S.phaseSteps.length > 1
+        ? "One comma schedule with no ';' runs in both stages: stretched over each stage's steps"
+        : "One comma schedule spans the whole run, so every phase uses it";
       strip.appendChild(sharedNote);
     } else if (values.length > 1 && !scheduling) {
       // Linking acts on the plain strength control, which scheduler mode does
@@ -1682,7 +1690,11 @@
     if ((row.phase_values || []).length > 1 && !row.schedule_shared) {
       titles.appendChild(pill(S.phaseLabels[phase] || ("Phase " + (phase + 1))));
     }
-    if (schedule) { titles.appendChild(pill(coordinateLabel(schedule))); }
+    if (schedule) {
+      var coordinates = pill(coordinateLabel(schedule));
+      coordinates.title = coordinateTitle(schedule);
+      titles.appendChild(coordinates);
+    }
     var kept = schedule ? keptPastEndPill(schedule) : null;
     if (kept) { titles.appendChild(kept); }
     head.appendChild(titles);
@@ -1772,11 +1784,47 @@
     if (schedule.coordinate_mode === "global_exact") {
       return slots + " global steps";
     }
+    if (schedule.coordinate_mode === "stage_exact") {
+      return (schedule.shared ? "stages 1+2" : stageName(schedule.stage)) + " • " + slots + " steps";
+    }
     if (schedule.coordinate_mode === "normalized_readonly") {
       return "read-only • " + slots + " values";
     }
+    if (schedule.stage_count > 1) {
+      return "spread over " + (schedule.shared ? "both stages" : stageName(schedule.stage))
+        + " • " + slots + " values";
+    }
     return (schedule.shared ? "spread over the run • " : "phase-relative • ")
       + slots + " schedule slots";
+  }
+
+  /* LTX-2 runs its phases as pipeline stages: the first denoising pass, then a
+     short refinement after the upscale. */
+  function stageName(stage) {
+    return stage === 2 ? "stage 2 (refine)" : "stage " + stage;
+  }
+
+  function coordinateTitle(schedule) {
+    if (!schedule.stage_count) { return ""; }
+    if (schedule.coordinate_mode !== "stage_exact" && schedule.coordinate_mode !== "global_exact") {
+      return "WanGP stretches these " + schedule.slots + " values over the "
+        + schedule.stage_steps + " steps the stage runs.";
+    }
+    if (schedule.stage_count === 1) {
+      return "One Phase runs a single stage, so slot n is step n of the run.";
+    }
+    var refine = S.phaseSteps[1] || 0;
+    if (schedule.shared) {
+      return "A list with no ';' runs in both stages: one value per step over stage 1's "
+        + schedule.stage_steps + " steps, then squeezed into the " + refine
+        + " refinement steps of stage 2.";
+    }
+    if (schedule.stage === 2) {
+      return "Stage 2 refines the upscaled video and always runs " + schedule.stage_steps
+        + " steps, whatever the step counter says. Slot n is its step n.";
+    }
+    return "Stage 1 is the first denoising pass, " + schedule.stage_steps
+      + " steps. Slot n is its step n.";
   }
 
   /* Resolution is a product decision, so it is offered rather than applied:
@@ -1803,7 +1851,9 @@
     var limits = S.slotLimits || { min: 1, max: 120, default: 20 };
     var options = [];
     var seen = {};
-    [S.steps, 8, 10, 12, 16, 20, 30, 40].forEach(function (value) {
+    // A stage's own length is what "one per step" means for it.
+    var perStep = schedule.stage_steps || S.steps;
+    [perStep, 8, 10, 12, 16, 20, 30, 40].forEach(function (value) {
       var slots = Math.round(Number(value));
       if (!slots || slots < limits.min || slots > limits.max || seen[slots]) { return; }
       seen[slots] = true;
@@ -1813,7 +1863,7 @@
 
     var items = options.map(function (slots) {
       var label = slots + " slots";
-      if (slots === S.steps) { label += "  (one per step)"; }
+      if (slots === perStep) { label += "  (one per step)"; }
       if (slots === schedule.slots) { label = "✓ " + label; }
       return {
         label: label,
@@ -2132,7 +2182,9 @@
   }
 
   function rangeLabel(region, schedule) {
-    var step = schedule && schedule.coordinate_mode === "global_exact";
+    // Within a stage of known length a slot is a step too, just of that stage.
+    var step = schedule && (schedule.coordinate_mode === "global_exact"
+      || schedule.coordinate_mode === "stage_exact");
     if (region.start === region.end) { return (step ? "Step " : "Slot ") + region.start; }
     return (step ? "Steps " : "Slots ") + region.start + "–" + region.end;
   }
@@ -2770,6 +2822,7 @@
     S.valueMax = payload.value_max !== undefined ? payload.value_max : 10;
     S.valueDecimals = payload.value_decimals || 4;
     S.steps = payload.steps || 0;
+    S.phaseSteps = payload.phase_steps || [];
     if (payload.schedule_slot_limits) { S.slotLimits = payload.schedule_slot_limits; }
     S.schedulingEnabled = payload.scheduling_enabled !== false;
     S.schedulingDisabledReason = payload.scheduling_disabled_reason || "";
