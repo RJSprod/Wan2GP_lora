@@ -84,6 +84,22 @@ def _follow_note(context: up.ScheduleContext) -> str:
     return f"Schedules follow {context.phase_length(0)} steps."
 
 
+def _fit_note(phases: up.PhaseConfig, scheduled: bool) -> str:
+    """What fitting the multipliers to a new phase mode says it did.
+
+    ``scheduled`` is whether some token scheduled a phase before the fit: on
+    LTX-2 those are the ones whose stage 2 does not come back.
+    """
+    if not (phases.staged and scheduled):
+        return "Multipliers now match the phase mode; anything it hides comes back with it."
+    if phases.effective > 1:
+        return "Two Phases: scheduled LoRAs keep their stage 1 schedule; stage 2 starts empty."
+    return (
+        "One Phase runs no refinement stage. Back in Two Phases, plain LoRAs get their "
+        "stage 2 strength back and scheduled LoRAs start stage 2 empty."
+    )
+
+
 class InstanceState:
     """Per media-generator tab state. WanGP can build the tab more than once."""
 
@@ -96,8 +112,9 @@ class InstanceState:
         #: does not erase a carefully chosen phase 2.
         self.phase_memory: dict[str, list[float]] = {}
         #: lora id -> the ";" parts a narrower phase mode cut from its token,
-        #: verbatim -- a stage-2 schedule as much as a scalar -- so the mode
-        #: coming back restores them. See ui_payloads.fit_phase_structure.
+        #: verbatim, so the mode coming back restores them -- never an LTX-2
+        #: stage 2 that was scheduled, which starts empty instead. See
+        #: ui_payloads.fit_phase_structure.
         self.hidden_phases: up.HiddenPhases = {}
         #: Snapshot taken by "Disable all"; invalidated when native state moves
         #: on its own, so Restore never overwrites newer settings unnoticed.
@@ -762,8 +779,11 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
             if kind == "schedule_resync":
                 # First the phase structure: a token declaring more phases than
-                # this mode runs is one WanGP refuses outright. The timelines
-                # are then re-derived from what it became before they move.
+                # this mode runs is one WanGP refuses outright, and on LTX-2 a
+                # stage-1 schedule entering Two Phases gets an empty stage 2.
+                # The timelines are then re-derived from what it became before
+                # they move.
+                scheduled = up.has_step_schedule(stack)
                 fitted = up.fit_phase_structure(stack, phases, instance.hidden_phases)
                 if fitted:
                     up.sync_schedules(stack, phases, instance.schedules, context)
@@ -777,9 +797,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                         else "Guidance uses more than one phase; scheduled LoRAs were reset to 0."
                     )
                 elif fitted:
-                    instance.note(
-                        "Multipliers now match the phase mode; anything it hides comes back with it."
-                    )
+                    instance.note(_fit_note(phases, scheduled))
                 return changed or fitted
 
             if kind == "schedule_normalize":

@@ -161,9 +161,16 @@ upscale, and each gets a timeline of exactly its own length:
 
 One Phase skips the refinement, so phase 1 is the whole run. The timeline header
 says which stage it is (`stage 1 • 8 steps`, `stage 2 (refine) • 3 steps`), and
-the step counter moves stage 1 only. A list with no `;` runs in both stages —
-one value per step in stage 1, squeezed into stage 2's three — so it follows
-stage 1 and is labelled `stages 1+2`.
+the step counter moves stage 1 only.
+
+The two stages are never one shared schedule. WanGP would play a list with no
+`;` in both — one value per step in stage 1, then squeezed into stage 2's three
+— and a stage-1 schedule squeezed into the refinement is not something anyone
+drew. So when a schedule from One Phase enters Two Phases, it stays stage 1's
+and **stage 2 starts empty**: `1,1,1,1,0,0,0,0` becomes `1,1,1,1,0,0,0,0;0`, the
+LoRA does not run in the refinement, and Phase 2 opens as an empty three-step
+timeline. A region drawn there starts at full strength. The same goes for a list
+with no `;` that arrives any other way in Two Phases, such as a preset.
 
 On every other model, switching guidance to two or more phases resets a
 scheduled LoRA to **0**: the schedule said the multiplier varies over the run,
@@ -280,9 +287,10 @@ On models whose phase count follows the guidance mode — LTX-2 among them —
 WanGP refuses a multiplier that names more phases than the mode runs (`1;1` in
 One Phase is an error, not a strength). So the moment the mode narrows, the
 panel rewrites every token to what WanGP accepts, without waiting for an edit,
-and keeps what it cut for the session: switch back and a phase 2 strength or a
-stage-2 schedule returns as it was. Branch syntax and anything else preserved as
-imported is never cut.
+and keeps what it cut for the session: switch back and a phase 2 strength
+returns as it was. A scheduled LTX-2 LoRA is the exception: what One Phase cut
+from it is not kept, and back in Two Phases its stage 2 starts empty (see
+above). Branch syntax and anything else preserved as imported is never cut.
 
 WanGP manages H3's phase-two Turbo LoRA itself; the plugin does not compete with
 that. LoRAs WanGP places on the accelerator side of the multiplier string are

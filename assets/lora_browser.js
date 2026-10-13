@@ -1123,10 +1123,14 @@
             return region.id + "@" + region.start + "-" + region.end;
           }).join(",")
         : "-";
+      // Shared is structure too: the chip strip and the timeline's labels
+      // differ, and a list with no ';' turning into one per LTX-2 stage keeps
+      // the same stage-1 shape.
       return [
         row.id, rowName(row), row.multiplier_kind, (row.phase_values || []).length,
         row.missing ? "m" : "", row.system_managed ? "s" : "",
-        phase, S.scheduleOpenById[row.id] ? "open" : "shut", shape
+        phase, S.scheduleOpenById[row.id] ? "open" : "shut", shape,
+        row.schedule_shared ? "shared" : "own"
       ].join(":");
     // The step count is in here because the schedule header compares itself
     // against it; a run length change has to reach the row.
@@ -2053,9 +2057,10 @@
   function paintGhost() {
     var drag = S.drag;
     if (!drag || drag.mode !== "draw") { return; }
+    var schedule = drag.context.schedule;
     var region = {
       start: drag.current.start, end: drag.current.end,
-      strength: drag.context.schedule.base
+      strength: schedule.seed_strength !== undefined ? schedule.seed_strength : schedule.base
     };
     placeRegion(drag.ghost, region, drag.context.slots, drag.context.schedule);
   }

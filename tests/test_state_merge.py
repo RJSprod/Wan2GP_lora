@@ -913,17 +913,53 @@ class TestLtxStages:
         self._settle(stack, phases, context)
         assert stack.tokens[0] == "1,1,1,1,1,1,1,1;1,0.5,0"
 
-    def test_a_shared_list_follows_stage_1(self):
-        """No ';' means both stages, each stretched to its own length; the
-        timeline is where it runs one value per step -- stage 1."""
+    def test_a_list_with_no_semicolon_becomes_stage_1_with_an_empty_stage_2(self):
+        """WanGP would play it in both stages, squeezing eight steps into the
+        refinement's three -- the stages are never one shared timeline."""
         phases, context = self._at(LTX23_DISTILLED, 2, 8)
         stack = up.Stack.from_native(["a.safetensors"], "1,1,1,1,0,0,0,0")
+        assert up.phase_structure_needs_fit(stack, phases, {}) is True
+        up.fit_phase_structure(stack, phases, {})
         self._settle(stack, phases, context)
-        schedule = self.schedules[("a.safetensors", up.SHARED_PHASE)]
-        assert schedule.slots == 8
+        assert stack.tokens[0] == "1,1,1,1,0,0,0,0;0"
+
+        assert set(self.schedules) == {("a.safetensors", 0)}
+        assert self.schedules[("a.safetensors", 0)].slots == 8
         fields = up.multiplier_fields(stack.tokens[0], phases, "a.safetensors", self.memory, self.schedules, context)
-        assert fields["phase_schedules"][0]["coordinate_mode"] == up.COORD_STAGE_EXACT
-        assert stack.tokens[0] == "1,1,1,1,0,0,0,0"
+        assert fields["schedule_shared"] is False
+        assert fields["phase_values"] == [1.0, 0.0]
+        first, second = fields["phase_schedules"]
+        assert (first["stage"], first["coordinate_mode"]) == (1, up.COORD_STAGE_EXACT)
+        assert second is None
+
+    def test_an_empty_stage_2_opens_at_its_own_length_and_draws_at_full_strength(self):
+        phases, context = self._at(LTX23_DISTILLED, 2, 8)
+        stack = up.Stack.from_native(["a.safetensors"], "1,1,1,1,0,0,0,0;0")
+        self._settle(stack, phases, context)
+        up.schedule_enable(stack, "a.safetensors", 1, phases, self.memory, self.schedules, context)
+        empty = self.schedules[("a.safetensors", 1)]
+        assert (empty.slots, empty.base, empty.regions) == (3, 0.0, [])
+        # Opening it writes nothing: the stage is still off.
+        assert stack.tokens[0] == "1,1,1,1,0,0,0,0;0"
+
+        up.schedule_add_region(
+            stack, "a.safetensors", 1, phases, self.memory, self.schedules, context, start=3, end=3,
+        )
+        # A region seeded at 0 would draw nothing at all.
+        assert stack.tokens[0] == "1,1,1,1,0,0,0,0;0,0,1"
+
+    def test_a_shared_timeline_left_open_in_one_phase_is_not_carried_into_two(self):
+        phases, context = self._at(LTX23_DISTILLED, 1, 8)
+        stack = up.Stack.from_native(["a.safetensors"], "0.7")
+        self._settle(stack, phases, context)
+        up.schedule_enable(stack, "a.safetensors", 0, phases, self.memory, self.schedules, context)
+        assert ("a.safetensors", up.SHARED_PHASE) in self.schedules
+
+        phases, context = self._at(LTX23_DISTILLED, 2, 8)
+        self._settle(stack, phases, context)
+        assert self.schedules == {}
+        up.schedule_enable(stack, "a.safetensors", 1, phases, self.memory, self.schedules, context)
+        assert self.schedules[("a.safetensors", 1)].slots == 3
 
 
 class TestPhaseStructureFit:
@@ -942,12 +978,43 @@ class TestPhaseStructureFit:
         assert up.phase_structure_needs_fit(stack, phases, self.hidden) is False
         return codec.serialize(stack.tokens, stack.separator_index)
 
-    def test_a_stage_2_schedule_survives_a_trip_through_one_phase(self):
+    def test_a_trip_through_one_phase_starts_a_scheduled_stage_2_empty(self):
+        """A plain strength comes back; a stage-2 schedule is not held."""
         one = self._fit("1,1,1,1,0,0,0,0;1,1,0 0.7;0.3", LTX23_DISTILLED, 1, ids=("a.safetensors", "b.safetensors"))
         # WanGP refuses "x;y" in One Phase; these it accepts.
         assert one == "1,1,1,1,0,0,0,0 0.7"
         two = self._fit(one, LTX23_DISTILLED, 2, ids=("a.safetensors", "b.safetensors"))
-        assert two == "1,1,1,1,0,0,0,0;1,1,0 0.7;0.3"
+        assert two == "1,1,1,1,0,0,0,0;0 0.7;0.3"
+
+    def test_a_one_phase_schedule_entering_two_phases_gets_an_empty_stage_2(self):
+        """Never a copy of stage 1: the stages run 8 and 3 steps."""
+        assert self._fit("1,1,0,0,0,0,0,0", LTX23_DISTILLED, 2) == "1,1,0,0,0,0,0,0;0"
+        assert self._fit("1,1,1,1,1,1,1,1,1,1,0,0", LTX25_DEV, 2) == "1,1,1,1,1,1,1,1,1,1,0,0;0"
+        assert self.hidden == {}
+
+    @pytest.mark.parametrize("token, one_phase", [
+        ("1,1,0;0,0.5,1", "1,1,0"),
+        ("1,1,0;0.4", "1,1,0"),       # a scheduled stage 1 with a plain stage 2
+        ("0.5;0,0,1", "0.5"),         # a plain stage 1 with a scheduled stage 2
+    ])
+    def test_nothing_is_held_from_a_token_that_schedules_a_stage(self, token, one_phase):
+        assert self._fit(token, LTX23_DISTILLED, 1) == one_phase
+        assert self.hidden == {}
+        back = self._fit(one_phase, LTX23_DISTILLED, 2)
+        assert back == (one_phase + ";0" if "," in one_phase else one_phase)
+
+    def test_a_held_strength_is_not_pasted_under_a_schedule_drawn_in_one_phase(self):
+        assert self._fit("0.8;0.4", LTX23_DISTILLED, 1) == "0.8"
+        # Drawn in One Phase on top of the 0.8 that was left.
+        assert self._fit("1,1,0,0,0,0,0,0", LTX23_DISTILLED, 2) == "1,1,0,0,0,0,0,0;0"
+        assert self.hidden == {}
+
+    def test_other_models_still_restore_what_a_cut_took(self):
+        """Only LTX-2's stages differ in length; elsewhere a schedule is a
+        phase-1 list like any other part."""
+        three = {"guidance_max_phases": 3}
+        assert self._fit("1,0.5;0.8;0.7", three, 1) == "1,0.5"
+        assert self._fit("1,0.5", three, 3) == "1,0.5;0.8;0.7"
 
     def test_an_edit_in_one_phase_keeps_what_two_phases_held(self):
         assert self._fit("0.8;0.4", LTX23_DISTILLED, 1) == "0.8"
@@ -955,7 +1022,7 @@ class TestPhaseStructureFit:
         assert self._fit("0.5", LTX23_DISTILLED, 2) == "0.5;0.4"
 
     def test_a_token_that_already_fits_is_not_touched(self):
-        for token in ("1;1", "0.8", "1,0.5;0.2", "1,0.5"):
+        for token in ("1;1", "0.8", "1,0.5;0.2", "0.8;1,0.5,0"):
             assert self._fit(token, LTX23_DISTILLED, 2) == token
         assert self._fit("1,0.5", LTX23_DISTILLED, 1) == "1,0.5"
 
@@ -978,10 +1045,17 @@ class TestPhaseStructureFit:
 
     def test_a_late_event_with_the_old_token_does_not_erase_the_memory(self):
         """The token the cut was made from, arriving after it, is no rewrite."""
-        assert self._fit("1,1,0;0,0.5,1", LTX23_DISTILLED, 1) == "1,1,0"
-        late = up.Stack.from_native(["a.safetensors"], "1,1,0;0,0.5,1")
+        assert self._fit("0.9;0.4", LTX23_DISTILLED, 1) == "0.9"
+        late = up.Stack.from_native(["a.safetensors"], "0.9;0.4")
         up.forget_superseded_phases(late, self.hidden)
-        assert self._fit("1,1,0", LTX23_DISTILLED, 2) == "1,1,0;0,0.5,1"
+        assert self._fit("0.9", LTX23_DISTILLED, 2) == "0.9;0.4"
+
+    def test_a_late_scheduled_token_is_cut_again_and_stage_2_still_starts_empty(self):
+        assert self._fit("1,1,0;0,0.5,1", LTX23_DISTILLED, 1) == "1,1,0"
+        assert self._fit("1,1,0;0,0.5,1", LTX23_DISTILLED, 1) == "1,1,0"
+        assert self._fit("1,1,0", LTX23_DISTILLED, 2) == "1,1,0;0"
+        # And the widened token arriving again changes nothing.
+        assert self._fit("1,1,0", LTX23_DISTILLED, 2) == "1,1,0;0"
 
     def test_a_late_token_cut_again_keeps_everything_it_stood_for(self):
         three = {"guidance_max_phases": 3}
