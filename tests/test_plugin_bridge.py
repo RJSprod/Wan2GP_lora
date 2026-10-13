@@ -1444,7 +1444,7 @@ class TestLtxScheduling:
         assert multipliers.split()[0] == "1,1,1,1,0,0,0,0;1,1,0"
         assert row_of(payload, "a.safetensors")["multiplier_kind"] == "scheduled"
 
-    def test_one_phase_and_back_keeps_every_token_valid_and_restores_stage_2(self, ltx, state):
+    def test_one_phase_and_back_keeps_every_token_valid_and_starts_stage_2_empty(self, ltx, state):
         start = "1,1,1,1,0,0,0,0;1,1,0 0.7;0.3"
         one, payload = self._settle(ltx, state, start, guidance=1, steps=8)
         # WanGP refuses a ';' token in One Phase; these it accepts.
@@ -1454,7 +1454,53 @@ class TestLtxScheduling:
         assert payload["schedules_out_of_sync"] is False
 
         two, _ = self._settle(ltx, state, one, guidance=2, steps=8)
-        assert two == start
+        # The plain strength comes back; the refinement schedule starts empty.
+        assert two == "1,1,1,1,0,0,0,0;0 0.7;0.3"
+
+    def test_a_schedule_drawn_in_one_phase_gets_an_empty_stage_2_in_two(self, ltx, state):
+        multipliers, _ = self._settle(ltx, state, "1 1", guidance=1, steps=8)
+        multipliers, _ = self._draw(ltx, state, multipliers, 0, 1, 4, guidance=1)
+        assert multipliers.split()[0] == "1,1,1,1,0,0,0,0"
+
+        multipliers, payload = self._settle(ltx, state, multipliers, guidance=2, steps=8)
+        # Not the same list run in both stages -- WanGP would squeeze the
+        # eight steps into the refinement's three.
+        assert multipliers == "1,1,1,1,0,0,0,0;0 1;1"
+        assert payload["schedules_out_of_sync"] is False
+        assert payload["status"] == (
+            "Two Phases: scheduled LoRAs keep their stage 1 schedule; stage 2 starts empty."
+        )
+        row = row_of(payload, "a.safetensors")
+        assert row["schedule_shared"] is False
+        assert row["phase_values"] == [1.0, 0.0]
+        first, second = row["phase_schedules"]
+        assert (first["slots"], first["stage"], first["coordinate_mode"]) == (8, 1, "stage_exact")
+        assert [(r["start"], r["end"]) for r in first["regions"]] == [(1, 4)]
+        assert second is None
+
+        # Stage 2 is a timeline of its own, three steps, drawn at full strength.
+        multipliers, payload = self._draw(ltx, state, multipliers, 1, 3, 3)
+        assert multipliers == "1,1,1,1,0,0,0,0;0,0,1 1;1"
+        second = row_of(payload, "a.safetensors")["phase_schedules"][1]
+        assert (second["slots"], second["stage"], second["regions"][0]["strength"]) == (3, 2, 1.0)
+
+    def test_one_phase_says_a_scheduled_stage_2_will_not_come_back(self, ltx, state):
+        """Only stage 2 was scheduled: nothing scheduled is left after the cut,
+        and the note still has to say so."""
+        one, payload = self._settle(ltx, state, "0.5;0,0,1 1;1", guidance=1, steps=8)
+        assert one == "0.5 1"
+        assert "scheduled LoRAs start stage 2 empty" in payload["status"]
+        two, _ = self._settle(ltx, state, one, guidance=2, steps=8)
+        assert two.split()[0] == "0.5;0.5"      # plain: one strength, both stages
+
+    def test_plain_loras_alone_get_the_generic_note(self, ltx, state):
+        one, _ = self._settle(ltx, state, "0.8;0.4 1", guidance=1, steps=8)
+        assert one == "0.8 1"
+        two, payload = self._settle(ltx, state, one, guidance=2, steps=8)
+        assert two == "0.8;0.4 1;1"
+        assert payload["status"] == (
+            "Multipliers now match the phase mode; anything it hides comes back with it."
+        )
 
     def test_the_distilled_counter_is_ignored_and_the_dev_one_followed(self, plugin, state):
         plugin.get_model_def = lambda model_type: LTX23_DISTILLED

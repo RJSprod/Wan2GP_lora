@@ -618,6 +618,8 @@ def schedule_payload(
     staged = bool(phases.staged and context and context.phase_steps)
     return {
         "base": round(float(schedule.base), VALUE_DECIMALS),
+        # What a region drawn now starts at, so the drawing ghost shows it.
+        "seed_strength": round(seed_strength(schedule), VALUE_DECIMALS),
         "slots": sch.held_slots(schedule.slots),
         "coordinate_mode": coordinate_mode(
             schedule, shared=shared, phases=phases, context=context, phase=phase
@@ -750,6 +752,13 @@ def normalize_stack_tokens(stack: "Stack", phases: PhaseConfig, memory: dict[str
 # tokens, but only on the next edit, and it never touches a schedule.  These
 # fit every token to the mode as soon as the mode changes, and keep what they
 # cut so the mode coming back restores it.
+#
+# LTX-2 schedules are the exception to the keeping.  Its phases are stages of
+# different lengths -- eight distilled steps, then three of refinement -- so a
+# list written for one stage means nothing in the other, and WanGP squeezing a
+# comma-only list into both is not a schedule anyone drew.  There, a stage-1
+# schedule entering Two Phases gets an empty stage 2 of its own, and a stage 2
+# a narrower mode cut is not held: it starts empty again when the mode widens.
 
 
 def _value_list(part: str) -> bool:
@@ -801,12 +810,17 @@ def _fitted_token(token: str, lora_id: str, phases: PhaseConfig, hidden: HiddenP
     enough for them.  Anything else with fewer parts than the mode is left
     alone: WanGP spreads its last part over the phases it does not name, which
     is valid and was someone's choice.
+
+    An LTX-2 token that schedules any stage is the exception: it follows
+    ``_fitted_stages``, which holds nothing and restores nothing.
     """
     parts = _phase_parts(token)
     if parts is None:
         return None
 
     capacity = max(1, phases.capacity)
+    if phases.staged and any(_is_list(part) for part in parts):
+        return _fitted_stages(parts, capacity)
     full = _remembered_phases(parts, hidden.get(normalize_id(lora_id))) or parts
     if len(parts) > capacity:
         return ";".join(parts[:capacity]), (capacity, full[capacity:])
@@ -814,6 +828,39 @@ def _fitted_token(token: str, lora_id: str, phases: PhaseConfig, hidden: HiddenP
         restored, rest = full[:capacity], full[capacity:]
         return ";".join(restored), ((len(restored), rest) if rest else None)
     return None
+
+
+def _is_list(part: str) -> bool:
+    """A phase part that is a step schedule rather than one strength."""
+    return "," in part
+
+
+#: What a stage with nothing drawn on it is worth in a scheduled token: the
+#: LoRA does not run there until a region says it does.
+EMPTY_STAGE = format_number(sch.GAP_STRENGTH)
+
+
+def _fitted_stages(parts: list[str], capacity: int):
+    """``_fitted_token`` for an LTX-2 token that schedules some stage.
+
+    Stages beyond the mode are cut and not remembered.  A stage-1 schedule
+    with no stage 2 -- a One Phase token entering Two Phases -- gets an empty
+    one, never a copy of itself: WanGP would otherwise expand that one list
+    over both stages, squeezing eight steps' worth into the refinement's three.
+    """
+    if len(parts) > capacity:
+        return ";".join(parts[:capacity]), None
+    if len(parts) < capacity and _is_list(parts[-1]):
+        return ";".join(parts + [EMPTY_STAGE] * (capacity - len(parts))), None
+    return None
+
+
+def has_step_schedule(stack: "Stack") -> bool:
+    """True when some token schedules a phase, in a form the fit may re-cut."""
+    return any(
+        any(_is_list(part) for part in _phase_parts(token) or [])
+        for token in stack.tokens
+    )
 
 
 def phase_structure_needs_fit(stack: "Stack", phases: PhaseConfig, hidden: HiddenPhases) -> bool:
@@ -829,8 +876,9 @@ def fit_phase_structure(stack: "Stack", phases: PhaseConfig, hidden: HiddenPhase
     """Make every token declare a phase structure WanGP accepts in this mode.
 
     Returns ``True`` when any token changed.  What a cut removes is kept in
-    ``hidden`` verbatim -- a stage-2 schedule as readily as a scalar -- and
-    handed back when the mode widens again.
+    ``hidden`` verbatim and handed back when the mode widens again -- except
+    from an LTX-2 token that schedules a stage, whose stage 2 starts empty in
+    every Two Phases it enters (``_fitted_stages``).
     """
     changed = False
     for position, lora_id in enumerate(stack.ids):
@@ -858,8 +906,8 @@ def forget_superseded_phases(stack: "Stack", hidden: HiddenPhases) -> None:
 
     The token the cut was made from is not "something else": an event sent
     before the cut landed carries it, and it is recognisable -- its extra parts
-    are exactly the ones removed.  Forgetting on that would lose a stage-2
-    schedule to nothing more than event timing.
+    are exactly the ones removed.  Forgetting on that would lose a phase 2
+    to nothing more than event timing.
     """
     for lora_id, token in zip(stack.ids, stack.tokens):
         key = normalize_id(lora_id)
@@ -973,9 +1021,17 @@ def token_is_shared(
     scalar in the token, so the token alone would say "not shared" and the
     editor would lose the timeline.  An already-open shared schedule therefore
     keeps its answer.
+
+    Except across LTX-2's two stages, which are never shared: they run
+    different numbers of steps, so each gets a timeline of its own, and a
+    comma-only token there is only waiting for ``fit_phase_structure`` to give
+    it an empty stage 2.  A shared timeline left open by One Phase is not
+    carried into Two Phases.
     """
     if info.kind == codec.SCHEDULED and info.schedule is not None:
         return info.schedule.shared
+    if phases.staged and phases.capacity > 1:
+        return False
     if lora_id and schedules and schedule_key(lora_id, 0, True) in schedules:
         return True
     return phases.capacity <= 1
@@ -1528,6 +1584,17 @@ def schedule_set_base(
     return changed
 
 
+def seed_strength(schedule: sch.PhaseSchedule) -> float:
+    """The strength a newly drawn region starts at: the schedule's base.
+
+    Unless the base is what an empty slot is already worth -- an empty LTX-2
+    stage 2, an all-zero import -- when a region seeded at it would draw
+    nothing at all.  It starts at full strength then, as a new LoRA does.
+    """
+    base = sanitize_value(schedule.base, 1.0)
+    return 1.0 if _close(base, sch.GAP_STRENGTH) else base
+
+
 def schedule_add_region(
     stack: "Stack",
     lora_id: str,
@@ -1564,7 +1631,7 @@ def schedule_add_region(
         id=sch.next_region_id(schedule.regions),
         start=span[0],
         end=span[1],
-        strength=sanitize_value(schedule.base, 1.0),
+        strength=seed_strength(schedule),
     )
     schedule.regions = sch.sort_regions(schedule.regions + [region])
     schedule.selected_region_id = region.id

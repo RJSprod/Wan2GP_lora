@@ -247,8 +247,10 @@ WHY IT TOOK FOUR ROUNDS
                    otherwise num_inference_steps (LTX2Scheduler, steps + 1 sigmas)
           stage 2: 3, always (both stage-2 sigma tables have four values)
       A comma-only token is expanded in BOTH stages: over stage 1's steps, then
-      again squeezed into stage 2's three. The distilled checkpoints hide the
-      step slider (lock_inference_steps) and ignore its value.
+      again squeezed into stage 2's three. The plugin never keeps one in Two
+      Phases: it becomes "<list>;0", stage 1's schedule with an empty stage 2
+      (ui_payloads._fitted_stages). The distilled checkpoints hide the step
+      slider (lock_inference_steps) and ignore its value.
 
     A ';' TOKEN CAN OUTLIVE ITS MODE
       lora_multiplier_phases defaults to guidance_phases, so on LTX-2 (and any
@@ -256,7 +258,10 @@ WHY IT TOOK FOUR ROUNDS
       makes every "a;b" token invalid: parse_loras_multipliers answers "there
       should be at most 1 phases for this multiplier" and WanGP refuses the
       whole string. Nothing in WanGP rewrites it; the plugin's resync does
-      (ui_payloads.fit_phase_structure).
+      (ui_payloads.fit_phase_structure). What it cuts is held for the session
+      and restored when the mode widens -- except from an LTX-2 token that
+      schedules a stage: stage lengths differ (8 or N, then 3), so nothing of
+      one stage is mapped onto the other, and stage 2 starts empty ("0").
 
     SCHEDULE GRAMMAR IS PHASE-MAJOR
       In "1,0.8,0.4,0;0.7,0.5,0.2,0" the ';' is the outer separator: phase 1 is

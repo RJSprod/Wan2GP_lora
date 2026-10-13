@@ -901,7 +901,7 @@ class TestLtxInTheBrowser:
         assert native(page).split()[0] == "1;0,0,1"
         assert problems == []
 
-    def test_one_phase_and_back_restores_the_refinement_schedule(self, ltx_panel):
+    def test_one_phase_and_back_starts_the_refinement_empty(self, ltx_panel):
         page, _, problems = ltx_panel
         set_token(page, 1, "1,1,1,1,0,0,0,0;0,0.5,1")
         try:
@@ -914,5 +914,25 @@ class TestLtxInTheBrowser:
         finally:
             set_guidance(page, 2)
             settle(page, 900)
-        assert native(page).split()[1] == "1,1,1,1,0,0,0,0;0,0.5,1"
+        # Stage 1 kept, stage 2 empty -- not the old refinement schedule, and
+        # not stage 1's list squeezed into three steps.
+        assert native(page).split()[1] == "1,1,1,1,0,0,0,0;0"
+
+        row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
+        assert row.locator(".lb-chip-static").count() == 0     # no shared schedule
+        select_phase(page, row, 1)
+        open_timeline(page, row)
+        settle(page, 600)
+        assert "stage 2 (refine) • 3 steps" in row.locator(".lb-sched-titles").inner_text()
+        assert row.locator(".lb-region").count() == 0
+        assert "this phase is 0" in row.locator(".lb-baseline").inner_text()
+
+        # Drawing on it starts at full strength, in the token's second part.
+        timeline = row.locator(".lb-timeline")
+        timeline.scroll_into_view_if_needed()
+        settle(page, 200)
+        box = timeline.bounding_box()
+        page.mouse.click(box["x"] + box["width"] * 0.85, box["y"] + box["height"] / 2)
+        settle(page, 1300)
+        assert native(page).split()[1] == "1,1,1,1,0,0,0,0;0,0,1"
         assert problems == []
