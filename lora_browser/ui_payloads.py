@@ -829,6 +829,8 @@ def normalize_stack_tokens(stack: "Stack", phases: PhaseConfig, memory: dict[str
 # comma-only list into both is not a schedule anyone drew.  There, a stage-1
 # schedule entering Two Phases gets an empty stage 2 of its own, and a stage 2
 # a narrower mode cut is not held: it starts empty again when the mode widens.
+# The switch then fills that empty stage 2 from stage 1 by noise level, as
+# "Fill from stage 1" does (``fill_stages_from_stage_1``).
 
 
 def _value_list(part: str) -> bool:
@@ -917,6 +919,7 @@ def _fitted_stages(parts: list[str], capacity: int):
     with no stage 2 -- a One Phase token entering Two Phases -- gets an empty
     one, never a copy of itself: WanGP would otherwise expand that one list
     over both stages, squeezing eight steps' worth into the refinement's three.
+    The resync then fills it by noise level (``fill_stages_from_stage_1``).
     """
     if len(parts) > capacity:
         return ";".join(parts[:capacity]), None
@@ -1859,10 +1862,11 @@ def schedule_normalize(
 
 # ----------------------------------------------------------- stage 2 fill
 #
-# An LTX-2 stage 2 starts empty, and stays a timeline of its own: nothing keeps
-# it in step with stage 1.  "Fill from stage 1" is the one bridge, and only on
-# request: it draws an empty stage 2 once, from what stage 1 applies where the
-# two stages share noise levels, and is plain regions from then on.
+# An LTX-2 stage 2 is a timeline of its own: nothing keeps it in step with
+# stage 1.  It is drawn from stage 1 at two moments only -- entering Two
+# Phases, and "Fill from stage 1" on an empty stage 2 -- each time once, from
+# what stage 1 applies where the two stages share noise levels, and it is
+# plain regions from then on.
 
 
 @dataclass(frozen=True)
@@ -1886,11 +1890,11 @@ class Stage2Fill:
         if self.steps:
             if self.empty:
                 return (
-                    f"Stage 1 is off at steps {_step_span(self.steps)}, where it runs stage 2's "
+                    f"Stage 1 is off at steps {step_span(self.steps)}, where it runs stage 2's "
                     "noise levels - there is nothing to carry."
                 )
             return (
-                f"Copy stage 1's steps {_step_span(self.steps)}, matched by noise level: "
+                f"Copy stage 1's steps {step_span(self.steps)}, matched by noise level: "
                 + ", ".join(format_number(value) for value in self.values)
             )
         if self.empty:
@@ -1904,14 +1908,15 @@ class Stage2Fill:
     def done(self) -> str:
         """What the status bar says once it has."""
         if self.steps:
-            return f"Stage 2 filled from stage 1's steps {_step_span(self.steps)}, matched by noise level."
+            return f"Stage 2 filled from stage 1's steps {step_span(self.steps)}, matched by noise level."
         return (
             f"Stage 2 holds stage 1's final strength, {format_number(self.values[0])}: "
             "this sampler's steps do not line up with stage 2's."
         )
 
 
-def _step_span(steps: tuple[int, ...]) -> str:
+def step_span(steps: tuple[int, ...]) -> str:
+    """``(6, 7, 8)`` as "6-8"; steps that do not run on from each other, listed."""
     consecutive = list(steps) == list(range(steps[0], steps[0] + len(steps)))
     if consecutive and len(steps) > 1:
         return f"{steps[0]}-{steps[-1]}"
@@ -1974,6 +1979,45 @@ def stage_2_fill_payload(fill: Stage2Fill | None) -> dict[str, Any] | None:
         "empty": fill.empty,
         "note": fill.note,
     }
+
+
+def entering_two_phases(stack: "Stack", phases: PhaseConfig) -> list[str]:
+    """LoRAs whose LTX-2 stage-1 schedule has no stage 2 in Two Phases yet:
+    the ones ``fit_phase_structure`` is about to give an empty one."""
+    if not (phases.staged and phases.capacity > 1):
+        return []
+    entering = []
+    for lora_id, token in zip(stack.ids, stack.tokens):
+        parts = _phase_parts(token)
+        if parts and len(parts) < phases.capacity and _is_list(parts[-1]):
+            entering.append(lora_id)
+    return entering
+
+
+def fill_stages_from_stage_1(
+    stack: "Stack",
+    lora_ids: list[str],
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None = None,
+) -> bool:
+    """Fill each of ``lora_ids``' empty stage 2 from its stage 1, as the button does.
+
+    What entering Two Phases does: the refinement carries on from where stage
+    1 ends, matched by noise level.  A LoRA with nothing to carry keeps its
+    empty stage 2.  A filled one is plain regions whose base is what stage 2
+    was -- empty, for a LoRA entering Two Phases -- so Clear phase empties it
+    again.
+    """
+    changed = False
+    for lora_id in lora_ids:
+        try:
+            changed = schedule_fill_stage_2(stack, lora_id, phases, memory, schedules, context) or changed
+        except sch.ScheduleError:
+            # Nothing to carry, or no stage lengths to read it by.
+            continue
+    return changed
 
 
 def schedule_fill_stage_2(

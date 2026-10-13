@@ -166,29 +166,29 @@ the step counter moves stage 1 only.
 The two stages are never one shared schedule. WanGP would play a list with no
 `;` in both — one value per step in stage 1, then squeezed into stage 2's three
 — and a stage-1 schedule squeezed into the refinement is not something anyone
-drew. So when a schedule from One Phase enters Two Phases, it stays stage 1's
-and **stage 2 starts empty**: `1,1,1,1,0,0,0,0` becomes `1,1,1,1,0,0,0,0;0`, the
-LoRA does not run in the refinement, and Phase 2 opens as an empty three-step
-timeline. A region drawn there starts at full strength. The same goes for a list
-with no `;` that arrives any other way in Two Phases, such as a preset.
+drew. So when a schedule from One Phase enters Two Phases, it stays stage 1's,
+and **stage 2 carries on from the end of stage 1**, matched by noise level
+rather than stretched. On a distilled stage 1 — the distilled checkpoints, or
+Dev on a *Distilled 8 Steps* sampler — the refinement re-runs the noise levels
+of stage 1's last three steps, so stage 2 gets steps 6–8:
 
-**Fill from stage 1.** An empty stage 2 can be drawn from stage 1 in one click,
-on request only. It copies what stage 1 applies at the noise levels stage 2
-runs, never a stretched stage 1. On a distilled stage 1 — the distilled
-checkpoints, or Dev on a *Distilled 8 Steps* sampler — the refinement re-runs
-the noise levels of stage 1's last three steps, so stage 2 gets steps 6–8:
-
-| Stage 1 (8 steps) | Fill from stage 1 |
+| One Phase (8 steps) | Two Phases |
 | --- | --- |
-| `1,1,1,1,0,0,0,0` (early only) | nothing to carry — stage 2 stays empty |
-| `0,0,0,0,1,1,1,1` (late detail) | `1,1,1` |
-| `1,1,1,1,0.8,0.6,0.4,0.2` (fade out) | `0.6,0.4,0.2` |
+| `1,1,1,1,0,0,0,0` (early only) | `1,1,1,1,0,0,0,0;0` — nothing to carry, stage 2 empty |
+| `0,0,0,0,0,0,1,1` (the last steps) | `0,0,0,0,0,0,1,1;0,1,1` |
+| `0,0,0,0,1,1,1,1` (late detail) | `0,0,0,0,1,1,1,1;1,1,1` |
+| `1,1,1,1,0.8,0.6,0.4,0.2` (fade out) | `1,1,1,1,0.8,0.6,0.4,0.2;0.6,0.4,0.2` |
 
 On Dev with Euler or res2s, stage 1's steps do not line up with stage 2's, so
-stage 2 holds the strength stage 1 ends at. The button is on an empty Phase 2
-timeline and its tooltip shows what it will write. What it draws is ordinary
-regions with no link to stage 1, and *Clear phase* puts back whatever stage 2
-was before.
+stage 2 holds the strength stage 1 ends at. The same goes for a list with no
+`;` that arrives any other way in Two Phases, such as a preset. What stage 2
+gets is ordinary regions with no link to stage 1: edit either stage and the
+other stays as it is. *Clear phase* empties it; a region drawn on an empty
+stage 2 starts at full strength.
+
+**Fill from stage 1.** The same copy, on request: an empty Phase 2 timeline —
+cleared, or a plain strength — offers it, and its tooltip shows what it will
+write. *Clear phase* afterwards puts back whatever stage 2 was before.
 
 On every other model, switching guidance to two or more phases resets a
 scheduled LoRA to **0**: the schedule said the multiplier varies over the run,
@@ -307,8 +307,9 @@ One Phase is an error, not a strength). So the moment the mode narrows, the
 panel rewrites every token to what WanGP accepts, without waiting for an edit,
 and keeps what it cut for the session: switch back and a phase 2 strength
 returns as it was. A scheduled LTX-2 LoRA is the exception: what One Phase cut
-from it is not kept, and back in Two Phases its stage 2 starts empty (see
-above). Branch syntax and anything else preserved as imported is never cut.
+from it is not kept, and back in Two Phases its stage 2 is filled from stage 1
+again (see above). Branch syntax and anything else preserved as imported is
+never cut.
 
 WanGP manages H3's phase-two Turbo LoRA itself; the plugin does not compete with
 that. LoRAs WanGP places on the accelerator side of the multiplier string are

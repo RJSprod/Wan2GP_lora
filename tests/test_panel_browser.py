@@ -937,6 +937,31 @@ class TestLtxInTheBrowser:
         assert native(page).split()[1] == "1,1,1,1,0,0,0,0;0,0,1"
         assert problems == []
 
+    def test_switching_to_two_phases_carries_the_last_steps_into_stage_2(self, ltx_panel):
+        page, _, problems = ltx_panel
+        row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
+        try:
+            set_guidance(page, 1)
+            settle(page, 900)
+            # On for the second half of the run, so on at steps 6-8.
+            set_token(page, 1, "0,0,0,0,1,1,1,1")
+            assert native(page).split()[1] == "0,0,0,0,1,1,1,1"
+        finally:
+            set_guidance(page, 2)
+            settle(page, 1200)
+        assert native(page).split()[1] == "0,0,0,0,1,1,1,1;1,1,1"
+
+        select_phase(page, row, 0)
+        open_timeline(page, row)
+        select_phase(page, row, 1)
+        settle(page, 900)
+        assert "stage 2 (refine) • 3 steps" in row.locator(".lb-sched-titles").inner_text()
+        second = schedule_of(page, "lora_02.safetensors", 1)
+        assert [(r["start"], r["end"], r["strength"]) for r in second["regions"]] == [(1, 3, 1)]
+        assert row.locator(".lb-region").count() == 1
+        assert row.locator("button.lb-fill-stage-2").count() == 0
+        assert problems == []
+
     def test_fill_from_stage_1_draws_the_refinement_once(self, ltx_panel):
         page, _, problems = ltx_panel
         row = page.locator('.lb-row[data-id="lora_02.safetensors"]')

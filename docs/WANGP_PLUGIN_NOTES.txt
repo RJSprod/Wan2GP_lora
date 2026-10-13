@@ -256,14 +256,16 @@ WHY IT TOOK FOUR ROUNDS
       distilled sampler, the first otherwise. A step runs at the sigma it starts
       from, so stage 2 re-runs the noise levels of a distilled stage 1's steps
       6-8 -- exactly with the first table, nearest with the second, whose 0.85
-      falls inside step 6. That is what "Fill from stage 1" copies
-      (ui_payloads.derive_stage_2); a Dev stage 1 on LTX2Scheduler matches
-      nothing, and hands over its final strength instead.
+      falls inside step 6. That is what entering Two Phases and "Fill from
+      stage 1" copy (ui_payloads.derive_stage_2); a Dev stage 1 on
+      LTX2Scheduler matches nothing, and hands over its final strength instead.
       A comma-only token is expanded in BOTH stages: over stage 1's steps, then
       again squeezed into stage 2's three. The plugin never keeps one in Two
       Phases: it becomes "<list>;0", stage 1's schedule with an empty stage 2
-      (ui_payloads._fitted_stages). The distilled checkpoints hide the step
-      slider (lock_inference_steps) and ignore its value.
+      (ui_payloads._fitted_stages), which the same resync then fills from
+      stage 1 (ui_payloads.fill_stages_from_stage_1). The distilled
+      checkpoints hide the step slider (lock_inference_steps) and ignore its
+      value.
 
     A ';' TOKEN CAN OUTLIVE ITS MODE
       lora_multiplier_phases defaults to guidance_phases, so on LTX-2 (and any
@@ -273,8 +275,9 @@ WHY IT TOOK FOUR ROUNDS
       whole string. Nothing in WanGP rewrites it; the plugin's resync does
       (ui_payloads.fit_phase_structure). What it cuts is held for the session
       and restored when the mode widens -- except from an LTX-2 token that
-      schedules a stage: stage lengths differ (8 or N, then 3), so nothing of
-      one stage is mapped onto the other, and stage 2 starts empty ("0").
+      schedules a stage: stage lengths differ (8 or N, then 3), so a stage 2
+      is never stretched from stage 1 or restored; it is filled from stage 1
+      by noise level again, or left empty ("0") when there is nothing to carry.
 
     SCHEDULE GRAMMAR IS PHASE-MAJOR
       In "1,0.8,0.4,0;0.7,0.5,0.2,0" the ';' is the outer separator: phase 1 is

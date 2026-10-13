@@ -1457,19 +1457,20 @@ class TestLtxScheduling:
         # The plain strength comes back; the refinement schedule starts empty.
         assert two == "1,1,1,1,0,0,0,0;0 0.7;0.3"
 
-    def test_a_schedule_drawn_in_one_phase_gets_an_empty_stage_2_in_two(self, ltx, state):
+    def test_a_schedule_off_at_the_end_of_stage_1_enters_two_phases_with_stage_2_empty(self, ltx, state):
         multipliers, _ = self._settle(ltx, state, "1 1", guidance=1, steps=8)
         multipliers, _ = self._draw(ltx, state, multipliers, 0, 1, 4, guidance=1)
         assert multipliers.split()[0] == "1,1,1,1,0,0,0,0"
 
         multipliers, payload = self._settle(ltx, state, multipliers, guidance=2, steps=8)
         # Not the same list run in both stages -- WanGP would squeeze the
-        # eight steps into the refinement's three.
+        # eight steps into the refinement's three -- and stage 1 is off at
+        # steps 6-8, the noise levels stage 2 runs, so there is nothing to carry.
         assert multipliers == "1,1,1,1,0,0,0,0;0 1;1"
         assert payload["schedules_out_of_sync"] is False
         assert payload["status"] == (
-            "Two Phases: scheduled LoRAs keep their stage 1 schedule; stage 2 starts empty "
-            "- its timeline offers Fill from stage 1."
+            "Two Phases: stage 2 of each scheduled LoRA copies its stage 1 steps 6-8, "
+            "matched by noise level."
         )
         row = row_of(payload, "a.safetensors")
         assert row["schedule_shared"] is False
@@ -1485,12 +1486,64 @@ class TestLtxScheduling:
         second = row_of(payload, "a.safetensors")["phase_schedules"][1]
         assert (second["slots"], second["stage"], second["regions"][0]["strength"]) == (3, 2, 1.0)
 
+    @pytest.mark.parametrize("one_phase, stage_2", [
+        ("0,0,0,0,0,0,0,1", "0,0,1"),            # the last step on: refine step 3
+        ("0,0,0,0,1,1,1,1", "1,1,1"),
+        ("1,1,1,1,0.8,0.6,0.4,0.2", "0.6,0.4,0.2"),
+    ])
+    def test_entering_two_phases_carries_the_end_of_stage_1_into_stage_2(
+        self, ltx, state, one_phase, stage_2
+    ):
+        multipliers, _ = self._settle(ltx, state, one_phase + " 1", guidance=1, steps=8)
+        assert multipliers == one_phase + " 1"
+        multipliers, payload = self._settle(ltx, state, multipliers, guidance=2, steps=8)
+        assert multipliers == f"{one_phase};{stage_2} 1;1"
+        assert payload["schedules_out_of_sync"] is False
+        row = row_of(payload, "a.safetensors")
+        second = row["phase_schedules"][1]
+        assert (second["slots"], second["stage"], second["base"]) == (3, 2, 0.0)
+        assert second["active"] is True
+        assert row["stage_2_fill"] is None              # already drawn
+
+        # Clear phase empties it again, as it was before the fill.
+        _, mults, payload = act(
+            ltx, {"type": "schedule_clear_phase", "id": "a.safetensors", "phase": 1},
+            state, self.LORAS, multipliers, 2, 8,
+        )
+        assert mults["value"] == f"{one_phase};0 1;1"
+
+    def test_entering_two_phases_on_dev_holds_the_strength_stage_1_ends_at(self, plugin, state):
+        plugin.get_model_def = lambda model_type: LTX25_DEV
+        stage_1 = ",".join(["0"] * 20 + ["1"] * 10)
+        multipliers, payload = self._settle(plugin, state, stage_1 + " 1", 2, 30, "euler")
+        assert multipliers == stage_1 + ";1,1,1 1;1"
+        assert payload["status"] == (
+            "Two Phases: stage 2 of each scheduled LoRA holds the strength its stage 1 ends at."
+        )
+
+    def test_a_late_one_phase_token_refills_stage_2_the_same(self, ltx, state):
+        """The switch's events arrive in any order; each fit gives one answer."""
+        first, _ = self._settle(ltx, state, "0,0,0,0,0,0,0,1 1", guidance=2, steps=8)
+        again, _ = self._settle(ltx, state, "0,0,0,0,0,0,0,1 1", guidance=2, steps=8)
+        assert first == again == "0,0,0,0,0,0,0,1;0,0,1 1;1"
+
+    def test_a_fit_that_fills_nothing_says_nothing_about_stage_2(self, ltx, state):
+        """A plain strength coming back next to a LoRA that already has both
+        stages: no stage 2 was filled, so the note does not say one was."""
+        one, _ = self._settle(ltx, state, "1;1 0.8;0.4", guidance=1, steps=8)
+        assert one == "1 0.8"
+        two, payload = self._settle(ltx, state, "0,0,0,0,0,0,0,1;0,0,1 0.8", guidance=2, steps=8)
+        assert two == "0,0,0,0,0,0,0,1;0,0,1 0.8;0.4"
+        assert payload["status"] == (
+            "Multipliers now match the phase mode; anything it hides comes back with it."
+        )
+
     def test_one_phase_says_a_scheduled_stage_2_will_not_come_back(self, ltx, state):
         """Only stage 2 was scheduled: nothing scheduled is left after the cut,
         and the note still has to say so."""
         one, payload = self._settle(ltx, state, "0.5;0,0,1 1;1", guidance=1, steps=8)
         assert one == "0.5 1"
-        assert "scheduled LoRAs start stage 2 empty" in payload["status"]
+        assert "scheduled LoRAs fill stage 2 from stage 1 again" in payload["status"]
         two, _ = self._settle(ltx, state, one, guidance=2, steps=8)
         assert two.split()[0] == "0.5;0.5"      # plain: one strength, both stages
 
