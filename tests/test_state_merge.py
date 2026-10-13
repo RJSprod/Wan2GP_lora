@@ -1214,3 +1214,28 @@ class TestStage2Fill:
         # Browser tiles never carry it.
         tile = up.multiplier_fields(token, phases, "a.safetensors", self.memory, with_schedules=False)
         assert tile["stage_2_fill"] is None
+
+    def test_the_loras_entering_two_phases_are_the_stage_1_lists_without_a_stage_2(self):
+        phases, _ = self._at(LTX23_DISTILLED, 2)
+        stack = up.Stack.from_native(
+            ["a.safetensors", "b.safetensors", "c.safetensors", "d.safetensors"],
+            "0,0,1,1 0.8 1,1,0;0 0.5:0.9",
+        )
+        assert up.entering_two_phases(stack, phases) == ["a.safetensors"]
+        assert up.entering_two_phases(stack, self._at(LTX23_DISTILLED, 1)[0]) == []
+        assert up.entering_two_phases(stack, up.resolve_phases(H3_MODEL_DEF, 2)) == []
+
+    def test_entering_two_phases_fills_what_there_is_to_carry(self):
+        phases, context = self._at(LTX23_DISTILLED, 2)
+        stack = up.Stack.from_native(
+            ["a.safetensors", "b.safetensors"], "0,0,0,0,0,0,0,1 1,1,1,1,0,0,0,0",
+        )
+        entering = up.entering_two_phases(stack, phases)
+        hidden = {}
+        up.fit_phase_structure(stack, phases, hidden)
+        up.sync_schedules(stack, phases, self.schedules, context)
+        assert up.fill_stages_from_stage_1(stack, entering, phases, self.memory, self.schedules, context)
+        # The last step on carries into refine step 3; off at steps 6-8, nothing.
+        assert stack.tokens == ["0,0,0,0,0,0,0,1;0,0,1", "1,1,1,1,0,0,0,0;0"]
+        assert self.schedules[("a.safetensors", 1)].base == 0.0
+        assert ("b.safetensors", 1) not in self.schedules

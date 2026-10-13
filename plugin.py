@@ -84,22 +84,34 @@ def _follow_note(context: up.ScheduleContext) -> str:
     return f"Schedules follow {context.phase_length(0)} steps."
 
 
-def _fit_note(phases: up.PhaseConfig, scheduled: bool) -> str:
+def _fit_note(
+    phases: up.PhaseConfig,
+    scheduled: bool,
+    context: up.ScheduleContext | None = None,
+    entering: bool = False,
+) -> str:
     """What fitting the multipliers to a new phase mode says it did.
 
     ``scheduled`` is whether some token scheduled a phase before the fit: on
-    LTX-2 those are the ones whose stage 2 does not come back.
+    LTX-2 those are the ones whose stage 2 does not come back, but is filled
+    from stage 1 again (``up.fill_stages_from_stage_1``).  ``entering`` is
+    whether some stage-1 schedule just entered Two Phases to be filled.
     """
-    if not (phases.staged and scheduled):
-        return "Multipliers now match the phase mode; anything it hides comes back with it."
+    generic = "Multipliers now match the phase mode; anything it hides comes back with it."
+    if not phases.staged or not (entering if phases.effective > 1 else scheduled):
+        return generic
     if phases.effective > 1:
-        return (
-            "Two Phases: scheduled LoRAs keep their stage 1 schedule; stage 2 starts empty "
-            "- its timeline offers Fill from stage 1."
-        )
+        if context is not None and context.stage_2_match:
+            return (
+                "Two Phases: stage 2 of each scheduled LoRA copies its stage 1 steps "
+                f"{up.step_span(context.stage_2_match)}, matched by noise level."
+            )
+        if context is not None and len(context.phase_steps) > 1:
+            return "Two Phases: stage 2 of each scheduled LoRA holds the strength its stage 1 ends at."
+        return "Two Phases: scheduled LoRAs keep their stage 1 schedule; stage 2 starts empty."
     return (
         "One Phase runs no refinement stage. Back in Two Phases, plain LoRAs get their "
-        "stage 2 strength back and scheduled LoRAs start stage 2 empty."
+        "stage 2 strength back and scheduled LoRAs fill stage 2 from stage 1 again."
     )
 
 
@@ -794,13 +806,17 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             if kind == "schedule_resync":
                 # First the phase structure: a token declaring more phases than
                 # this mode runs is one WanGP refuses outright, and on LTX-2 a
-                # stage-1 schedule entering Two Phases gets an empty stage 2.
-                # The timelines are then re-derived from what it became before
-                # they move.
+                # stage-1 schedule entering Two Phases gets a stage 2 of its
+                # own. The timelines are then re-derived from what it became
+                # before they move.
                 scheduled = up.has_step_schedule(stack)
+                entering = up.entering_two_phases(stack, phases)
                 fitted = up.fit_phase_structure(stack, phases, instance.hidden_phases)
                 if fitted:
                     up.sync_schedules(stack, phases, instance.schedules, context)
+                    # Entering Two Phases, stage 2 carries on from where stage
+                    # 1 ends -- what Fill from stage 1 draws.
+                    up.fill_stages_from_stage_1(stack, entering, *args)
                 changed = up.refit_schedules(
                     stack, phases, instance.schedules, instance.phase_memory, context
                 )
@@ -811,7 +827,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                         else "Guidance uses more than one phase; scheduled LoRAs were reset to 0."
                     )
                 elif fitted:
-                    instance.note(_fit_note(phases, scheduled))
+                    instance.note(_fit_note(phases, scheduled, context, bool(entering)))
                 return changed or fitted
 
             if kind == "schedule_normalize":
