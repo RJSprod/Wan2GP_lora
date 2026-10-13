@@ -1064,3 +1064,153 @@ class TestPhaseStructureFit:
         # The two-phase token arriving late and being cut once more.
         assert self._fit("0.9;0.8", three, 1) == "0.9"
         assert self._fit("0.9", three, 3) == "0.9;0.8;0.7"
+
+
+LTX2_DEV_19B = {"architecture": "ltx2_19B", "guidance_max_phases": 2, "ltx2_22B_class": False}
+
+
+class TestStage2Fill:
+    """"Fill from stage 1": copy what stage 1 applies at stage 2's noise
+    levels, once, into an empty stage 2 -- never a stretched stage 1."""
+
+    def setup_method(self):
+        self.schedules = {}
+        self.memory = {}
+
+    def _at(self, model_def, guidance=2, steps=8, sampler=""):
+        phases = up.resolve_phases(model_def, guidance)
+        return phases, up.ScheduleContext.from_native(steps, model_def, phases, sampler)
+
+    def _stack(self, token, phases, context):
+        stack = up.Stack.from_native(["a.safetensors"], token)
+        up.sync_schedules(stack, phases, self.schedules, context)
+        return stack
+
+    def _fill(self, token, model_def=LTX23_DISTILLED, steps=8, sampler=""):
+        phases, context = self._at(model_def, 2, steps, sampler)
+        stack = self._stack(token, phases, context)
+        up.schedule_fill_stage_2(stack, "a.safetensors", phases, self.memory, self.schedules, context)
+        return stack.tokens[0]
+
+    def test_both_refinement_tables_rerun_the_distilled_steps_6_to_8(self):
+        # The first is the distilled table's tail exactly; the second starts at
+        # 0.85, inside step 6, and is the same from there.
+        assert up.LTX2_STAGE_2_SIGMAS == up.LTX2_DISTILLED_SIGMAS[5:]
+        for table in (up.LTX2_STAGE_2_SIGMAS, up.LTX2_STAGE_2_SIGMAS_8_STEPS):
+            assert up.nearest_steps(up.LTX2_DISTILLED_SIGMAS, table) == (6, 7, 8)
+        assert up.LTX2_DISTILLED_STEPS == 8 and up.LTX2_REFINE_STEPS == 3
+
+    @pytest.mark.parametrize("model_def, sampler, expected", [
+        (LTX23_DISTILLED, "", up.LTX2_STAGE_2_SIGMAS_8_STEPS),   # 22B
+        (LTX25_DEV, "euler", up.LTX2_STAGE_2_SIGMAS_8_STEPS),     # 22B
+        (JOYAI_ECHO, "", up.LTX2_STAGE_2_SIGMAS),
+        (LTX2_DEV_19B, "euler", up.LTX2_STAGE_2_SIGMAS),
+        (LTX2_DEV_19B, "distilled_8_steps", up.LTX2_STAGE_2_SIGMAS_8_STEPS),
+    ])
+    def test_the_refinement_table_is_chosen_as_wangp_chooses_it(self, model_def, sampler, expected):
+        assert up.ltx2_stage_2_sigmas(model_def, sampler) == expected
+
+    @pytest.mark.parametrize("model_def, guidance, steps, sampler, expected", [
+        (LTX23_DISTILLED, 2, 8, "", (6, 7, 8)),
+        (JOYAI_ECHO, 2, 20, "", (6, 7, 8)),
+        (LTX25_DEV, 2, 30, "distilled_8_steps_ancestral", (6, 7, 8)),
+        (LTX25_DEV, 2, 30, "euler", ()),         # the scheduler's own table
+        (LTX25_DEV, 2, 40, "res2s", ()),
+        (LTX23_DISTILLED, 1, 8, "", ()),         # One Phase: no refinement
+        (H3_MODEL_DEF, 2, 30, "", ()),
+    ])
+    def test_steps_are_matched_only_where_stage_1_noise_levels_are_known(
+        self, model_def, guidance, steps, sampler, expected
+    ):
+        assert self._at(model_def, guidance, steps, sampler)[1].stage_2_match == expected
+
+    @pytest.mark.parametrize("stage_1, stage_2", [
+        ("1,1,1,1,0,0,0,0", None),                       # early only: stays empty
+        ("0,0,0,0,1,1,1,1", "1,1,1"),                    # late detail
+        ("1,1,1,1,1,1,1,1", "1,1,1"),                    # the whole run
+        ("1,1,1,1,0.8,0.6,0.4,0.2", "0.6,0.4,0.2"),      # a fade-out
+        ("0,0,1,1,1,0,0,0", None),                       # a mid burst: stays empty
+    ])
+    def test_a_distilled_stage_1_gives_its_steps_6_to_8(self, stage_1, stage_2):
+        if stage_2 is None:
+            with pytest.raises(sch.ScheduleError, match="nothing to carry"):
+                self._fill(stage_1 + ";0")
+        else:
+            assert self._fill(stage_1 + ";0") == f"{stage_1};{stage_2}"
+
+    def test_a_stage_1_list_of_another_length_is_read_the_way_wangp_plays_it(self):
+        """Four values over eight steps: steps 6-8 play the third and fourth."""
+        assert self._fill("1,1,0.5,0;0") == "1,1,0.5,0;0.5,0,0"
+
+    @pytest.mark.parametrize("stage_1, stage_2", [
+        (["1"] * 15 + ["0"] * 15, None),
+        (["1"] * 10 + ["0.6"] * 10 + ["0.3"] * 10, "0.3,0.3,0.3"),
+        (["0"] * 5 + ["0.8"] * 25, "0.8,0.8,0.8"),
+    ])
+    def test_a_dev_stage_1_hands_over_its_final_strength(self, stage_1, stage_2):
+        token = ",".join(stage_1) + ";0"
+        if stage_2 is None:
+            with pytest.raises(sch.ScheduleError, match="Stage 1 ends at 0"):
+                self._fill(token, LTX25_DEV, 30, "euler")
+        else:
+            assert self._fill(token, LTX25_DEV, 30, "euler") == ",".join(stage_1) + ";" + stage_2
+
+    def test_a_fill_is_drawn_once_and_stays_independent(self):
+        phases, context = self._at(LTX23_DISTILLED)
+        stack = self._stack("1,1,1,1,0.8,0.6,0.4,0.2;0", phases, context)
+        up.schedule_fill_stage_2(stack, "a.safetensors", phases, self.memory, self.schedules, context)
+        filled = self.schedules[("a.safetensors", 1)]
+        assert [(r.start, r.end, r.strength) for r in filled.regions] == [
+            (1, 1, 0.6), (2, 2, 0.4), (3, 3, 0.2),
+        ]
+        # Stage 1 edited afterwards: stage 2 is regions of its own now.
+        stage_1 = self.schedules[("a.safetensors", 0)]
+        up.schedule_delete_region(
+            stack, "a.safetensors", 0, stage_1.regions[-1].id, phases, self.memory, self.schedules, context,
+        )
+        assert stack.tokens[0].split(";")[1] == "0.6,0.4,0.2"
+        # And there is nothing left to fill.
+        with pytest.raises(sch.ScheduleError):
+            up.schedule_fill_stage_2(stack, "a.safetensors", phases, self.memory, self.schedules, context)
+
+    @pytest.mark.parametrize("stage_2", ["0", "1", "0.5"])
+    def test_clear_phase_puts_back_what_stage_2_was(self, stage_2):
+        phases, context = self._at(LTX23_DISTILLED)
+        stack = self._stack("0,0,0,0,1,1,1,1;" + stage_2, phases, context)
+        up.schedule_fill_stage_2(stack, "a.safetensors", phases, self.memory, self.schedules, context)
+        assert stack.tokens[0] == "0,0,0,0,1,1,1,1;1,1,1"
+        up.schedule_clear_phase(stack, "a.safetensors", 1, phases, self.memory, self.schedules, context)
+        assert stack.tokens[0] == "0,0,0,0,1,1,1,1;" + stage_2
+
+    @pytest.mark.parametrize("model_def, guidance, token", [
+        (LTX23_DISTILLED, 2, "1,1,1,1,0.8,0.6,0.4,0.2;0,0,1"),   # stage 2 drawn
+        (LTX23_DISTILLED, 2, "0.8;0"),                            # stage 1 not scheduled
+        (LTX23_DISTILLED, 2, "1,1,1,1,0.8,0.6,0.4,0.2"),          # no ';' (before the fit)
+        (LTX23_DISTILLED, 1, "1,1,1,1,0.8,0.6,0.4,0.2"),          # One Phase
+        (H3_MODEL_DEF, 1, "1,1,0.5,0;0.5"),                       # not staged
+        (LTX23_DISTILLED, 2, "0.5:0.9;1"),                        # preserved as imported
+    ])
+    def test_nothing_is_offered_where_it_could_overwrite_or_mean_nothing(self, model_def, guidance, token):
+        phases, context = self._at(model_def, guidance)
+        stack = self._stack(token, phases, context)
+        assert up.stage_2_fill(codec.classify(token, phases.capacity), phases, context) is None
+        fields = up.multiplier_fields(token, phases, "a.safetensors", self.memory, self.schedules, context)
+        assert fields["stage_2_fill"] is None
+        with pytest.raises(sch.ScheduleError):
+            up.schedule_fill_stage_2(stack, "a.safetensors", phases, self.memory, self.schedules, context)
+        assert stack.tokens[0] == token
+
+    def test_the_row_says_what_the_fill_would_draw(self):
+        phases, context = self._at(LTX23_DISTILLED)
+        token = "1,1,1,1,0.8,0.6,0.4,0.2;0"
+        self._stack(token, phases, context)
+        fields = up.multiplier_fields(token, phases, "a.safetensors", self.memory, self.schedules, context)
+        assert fields["stage_2_fill"] == {
+            "values": [0.6, 0.4, 0.2],
+            "steps": [6, 7, 8],
+            "empty": False,
+            "note": "Copy stage 1's steps 6-8, matched by noise level: 0.6, 0.4, 0.2",
+        }
+        # Browser tiles never carry it.
+        tile = up.multiplier_fields(token, phases, "a.safetensors", self.memory, with_schedules=False)
+        assert tile["stage_2_fill"] is None

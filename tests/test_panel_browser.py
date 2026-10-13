@@ -936,3 +936,33 @@ class TestLtxInTheBrowser:
         settle(page, 1300)
         assert native(page).split()[1] == "1,1,1,1,0,0,0,0;0,0,1"
         assert problems == []
+
+    def test_fill_from_stage_1_draws_the_refinement_once(self, ltx_panel):
+        page, _, problems = ltx_panel
+        row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
+
+        def show_stage_2():
+            # A chip only asks for a timeline when it changes the selection.
+            select_phase(page, row, 0)
+            open_timeline(page, row)
+            select_phase(page, row, 1)
+            settle(page, 900)
+            return row.locator("button.lb-fill-stage-2")
+
+        # Off where stage 2's noise levels are: the button says why, and is off.
+        set_token(page, 1, "1,1,1,1,0,0,0,0;0")
+        button = show_stage_2()
+        assert button.count() == 1 and button.is_disabled()
+        assert "nothing to carry" in button.get_attribute("title")
+
+        set_token(page, 1, "1,1,1,1,0.8,0.6,0.4,0.2;0")
+        button = show_stage_2()
+        assert button.is_enabled()
+        assert button.get_attribute("title").endswith("0.6, 0.4, 0.2")
+        button.click()
+        settle(page, 1300)
+        assert native(page).split()[1] == "1,1,1,1,0.8,0.6,0.4,0.2;0.6,0.4,0.2"
+        assert row.locator(".lb-region").count() == 3
+        # Drawn once: stage 2 is regions now, with nothing left to fill.
+        assert row.locator("button.lb-fill-stage-2").count() == 0
+        assert problems == []

@@ -52,13 +52,19 @@ COORD_STAGE_EXACT = "stage_exact"
 COORD_PHASE_RELATIVE = "phase_relative"
 COORD_NORMALIZED_READONLY = "normalized_readonly"
 
-#: LTX-2's stage lengths, as WanGP's ``models/ltx2/ltx_pipelines`` run them.
-#: The first stage runs the eight-step distilled sigma table on a distilled
-#: checkpoint -- or on the Dev checkpoint with a distilled sampler -- and the
-#: step counter otherwise; the refinement stage after the upscale always runs
-#: the three-step stage-2 table, whatever the counter says.
-LTX2_DISTILLED_STEPS = 8
-LTX2_REFINE_STEPS = 3
+#: LTX-2's sigma tables, as WanGP's ``models/ltx2/ltx_pipelines/utils/
+#: constants.py`` defines them.  A table of n + 1 sigmas runs n steps, step i
+#: evaluated at the i-th sigma.  The first stage runs the distilled table on a
+#: distilled checkpoint -- or on the Dev checkpoint with a distilled sampler --
+#: and the step counter otherwise.  The refinement stage after the upscale
+#: always runs one of the two stage-2 tables, whatever the counter says: the
+#: second on the 22B checkpoints (LTX-2.3, 2.5), whose handler sets
+#: ``ltx2_22B_class``, and on Dev after a distilled sampler.
+LTX2_DISTILLED_SIGMAS = (1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0)
+LTX2_STAGE_2_SIGMAS = (0.909375, 0.725, 0.421875, 0.0)
+LTX2_STAGE_2_SIGMAS_8_STEPS = (0.85, 0.725, 0.4219, 0.0)
+LTX2_DISTILLED_STEPS = len(LTX2_DISTILLED_SIGMAS) - 1
+LTX2_REFINE_STEPS = len(LTX2_STAGE_2_SIGMAS) - 1
 LTX2_DISTILLED_SAMPLERS = frozenset({"distilled_8_steps", "distilled_8_steps_ancestral"})
 
 #: Field separator used only inside the canonical fingerprint below.
@@ -114,13 +120,60 @@ def ltx2_runs_distilled_steps(model_def: dict | None, sampler: Any = "") -> bool
     ``distilled``, which JoyAI Echo always is) ignores the step counter, and so
     does the Dev checkpoint on one of the distilled samplers.
     """
+    return _ltx2_distilled_checkpoint(model_def) or _distilled_sampler(sampler)
+
+
+def _ltx2_distilled_checkpoint(model_def: dict | None) -> bool:
     model_def = model_def or {}
-    distilled = (
+    return (
         model_def.get("ltx2_pipeline") == "distilled"
         or str(model_def.get("architecture", "") or "") == "joyai_echo"
         or bool(model_def.get("joyai_echo", False))
     )
-    return distilled or str(sampler or "").strip().lower() in LTX2_DISTILLED_SAMPLERS
+
+
+def _distilled_sampler(sampler: Any) -> bool:
+    return str(sampler or "").strip().lower() in LTX2_DISTILLED_SAMPLERS
+
+
+def ltx2_stage_2_sigmas(model_def: dict | None, sampler: Any = "") -> tuple[float, ...]:
+    """The table an LTX-2 refinement stage runs, as both pipelines choose it.
+
+    WanGP's distilled pipeline also falls back to the first table while
+    rendering a layout; both tables match the same stage-1 steps, so nothing
+    here depends on telling those runs apart.
+    """
+    model_def = model_def or {}
+    if model_def.get("ltx2_22B_class", False):
+        return LTX2_STAGE_2_SIGMAS_8_STEPS
+    if not _ltx2_distilled_checkpoint(model_def) and _distilled_sampler(sampler):
+        return LTX2_STAGE_2_SIGMAS_8_STEPS
+    return LTX2_STAGE_2_SIGMAS
+
+
+def nearest_steps(stage_1: tuple[float, ...], stage_2: tuple[float, ...]) -> tuple[int, ...]:
+    """For each step of ``stage_2``, the step of ``stage_1`` run at the nearest
+    noise level, 1-based; a tie goes to the later, quieter step."""
+    starts = stage_1[:-1]
+    return tuple(
+        min(range(len(starts)), key=lambda index: (abs(starts[index] - sigma), -index)) + 1
+        for sigma in stage_2[:-1]
+    )
+
+
+def ltx2_stage_2_match(model_def: dict | None, sampler: Any = "") -> tuple[int, ...]:
+    """The stage-1 steps whose noise levels the refinement re-runs, one per
+    refinement step -- or empty when stage 1's noise levels are not known.
+
+    A distilled stage 1 ends where stage 2 works: the first stage-2 table is
+    the distilled table's last three steps exactly, and the second differs only
+    in starting at 0.85, inside step 6 (0.909 -> 0.725).  Either way that is
+    steps 6, 7 and 8.  A Dev stage 1 on its own scheduler runs a table this
+    does not reproduce, so nothing is matched there.
+    """
+    if not ltx2_runs_distilled_steps(model_def, sampler):
+        return ()
+    return nearest_steps(LTX2_DISTILLED_SIGMAS, ltx2_stage_2_sigmas(model_def, sampler))
 
 
 def phase_step_counts(
@@ -189,11 +242,16 @@ class ScheduleContext:
     a runtime interval that depends on model switching, and labelling its slots
     with step numbers the plugin cannot verify would be a lie.
     ``boundaries_known`` says which of the two this is.
+
+    ``stage_2_match`` is, for each refinement step of an LTX-2 run in Two
+    Phases, the stage-1 step at the nearest noise level, where stage 1's noise
+    levels are known (``ltx2_stage_2_match``); "Fill from stage 1" reads those.
     """
 
     steps: int = 0
     boundaries_known: bool = False
     phase_steps: tuple[int, ...] = ()
+    stage_2_match: tuple[int, ...] = ()
 
     @classmethod
     def from_native(
@@ -208,7 +266,12 @@ class ScheduleContext:
         except (TypeError, ValueError):
             steps = 0
         phase_steps = phase_step_counts(model_def, phases, steps, sampler) if phases else ()
-        return cls(steps=steps, boundaries_known=bool(phase_steps), phase_steps=phase_steps)
+        return cls(
+            steps=steps,
+            boundaries_known=bool(phase_steps),
+            phase_steps=phase_steps,
+            stage_2_match=ltx2_stage_2_match(model_def, sampler) if len(phase_steps) > 1 else (),
+        )
 
     def phase_length(self, phase: int = 0) -> int:
         """Steps ``phase`` runs, or 0 when nobody can say.
@@ -487,6 +550,7 @@ def multiplier_fields(
             "schedule_shared": False,
             "schedule_reason": info.reason,
             "advanced_preserved": True,
+            "stage_2_fill": None,
         }
 
     if info.kind == codec.SCHEDULED and scheduling_allowed(phases):
@@ -505,6 +569,7 @@ def multiplier_fields(
             "schedule_shared": False,
             "schedule_reason": SCHEDULING_DISABLED_REASON,
             "advanced_preserved": False,
+            "stage_2_fill": None,
         }
 
     values = full_values(info, phases, lora_id, memory)
@@ -531,6 +596,7 @@ def multiplier_fields(
         "schedule_shared": token_is_shared(info, phases, lora_id, schedules),
         "schedule_reason": "",
         "advanced_preserved": False,
+        "stage_2_fill": None,
     }
 
 
@@ -567,6 +633,10 @@ def _scheduled_fields(
         "schedule_shared": shared,
         "schedule_reason": "",
         "advanced_preserved": False,
+        # What "Fill from stage 1" would draw on an empty LTX-2 stage 2.
+        "stage_2_fill": (
+            stage_2_fill_payload(stage_2_fill(info, phases, context)) if with_schedules else None
+        ),
     }
 
 
@@ -1784,6 +1854,163 @@ def schedule_normalize(
 
     schedules[key] = sch.normalize_schedule(existing, target_slots)
     target = _resolve(stack, lora_id, index, phases, memory, schedules, context, create=False)
+    return _commit(stack, lora_id, target, phases, memory)
+
+
+# ----------------------------------------------------------- stage 2 fill
+#
+# An LTX-2 stage 2 starts empty, and stays a timeline of its own: nothing keeps
+# it in step with stage 1.  "Fill from stage 1" is the one bridge, and only on
+# request: it draws an empty stage 2 once, from what stage 1 applies where the
+# two stages share noise levels, and is plain regions from then on.
+
+
+@dataclass(frozen=True)
+class Stage2Fill:
+    """What "Fill from stage 1" would draw on an empty stage 2, and why."""
+
+    #: One value per refinement step.
+    values: tuple[float, ...]
+    #: The stage-1 steps they were read from, matched by noise level -- or
+    #: empty when stage 2 holds stage 1's final strength instead.
+    steps: tuple[int, ...] = ()
+
+    @property
+    def empty(self) -> bool:
+        """Nothing to carry: every value is what an empty slot is worth."""
+        return all(_close(value, sch.GAP_STRENGTH) for value in self.values)
+
+    @property
+    def note(self) -> str:
+        """What the button says it will do, or why it cannot."""
+        if self.steps:
+            if self.empty:
+                return (
+                    f"Stage 1 is off at steps {_step_span(self.steps)}, where it runs stage 2's "
+                    "noise levels - there is nothing to carry."
+                )
+            return (
+                f"Copy stage 1's steps {_step_span(self.steps)}, matched by noise level: "
+                + ", ".join(format_number(value) for value in self.values)
+            )
+        if self.empty:
+            return "Stage 1 ends at 0 - there is nothing to carry."
+        return (
+            f"Hold stage 1's final strength, {format_number(self.values[0])}, for all "
+            f"{len(self.values)} steps: this sampler's steps do not line up with stage 2's."
+        )
+
+    @property
+    def done(self) -> str:
+        """What the status bar says once it has."""
+        if self.steps:
+            return f"Stage 2 filled from stage 1's steps {_step_span(self.steps)}, matched by noise level."
+        return (
+            f"Stage 2 holds stage 1's final strength, {format_number(self.values[0])}: "
+            "this sampler's steps do not line up with stage 2's."
+        )
+
+
+def _step_span(steps: tuple[int, ...]) -> str:
+    consecutive = list(steps) == list(range(steps[0], steps[0] + len(steps)))
+    if consecutive and len(steps) > 1:
+        return f"{steps[0]}-{steps[-1]}"
+    return ", ".join(str(step) for step in steps)
+
+
+def _played(values: list[float], steps: int) -> list[float]:
+    """What WanGP applies at each of ``steps`` steps for one phase's list.
+
+    Mirrors ``expand_one`` in WanGP's multiplier parser -- entry
+    ``i * len // steps`` at step i -- so a list of any length is read the way
+    it runs.
+    """
+    count = len(values)
+    return [float(values[index * count // steps]) for index in range(steps)]
+
+
+def derive_stage_2(stage_1: list[float], context: ScheduleContext) -> Stage2Fill:
+    """Stage 2's values, from what stage 1 applies -- copied, never stretched.
+
+    Where stage 1's noise levels are known, each refinement step takes what
+    stage 1 applies at the matching level: a distilled stage 1's steps 6-8.
+    Its first five steps, where layout and motion are set, have no counterpart
+    in the refinement and are never read.  Otherwise there is no step to match,
+    and stage 2 holds the strength stage 1 ends at: one number, no shape the
+    run did not have.
+    """
+    played = _played(stage_1, context.phase_length(0))
+    steps = tuple(step for step in context.stage_2_match if step <= len(played))
+    if steps:
+        return Stage2Fill(values=tuple(played[step - 1] for step in steps), steps=steps)
+    return Stage2Fill(values=(played[-1],) * context.phase_length(1))
+
+
+def stage_2_fill(
+    info: codec.TokenInfo, phases: PhaseConfig, context: ScheduleContext | None
+) -> Stage2Fill | None:
+    """What "Fill from stage 1" offers this token, or ``None`` for nothing.
+
+    Offered on LTX-2 in Two Phases, for a token whose stage 1 is scheduled and
+    whose stage 2 has nothing drawn on it.  Whatever plain strength stage 2 has
+    stays its schedule's base, so Clear phase puts it back.
+    """
+    if not (phases.staged and phases.effective > 1 and context and len(context.phase_steps) > 1):
+        return None
+    if info.kind != codec.SCHEDULED or info.schedule is None or info.schedule.shared:
+        return None
+    stage_1, stage_2 = info.schedule.values_for(0), info.schedule.values_for(1)
+    if len(stage_1) < 2 or len(stage_2) > 1:
+        return None
+    return derive_stage_2(stage_1, context)
+
+
+def stage_2_fill_payload(fill: Stage2Fill | None) -> dict[str, Any] | None:
+    if fill is None:
+        return None
+    return {
+        "values": [round(value, VALUE_DECIMALS) for value in fill.values],
+        "steps": list(fill.steps),
+        "empty": fill.empty,
+        "note": fill.note,
+    }
+
+
+def schedule_fill_stage_2(
+    stack: "Stack",
+    lora_id: str,
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None = None,
+) -> bool:
+    """Draw an empty stage 2 from stage 1, once.
+
+    Regions like any others: nothing links them to stage 1 afterwards, so an
+    edit to either stage stays in that stage.  Refused when there is nothing
+    to carry -- an empty stage 2 already says that.
+    """
+    position = stack.index_of(lora_id)
+    if position < 0:
+        raise sch.ScheduleError("That LoRA is not active.")
+    fill = stage_2_fill(codec.classify(stack.tokens[position], phases.capacity), phases, context)
+    if fill is None:
+        raise sch.ScheduleError(
+            "Fill from stage 1 needs Two Phases on LTX-2, a schedule on stage 1 and "
+            "nothing drawn on stage 2."
+        )
+    if fill.empty:
+        raise sch.ScheduleError(fill.note)
+
+    target = _resolve(stack, lora_id, 1, phases, memory, schedules, context, create=True)
+    schedule = target.schedule
+    if schedule.regions:
+        raise sch.ScheduleError("Stage 2 already has a schedule - clear it first.")
+    drawn = sch.reconstruct_schedule(list(fill.values))
+    schedule.slots = len(fill.values)
+    schedule.regions = drawn.regions
+    schedule.selected_region_id = drawn.selected_region_id
+    sch.validate_regions(schedule.regions, schedule.slots)
     return _commit(stack, lora_id, target, phases, memory)
 
 

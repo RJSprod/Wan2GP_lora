@@ -93,7 +93,10 @@ def _fit_note(phases: up.PhaseConfig, scheduled: bool) -> str:
     if not (phases.staged and scheduled):
         return "Multipliers now match the phase mode; anything it hides comes back with it."
     if phases.effective > 1:
-        return "Two Phases: scheduled LoRAs keep their stage 1 schedule; stage 2 starts empty."
+        return (
+            "Two Phases: scheduled LoRAs keep their stage 1 schedule; stage 2 starts empty "
+            "- its timeline offers Fill from stage 1."
+        )
     return (
         "One Phase runs no refinement stage. Back in Two Phases, plain LoRAs get their "
         "stage 2 strength back and scheduled LoRAs start stage 2 empty."
@@ -776,6 +779,17 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
             if kind == "schedule_clear_phase":
                 return up.schedule_clear_phase(stack, lora_id, phase, *args)
+
+            if kind == "schedule_fill_stage_2":
+                # Described before it writes: afterwards stage 2 is drawn, and
+                # there is nothing left on offer to describe.
+                fill = up.stage_2_fill(
+                    up.codec.classify(stack.token_for(lora_id), phases.capacity), phases, context
+                )
+                changed = up.schedule_fill_stage_2(stack, lora_id, *args)
+                if changed and fill is not None:
+                    instance.note(fill.done)
+                return changed
 
             if kind == "schedule_resync":
                 # First the phase structure: a token declaring more phases than

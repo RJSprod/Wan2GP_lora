@@ -1468,7 +1468,8 @@ class TestLtxScheduling:
         assert multipliers == "1,1,1,1,0,0,0,0;0 1;1"
         assert payload["schedules_out_of_sync"] is False
         assert payload["status"] == (
-            "Two Phases: scheduled LoRAs keep their stage 1 schedule; stage 2 starts empty."
+            "Two Phases: scheduled LoRAs keep their stage 1 schedule; stage 2 starts empty "
+            "- its timeline offers Fill from stage 1."
         )
         row = row_of(payload, "a.safetensors")
         assert row["schedule_shared"] is False
@@ -1500,6 +1501,49 @@ class TestLtxScheduling:
         assert two == "0.8;0.4 1;1"
         assert payload["status"] == (
             "Multipliers now match the phase mode; anything it hides comes back with it."
+        )
+
+    def test_fill_from_stage_1_draws_stage_2_from_steps_6_to_8(self, ltx, state):
+        multipliers = "1,1,1,1,0.8,0.6,0.4,0.2;0 1;1"
+        payload = payload_of(ltx, state, self.LORAS, multipliers, guidance=2, steps=8)
+        offer = row_of(payload, "a.safetensors")["stage_2_fill"]
+        assert (offer["values"], offer["steps"], offer["empty"]) == ([0.6, 0.4, 0.2], [6, 7, 8], False)
+        assert row_of(payload, "b.safetensors")["stage_2_fill"] is None
+
+        _, mults, payload = act(
+            ltx, {"type": "schedule_fill_stage_2", "id": "a.safetensors"},
+            state, self.LORAS, multipliers, 2, 8,
+        )
+        assert mults["value"] == "1,1,1,1,0.8,0.6,0.4,0.2;0.6,0.4,0.2 1;1"
+        assert payload["status"] == "Stage 2 filled from stage 1's steps 6-8, matched by noise level."
+        row = row_of(payload, "a.safetensors")
+        assert row["stage_2_fill"] is None
+        second = row["phase_schedules"][1]
+        assert [(r["start"], r["strength"]) for r in second["regions"]] == [(1, 0.6), (2, 0.4), (3, 0.2)]
+
+    def test_nothing_to_carry_is_reported_and_writes_nothing(self, ltx, state):
+        multipliers = "1,1,1,1,0,0,0,0;0 1;1"
+        payload = payload_of(ltx, state, self.LORAS, multipliers, guidance=2, steps=8)
+        assert row_of(payload, "a.safetensors")["stage_2_fill"]["empty"] is True
+        _, mults, payload = act(
+            ltx, {"type": "schedule_fill_stage_2", "id": "a.safetensors"},
+            state, self.LORAS, multipliers, 2, 8,
+        )
+        assert "value" not in mults
+        assert payload["status_warn"] is True
+        assert "nothing to carry" in payload["status"]
+
+    def test_a_dev_stage_1_on_euler_hands_over_its_final_strength(self, plugin, state):
+        plugin.get_model_def = lambda model_type: LTX25_DEV
+        stage_1 = ",".join(["1"] * 20 + ["0.3"] * 10)
+        _, mults, payload = act(
+            plugin, {"type": "schedule_fill_stage_2", "id": "a.safetensors"},
+            state, self.LORAS, stage_1 + ";0 1;1", 2, 30, "euler",
+        )
+        assert mults["value"] == stage_1 + ";0.3,0.3,0.3 1;1"
+        assert payload["status"] == (
+            "Stage 2 holds stage 1's final strength, 0.3: this sampler's steps do not line up "
+            "with stage 2's."
         )
 
     def test_the_distilled_counter_is_ignored_and_the_dev_one_followed(self, plugin, state):
