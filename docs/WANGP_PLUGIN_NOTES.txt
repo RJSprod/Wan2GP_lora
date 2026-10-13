@@ -246,6 +246,19 @@ WHY IT TOOK FOUR ROUNDS
                    the Dev pipeline with sample_solver distilled_8_steps[_ancestral];
                    otherwise num_inference_steps (LTX2Scheduler, steps + 1 sigmas)
           stage 2: 3, always (both stage-2 sigma tables have four values)
+      The tables (models/ltx2/ltx_pipelines/utils/constants.py):
+          DISTILLED_SIGMA_VALUES   1.0 0.99375 0.9875 0.98125 0.975
+                                   0.909375 0.725 0.421875 0.0
+          STAGE_2_DISTILLED_SIGMA_VALUES          0.909375 0.725 0.421875 0.0
+          DISTILLED_8_STEPS_STAGE_2_SIGMA_VALUES  0.85 0.7250 0.4219 0.0
+      Stage 2 runs the second on the 22B checkpoints (ltx2_22B_class, with
+      LTX23_USE_DISTILLED_8_STEPS_STAGE_2_SIGMAS on) and on Dev after a
+      distilled sampler, the first otherwise. A step runs at the sigma it starts
+      from, so stage 2 re-runs the noise levels of a distilled stage 1's steps
+      6-8 -- exactly with the first table, nearest with the second, whose 0.85
+      falls inside step 6. That is what "Fill from stage 1" copies
+      (ui_payloads.derive_stage_2); a Dev stage 1 on LTX2Scheduler matches
+      nothing, and hands over its final strength instead.
       A comma-only token is expanded in BOTH stages: over stage 1's steps, then
       again squeezed into stage 2's three. The plugin never keeps one in Two
       Phases: it becomes "<list>;0", stage 1's schedule with an empty stage 2

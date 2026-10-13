@@ -172,6 +172,24 @@ LoRA does not run in the refinement, and Phase 2 opens as an empty three-step
 timeline. A region drawn there starts at full strength. The same goes for a list
 with no `;` that arrives any other way in Two Phases, such as a preset.
 
+**Fill from stage 1.** An empty stage 2 can be drawn from stage 1 in one click,
+on request only. It copies what stage 1 applies at the noise levels stage 2
+runs, never a stretched stage 1. On a distilled stage 1 — the distilled
+checkpoints, or Dev on a *Distilled 8 Steps* sampler — the refinement re-runs
+the noise levels of stage 1's last three steps, so stage 2 gets steps 6–8:
+
+| Stage 1 (8 steps) | Fill from stage 1 |
+| --- | --- |
+| `1,1,1,1,0,0,0,0` (early only) | nothing to carry — stage 2 stays empty |
+| `0,0,0,0,1,1,1,1` (late detail) | `1,1,1` |
+| `1,1,1,1,0.8,0.6,0.4,0.2` (fade out) | `0.6,0.4,0.2` |
+
+On Dev with Euler or res2s, stage 1's steps do not line up with stage 2's, so
+stage 2 holds the strength stage 1 ends at. The button is on an empty Phase 2
+timeline and its tooltip shows what it will write. What it draws is ordinary
+regions with no link to stage 1, and *Clear phase* puts back whatever stage 2
+was before.
+
 On every other model, switching guidance to two or more phases resets a
 scheduled LoRA to **0**: the schedule said the multiplier varies over the run,
 and no single number carries that over, so the LoRA switches off and waits for

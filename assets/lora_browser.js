@@ -1126,11 +1126,14 @@
       // Shared is structure too: the chip strip and the timeline's labels
       // differ, and a list with no ';' turning into one per LTX-2 stage keeps
       // the same stage-1 shape.
+      // So is what "Fill from stage 1" offers: its tooltip names the values.
+      var fill = row.stage_2_fill;
       return [
         row.id, rowName(row), row.multiplier_kind, (row.phase_values || []).length,
         row.missing ? "m" : "", row.system_managed ? "s" : "",
         phase, S.scheduleOpenById[row.id] ? "open" : "shut", shape,
-        row.schedule_shared ? "shared" : "own"
+        row.schedule_shared ? "shared" : "own",
+        fill ? (fill.empty ? "fill-none" : "fill-" + fill.values.join(",")) : ""
       ].join(":");
     // The step count is in here because the schedule header compares itself
     // against it; a run length change has to reach the row.
@@ -1705,6 +1708,24 @@
 
     var actions = document.createElement("div");
     actions.className = "lb-actions";
+
+    // An empty LTX-2 stage 2 can be drawn once from stage 1, where the two run
+    // the same noise levels. Disabled, it says why there is nothing to carry.
+    var fillInfo = row.stage_2_fill;
+    if (schedule && schedule.editable && schedule.stage === 2 && fillInfo &&
+        !(schedule.regions || []).length) {
+      var fill = document.createElement("button");
+      fill.type = "button";
+      fill.className = "lb-btn lb-fill-stage-2";
+      fill.textContent = "Fill from stage 1";
+      fill.title = fillInfo.note;
+      fill.disabled = !!fillInfo.empty;
+      fill.addEventListener("click", function () {
+        delete S.selectedRegionByKey[regionKey(row, phase)];
+        send({ type: "schedule_fill_stage_2", id: row.id });
+      });
+      actions.appendChild(fill);
+    }
 
     if (schedule && schedule.editable) {
       var add = document.createElement("button");
