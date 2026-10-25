@@ -982,30 +982,39 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         ``media`` (one catalogue image/video), ``video`` (a tile's preview
         video). Everything is addressed by stable LoRA id -- the frontend never
         supplies a filesystem path.
+
+        Every reply echoes the request's ``seq``. The browser only hears a
+        reply through the result textbox's change event, and Gradio raises none
+        when the new text equals the old -- two preview-less thumbnail batches,
+        or reopening a LoRA with no media, would otherwise leave the request
+        unanswered until its timeout, with everything queued behind it.
         """
         try:
             request = json.loads(request_json or "{}")
         except (TypeError, ValueError):
-            return json.dumps({"kind": "none"})
+            request = None
         if not isinstance(request, dict):
             return json.dumps({"kind": "none"})
 
         kind = str(request.get("kind", "thumbs"))
         try:
             if kind == "inspect":
-                return self._serve_inspect(instance, request, state_value)
-            if kind == "fetch":
-                return self._serve_fetch(instance, request, state_value)
-            if kind == "fetch_all":
-                return self._serve_fetch_all(instance, request, state_value)
-            if kind == "media":
-                return self._serve_catalogue_media(instance, request, state_value)
-            if kind == "video":
-                return self._serve_preview_video(instance, request, state_value)
-            return self._serve_thumbnails(instance, request, state_value)
+                reply = self._serve_inspect(instance, request, state_value)
+            elif kind == "fetch":
+                reply = self._serve_fetch(instance, request, state_value)
+            elif kind == "fetch_all":
+                reply = self._serve_fetch_all(instance, request, state_value)
+            elif kind == "media":
+                reply = self._serve_catalogue_media(instance, request, state_value)
+            elif kind == "video":
+                reply = self._serve_preview_video(instance, request, state_value)
+            else:
+                reply = self._serve_thumbnails(instance, request, state_value)
         except Exception as error:
             traceback.print_exc()
-            return json.dumps({"kind": kind, "error": str(error)})
+            reply = {"kind": kind, "error": str(error)}
+        reply["seq"] = request.get("seq")
+        return json.dumps(reply)
 
     def _entry_for(self, state_value, lora_id):
         """Resolve a frontend-supplied id against the current native inventory."""
@@ -1054,11 +1063,11 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             ],
         }
 
-    def _serve_inspect(self, instance, request, state_value) -> str:
+    def _serve_inspect(self, instance, request, state_value) -> dict:
         entry, lora_dir = self._entry_for(state_value, request.get("id"))
         if entry is None or not entry.path:
-            return json.dumps({"kind": "inspect", "error": "That LoRA is not in the current inventory."})
-        return json.dumps(self._inspect_payload(entry))
+            return {"kind": "inspect", "error": "That LoRA is not in the current inventory."}
+        return self._inspect_payload(entry)
 
     def _civitai_key(self) -> str:
         """The environment wins: a key exported for the session is never
@@ -1068,7 +1077,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             return from_env
         return self._metadata.civitai_api_key if self._metadata else ""
 
-    def _serve_fetch(self, instance, request, state_value) -> str:
+    def _serve_fetch(self, instance, request, state_value) -> dict:
         """Build or top up the Civitai catalogue folder for one LoRA.
 
         Deliberately synchronous: it runs on an explicit click, the frontend
@@ -1077,7 +1086,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         """
         entry, lora_dir = self._entry_for(state_value, request.get("id"))
         if entry is None or not entry.path:
-            return json.dumps({"kind": "fetch", "error": "That LoRA is not in the current inventory."})
+            return {"kind": "fetch", "error": "That LoRA is not in the current inventory."}
 
         report = civitai.fetch_sidecar(
             entry.path, api_key=self._civitai_key(), lora_root=lora_dir
@@ -1095,17 +1104,17 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             "downloaded": report.downloaded,
         })
         instance.note(report.message, not report.ok)
-        return json.dumps(payload)
+        return payload
 
-    def _bulk_payload(self, extra: dict | None = None) -> str:
+    def _bulk_payload(self, extra: dict | None = None) -> dict:
         payload = {"kind": "fetch_all", "running": False, "total": 0, "done": 0}
         if self._bulk is not None:
             payload.update(self._bulk.status())
             payload["running"] = self._bulk.running
         payload.update(extra or {})
-        return json.dumps(payload)
+        return payload
 
-    def _serve_fetch_all(self, instance, request, state_value) -> str:
+    def _serve_fetch_all(self, instance, request, state_value) -> dict:
         """Start, poll or stop a catalogue fetch across the whole inventory.
 
         The work runs on a worker thread and the frontend polls: a hundred
@@ -1143,20 +1152,20 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         ).start()
         return self._bulk_payload({"running": True})
 
-    def _serve_catalogue_media(self, instance, request, state_value) -> str:
+    def _serve_catalogue_media(self, instance, request, state_value) -> dict:
         entry, _ = self._entry_for(state_value, request.get("id"))
         if entry is None or not entry.path:
-            return json.dumps({"kind": "media", "error": "unknown LoRA"})
+            return {"kind": "media", "error": "unknown LoRA"}
 
         try:
             wanted = int(request.get("index", 0))
         except (TypeError, ValueError):
-            return json.dumps({"kind": "media", "error": "bad index"})
+            return {"kind": "media", "error": "bad index"}
 
         detail = cat.read_detail(entry.path)
         item = next((media for media in detail.media if media.index == wanted), None)
         if item is None:
-            return json.dumps({"kind": "media", "error": "no such media"})
+            return {"kind": "media", "error": "no such media"}
 
         data = (
             self._image_data_uri(item.path)
@@ -1164,16 +1173,16 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             else self._file_data_uri(item.path)
         )
         if not data:
-            return json.dumps({"kind": "media", "id": entry.id, "index": wanted,
-                               "error": "could not read media"})
-        return json.dumps({"kind": "media", "id": entry.id, "index": wanted,
-                           "media_kind": item.kind, "data": data})
+            return {"kind": "media", "id": entry.id, "index": wanted,
+                    "error": "could not read media"}
+        return {"kind": "media", "id": entry.id, "index": wanted,
+                "media_kind": item.kind, "data": data}
 
-    def _serve_preview_video(self, instance, request, state_value) -> str:
+    def _serve_preview_video(self, instance, request, state_value) -> dict:
         """The same-stem video beside the .safetensors, for tile playback."""
         entry, lora_dir = self._entry_for(state_value, request.get("id"))
         if entry is None or not entry.path:
-            return json.dumps({"kind": "video", "error": "unknown LoRA"})
+            return {"kind": "video", "error": "unknown LoRA"}
 
         directory = os.path.dirname(entry.path)
         stem = os.path.splitext(os.path.basename(entry.path))[0].lower()
@@ -1189,12 +1198,12 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 match = os.path.join(directory, name)
                 break
         if match is None or (lora_dir and not is_within(lora_dir, match)):
-            return json.dumps({"kind": "video", "id": entry.id, "error": "no preview video"})
+            return {"kind": "video", "id": entry.id, "error": "no preview video"}
 
         data = self._file_data_uri(match)
         if not data:
-            return json.dumps({"kind": "video", "id": entry.id, "error": "video too large to preview"})
-        return json.dumps({"kind": "video", "id": entry.id, "data": data})
+            return {"kind": "video", "id": entry.id, "error": "video too large to preview"}
+        return {"kind": "video", "id": entry.id, "data": data}
 
     def _image_data_uri(self, path: str) -> str:
         """Re-encode a catalogue image down to a sane size for the modal."""
@@ -1226,7 +1235,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         mime = _SNIFFED_MIME.get(sniffed) or mimetypes.guess_type(path)[0] or "application/octet-stream"
         return f"data:{mime};base64,{payload}"
 
-    def _serve_thumbnails(self, instance: InstanceState, request, state_value) -> str:
+    def _serve_thumbnails(self, instance: InstanceState, request, state_value) -> dict:
         """Resolve previews for the tiles the browser can actually see.
 
         The frontend only ever sends stable LoRA IDs; paths are resolved here
@@ -1236,7 +1245,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         """
         requested = [normalize_id(value) for value in request.get("ids", []) or []]
         if not requested or self._thumbnails is None:
-            return json.dumps({"kind": "thumbs", "thumbs": {}})
+            return {"kind": "thumbs", "thumbs": {}}
 
         model_type = self._model_type(state_value)
         lora_dir = self._lora_dir(model_type) or instance.lora_dir
@@ -1260,4 +1269,4 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             data_uri = self._thumbnails.get(preview)
             if data_uri:
                 thumbs[lora_id] = data_uri
-        return json.dumps({"kind": "thumbs", "thumbs": thumbs})
+        return {"kind": "thumbs", "thumbs": thumbs}
