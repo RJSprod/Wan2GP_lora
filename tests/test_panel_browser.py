@@ -99,9 +99,20 @@ __CSS__
       .then(function (response) { return response.json(); })
       .then(function (data) { window.__native = data.multipliers; push(data.payload); });
   });
+  // The media bridge as Gradio runs it: the request reaches the plugin's real
+  // handler, and the reply only reaches the panel when its text differs from
+  // the last one -- a Textbox raises no change event for an identical value.
+  var mediaReq = document.querySelector("#__THUMB_REQ_ID__ textarea");
+  var mediaRes = document.querySelector("#__THUMB_RES_ID__ textarea");
   document.querySelector("#__THUMB_BTN__ button").addEventListener("click", function () {
-    var api = window.wgpLoraBrowser && window.wgpLoraBrowser["__INST__"];
-    if (api) { api.applyMedia(JSON.stringify({ kind: "thumbs", thumbs: {} })); }
+    fetch("/media", { method: "POST", body: mediaReq.value })
+      .then(function (response) { return response.text(); })
+      .then(function (text) {
+        if (text === mediaRes.value) { return; }
+        mediaRes.value = text;
+        var api = window.wgpLoraBrowser && window.wgpLoraBrowser["__INST__"];
+        if (api) { api.applyMedia(text); }
+      });
   });
 })();
 </script>
@@ -155,6 +166,9 @@ class _Host:
             self.multipliers = mults["value"]
         return text
 
+    def media(self, request_json):
+        return self.plugin._serve_media(self.plugin._instance(INSTANCE), request_json, STATE)
+
 
 def _serve(host):
     class Handler(BaseHTTPRequestHandler):
@@ -197,6 +211,9 @@ def _serve(host):
 
         def do_POST(self):
             body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode("utf-8")
+            if self.path == "/media":
+                self._send(host.media(body))
+                return
             text = host.act(body)
             self._send(json.dumps({"payload": text, "multipliers": host.multipliers}))
 
@@ -416,6 +433,21 @@ class TestPanelInTheBrowser:
         assert box["width"] > 900 and box["height"] > 700
         page.keyboard.press("Escape")
         settle(page, 200)
+
+    def test_reopening_the_inspector_is_answered_at_once(self, panel):
+        """A LoRA with no catalogue gets the same Inspect reply every time, and
+        preview-less thumbnail batches all reply alike. Gradio drops a reply
+        whose text equals the last one, so without the echoed sequence number
+        the view sat on "Loading..." until the 30 s timeout, then claimed the
+        LoRA could not be read."""
+        page, _, _ = panel
+        inspect = page.locator(".lb-tile").first.locator("button.lb-tile-inspect")
+        for _ in range(2):
+            inspect.click()
+            page.wait_for_selector(".lb-modal .lb-fetch-btn", timeout=5000)
+            assert page.locator(".lb-modal-title").inner_text() != "Loading..."
+            page.keyboard.press("Escape")
+            settle(page, 200)
 
     def test_imported_values_survive_rendering(self, panel):
         page, _, _ = panel

@@ -104,6 +104,7 @@
     syncTimer: null,
     thumbTimer: null,
     mediaQueue: [],
+    mediaSeq: 0,
     mediaInFlight: null,
     mediaTimer: null,
     bulkTimer: null,
@@ -992,6 +993,11 @@
   function pumpMedia() {
     if (S.mediaInFlight || !S.mediaQueue.length) { return; }
     var job = S.mediaQueue.shift();
+    // The server echoes this back, which keeps every reply's text unique:
+    // Gradio raises no change event when a reply equals the one before it, so
+    // a repeated answer would otherwise sit unheard until the timeout.
+    S.mediaSeq += 1;
+    job.request.seq = S.mediaSeq;
     S.mediaInFlight = job;
     if (!setHidden(IDS.thumbReq, JSON.stringify(job.request))) {
       S.mediaInFlight = null;
@@ -1015,6 +1021,10 @@
     var payload = null;
     try { payload = JSON.parse(json || "{}"); } catch (error) { payload = null; }
     if (payload && payload.kind === "thumbs") { applyThumbBatch(payload); }
+    // A late reply to a request that already timed out is not the answer to
+    // the one now in flight; thumbnails above are keyed by id, so still useful.
+    var job = S.mediaInFlight;
+    if (payload && payload.seq !== undefined && (!job || payload.seq !== job.request.seq)) { return; }
     finishMedia(payload);
   }
 

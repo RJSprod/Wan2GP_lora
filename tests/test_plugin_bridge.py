@@ -679,6 +679,20 @@ class TestMediaBridge:
         assert result["has_catalogue"] is False
         assert result["media"] == []
 
+    def test_a_repeated_request_never_gets_identical_text(self, plugin, state, tmp_path):
+        """The browser only hears a reply through a Textbox change event, which
+        Gradio skips when the text is unchanged; the echoed seq keeps them apart."""
+        self._library(tmp_path)
+        instance = plugin._instance("test")
+        replies = [
+            plugin._serve_media(instance, json.dumps({"kind": kind, "id": "b.safetensors",
+                                                      "ids": ["b.safetensors"], "seq": seq}), state)
+            for kind in ("inspect", "thumbs", "media")
+            for seq in (1, 2)
+        ]
+        assert len(set(replies)) == len(replies)
+        assert [json.loads(reply)["seq"] for reply in replies] == [1, 2] * 3
+
     def test_inspect_refuses_an_unknown_lora(self, plugin, state, tmp_path):
         self._library(tmp_path)
         assert self.ask(plugin, state, {"kind": "inspect", "id": "../escape"})["error"]
