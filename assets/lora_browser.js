@@ -58,11 +58,10 @@
     valueDecimals: 4,
     steps: 0,
     //: Steps each LoRA phase runs, where the model's phases are stages of
-    //  known length (LTX-2); empty elsewhere.
+    //  known length (LTX-2, MiniMax H3); empty elsewhere.
     phaseSteps: [],
-    slotLimits: { min: 1, max: 120, default: 20 },
     //: Step schedules only mean what they show in One Phase guidance, or where
-    //  every phase is a stage of known length (LTX-2).
+    //  every phase is a stage of known length (LTX-2, MiniMax H3).
     schedulingEnabled: true,
     schedulingDisabledReason: "",
     profiles: [],
@@ -72,7 +71,9 @@
     activeProfile: "",
     status: "",
     statusWarn: false,
-    canRestore: false,
+    //: Whether "Disable all" / "Enable all" would change anything right now.
+    canDisableAll: false,
+    canEnableAll: false,
     thumbs: {},
     requested: {},
     pendingThumbs: [],
@@ -299,8 +300,10 @@
       '<div class="lb-grid-wrap" data-lb="grid-wrap"><div class="lb-grid" data-lb="grid" role="listbox" aria-multiselectable="true"></div></div>' +
       '<div class="lb-active-head"><span data-lb="active-title">Active LoRAs (0)</span>' +
         '<span class="lb-actions">' +
-          '<button type="button" class="lb-btn" data-lb="disable-all">Disable all</button>' +
-          '<button type="button" class="lb-btn" data-lb="restore" disabled>Restore</button>' +
+          '<button type="button" class="lb-btn" data-lb="disable-all" ' +
+            'title="Switch every LoRA off - each keeps its strength and schedule">Disable all</button>' +
+          '<button type="button" class="lb-btn" data-lb="enable-all" disabled ' +
+            'title="Switch every LoRA back on">Enable all</button>' +
         '</span>' +
       '</div>' +
       '<div class="lb-rows" data-lb="rows"></div>' +
@@ -319,7 +322,7 @@
       zoomIn: pick("zoom-in"), zoomOut: pick("zoom-out"),
       gridWrap: pick("grid-wrap"), grid: pick("grid"),
       activeTitle: pick("active-title"), disableAll: pick("disable-all"),
-      restore: pick("restore"), rows: pick("rows"), status: pick("status"),
+      enableAll: pick("enable-all"), rows: pick("rows"), status: pick("status"),
       nativeToggle: pick("native")
     };
 
@@ -443,7 +446,7 @@
     });
 
     el.disableAll.addEventListener("click", function () { send({ type: "disable_all" }); });
-    el.restore.addEventListener("click", function () { send({ type: "restore" }); });
+    el.enableAll.addEventListener("click", function () { send({ type: "enable_all" }); });
 
     // Last-resort escape hatch. Automatic fail-open covers the failures we can
     // detect; this covers the ones we cannot.
@@ -628,7 +631,9 @@
         } },
       { separator: true },
       { label: "Copy filename", run: function () { copyText(item.name || ""); } },
-      { label: item.active ? "Exclude LoRA" : "Include LoRA", run: function () { send({ type: "toggle", id: id, enabled: !item.active }); } }
+      item.disabled
+        ? { label: "Switch on", run: function () { send({ type: "set_enabled", id: id, value: true }); } }
+        : { label: item.active ? "Exclude LoRA" : "Include LoRA", run: function () { send({ type: "toggle", id: id, enabled: !item.active }); } }
     ];
   }
 
@@ -749,12 +754,13 @@
 
   function buildTile(item) {
     var tile = document.createElement("div");
-    tile.className = "lb-tile";
+    tile.className = "lb-tile" + (item.disabled ? " lb-tile-off" : "");
     tile.dataset.id = item.id;
     tile.tabIndex = 0;
     tile.setAttribute("role", "option");
     tile.setAttribute("aria-selected", item.active ? "true" : "false");
     var tooltip = [displayName(item), item.name];
+    if (item.disabled) { tooltip.push("Switched off - click to switch it back on"); }
     if (item.parent) { tooltip.push(item.parent); }
     if ((item.words || []).length) { tooltip.push("Triggers: " + item.words.join(", ")); }
     tile.title = tooltip.filter(Boolean).join("\n");
@@ -778,8 +784,9 @@
     var badges = document.createElement("div");
     badges.className = "lb-badges";
     var check = document.createElement("span");
-    if (item.active) {
-      check.className = "lb-check";
+    if (item.active || item.disabled) {
+      // In the stack either way; hollow while it is switched off.
+      check.className = "lb-check" + (item.disabled ? " lb-check-off" : "");
       check.textContent = "\u2713";
     }
     badges.appendChild(check);
@@ -1058,25 +1065,42 @@
 
   /* ------------------------------------------------------ active rows */
 
-  /* An active row is one of two modes, never both:
+  /* Every row has the same frame, whatever it is doing:
    *
-   *   plain      [i] LoRA name                      [Schedule v]  [x]
-   *              [Phase 1 0.71] [Phase 2 1.23] [Independent]
-   *              [-]  --------- slider ---------  [0.71]  [+]
+   *   [on] LoRA name                       [Schedule v]  [i]  [x]
+   *        [Phase 1 0.71] [Phase 2 1.23] [Independent]          (more than one phase)
+   *        [-]  --------- slider ---------  [0.71]  [+]
    *
-   *   scheduled  [i] LoRA name                      [Schedule ^]  [x]
-   *              [Phase 1 ~2] [Phase 2 1.23]
-   *              timeline, then [-] --- slider --- [0.9] [+] for the region
+   * and scheduling only changes what sits above the strength control:
    *
-   * The plain strength control is removed in scheduled mode rather than
-   * disabled, because it is not what WanGP applies: a scheduled phase is its
-   * regions, and every slot they do not cover is zero. Leaving a scrubber on
-   * screen that changes nothing would be a lie about what is running.
+   *   [on] LoRA name                     [~ Schedule ^]  [i]  [x]
+   *        [Phase 1 ~2] [Phase 2 1.23]
+   *        [Full screen] [Clear schedule]             [Delete]
+   *        timeline -- tap or drag on empty space to draw
+   *        [-]  --------- slider ---------  [0.9]  [+]    the selected region
+   *
+   * The strength control is the same control in both: it edits the plain
+   * strength, or the selected region -- never a number WanGP is not applying.
+   * A scheduled phase is its regions and every slot they do not cover is zero,
+   * so there is no plain strength left for it to show. Before anything is drawn
+   * it still edits the strength the phase is worth, and new regions start at.
+   *
+   * A switched-off row keeps everything and shows what switching it back on
+   * brings back; nothing in it is editable until it is on.
    *
    * Selected phase and expansion are view state held here; regions are
    * canonical state that Python validates. Collapsing is a view change only --
    * it never deletes a schedule, and it never brings the plain control back for
    * a phase that has one. */
+
+  function isOn(row) { return row.enabled !== false; }
+
+  /* What a row can edit: nothing while it is switched off, preserved syntax,
+     or a schedule this guidance mode cannot show truthfully. */
+  function rowEditable(row) {
+    if (!isOn(row) || row.multiplier_kind === "advanced") { return false; }
+    return !(row.multiplier_kind === "scheduled" && !S.schedulingEnabled);
+  }
 
   function phaseOf(row) {
     var count = Math.max(1, (row.phase_values || []).length);
@@ -1091,12 +1115,16 @@
     return list[index] || null;
   }
 
+  function hasActiveSchedule(row) {
+    return (row.phase_schedules || []).some(function (schedule) { return schedule && schedule.active; });
+  }
+
   function regionKey(row, phase) {
     return row.id + ":" + (row.schedule_shared ? "shared" : phase);
   }
 
   /* The payload's selection wins whenever the local one has gone stale, which
-     is how a freshly added region arrives already selected. */
+     is how a freshly drawn region arrives already selected. */
   function selectedRegion(row, phase, schedule) {
     if (!schedule) { return null; }
     var regions = schedule.regions || [];
@@ -1112,17 +1140,6 @@
     return found || regions[0] || null;
   }
 
-  /* One phase only, unless every phase is a stage of known length (LTX-2): with
-     more, WanGP squeezes each phase's values into a phase whose length nothing
-     knows while editing, so a timeline would be drawing something it cannot
-     promise. */
-  function schedulingNote() {
-    var note = document.createElement("div");
-    note.className = "lb-preserved-note";
-    note.textContent = S.schedulingDisabledReason;
-    return note;
-  }
-
   function rowsKey() {
     return S.rows.map(function (row) {
       var phase = phaseOf(row);
@@ -1133,20 +1150,18 @@
             return region.id + "@" + region.start + "-" + region.end;
           }).join(",")
         : "-";
-      // Shared is structure too: the chip strip and the timeline's labels
-      // differ, and a list with no ';' turning into one per LTX-2 stage keeps
-      // the same stage-1 shape.
+      // Shared is structure too: the chip strip differs, and a list with no
+      // ';' turning into one per stage keeps the same stage-1 shape.
       // So is what "Fill from stage 1" offers: its tooltip names the values.
       var fill = row.stage_2_fill;
       return [
         row.id, rowName(row), row.multiplier_kind, (row.phase_values || []).length,
         row.missing ? "m" : "", row.system_managed ? "s" : "",
+        isOn(row) ? "on" : "off:" + (row.summary || ""),
         phase, S.scheduleOpenById[row.id] ? "open" : "shut", shape,
-        row.schedule_shared ? "shared" : "own",
+        row.schedule_shared ? "shared" : "own", hasActiveSchedule(row) ? "sched" : "plain",
         fill ? (fill.empty ? "fill-none" : "fill-" + fill.values.join(",")) : ""
       ].join(":");
-    // The step count is in here because the schedule header compares itself
-    // against it; a run length change has to reach the row.
     }).join("|") + "#" + S.phases.effective + "#" + S.nameMode + "#" + S.steps
       + "#" + S.phaseSteps.join(",") + "#" + (S.schedulingEnabled ? "sched" : "nosched");
   }
@@ -1188,23 +1203,27 @@
 
   function buildRow(row) {
     var node = document.createElement("div");
-    node.className = "lb-row" + (row.missing ? " lb-missing" : "");
+    node.className = "lb-row" + (row.missing ? " lb-missing" : "") + (isOn(row) ? "" : " lb-row-off");
     node.dataset.id = row.id;
 
     var phase = phaseOf(row);
     var schedule = scheduleOf(row, phase);
-    var open = !!S.scheduleOpenById[row.id] && S.schedulingEnabled;
+    var editable = rowEditable(row);
+    var open = editable && !!S.scheduleOpenById[row.id] && S.schedulingEnabled;
 
-    node.appendChild(buildRowTop(row, phase, schedule, open));
+    node.appendChild(buildRowTop(row, open, editable));
 
+    if (!isOn(row)) {
+      node.appendChild(buildOffSummary(row));
+      return node;
+    }
     if (row.multiplier_kind === "advanced") {
       node.appendChild(buildPreserved(row));
       return node;
     }
-
-    if (row.multiplier_kind === "scheduled" && !S.schedulingEnabled) {
-      // Waiting for the reset that leaving One Phase triggers.
-      node.appendChild(schedulingNote());
+    if (!editable) {
+      // A schedule this guidance mode cannot show: kept as it is, read-only.
+      node.appendChild(buildKeptSchedule(row));
       return node;
     }
 
@@ -1216,7 +1235,7 @@
     }
 
     if (open) {
-      // Scheduler mode: the timeline and its own strength control, nothing else.
+      // Scheduler mode: the timeline, its tools, and the same strength control.
       var built = buildSchedule(row, phase, schedule);
       node.appendChild(built.node);
       if (built.paint) { painters.push(built.paint); }
@@ -1263,11 +1282,62 @@
   function baseKey(id, phase) { return id + "#" + phase; }
   function regionKeyFor(id, phase, regionId) { return id + "#" + phase + "#" + regionId; }
 
-  function buildRowTop(row, phase, schedule, open) {
+  function buildRowTop(row, open, editable) {
     var top = document.createElement("div");
     top.className = "lb-row-top";
 
-    // Inspector first: one tap from every row to the full record.
+    // On/off first: the one thing worth reaching without looking. WanGP's own
+    // accelerator LoRAs are its to manage, so they have no switch.
+    if (!row.system_managed) {
+      top.appendChild(powerSwitch(row));
+    }
+
+    // The name truncates before the controls do; the full one is in the tooltip.
+    var name = document.createElement("div");
+    name.className = "lb-row-name";
+    name.textContent = rowName(row);
+    name.title = [row.civitai_name, row.name].filter(Boolean).join("\n");
+    if (row.system_managed) { name.appendChild(note("WanGP-managed")); }
+    if (row.missing) { name.appendChild(note("Missing locally")); }
+    top.appendChild(name);
+
+    if (editable && S.schedulingEnabled) {
+      var scheduled = hasActiveSchedule(row);
+      var toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "lb-btn lb-schedule-toggle" + (open ? " lb-on" : "") +
+        (scheduled ? " lb-scheduled" : "");
+      // The word gives way on a phone; the mark and the arrow do not.
+      [["lb-sched-mark", "∿"], ["lb-sched-word", "Schedule"], ["lb-sched-arrow", open ? "▴" : "▾"]]
+        .forEach(function (part) {
+          var span = document.createElement("span");
+          span.className = part[0];
+          span.textContent = part[1];
+          toggle.appendChild(span);
+        });
+      toggle.setAttribute("aria-label", "Schedule");
+      toggle.title = open
+        ? "Hide the timeline - the schedule is kept"
+        : scheduled
+          ? "Show this LoRA's schedule"
+          : "Schedule this phase over the steps instead of one strength";
+      toggle.setAttribute("aria-expanded", open ? "true" : "false");
+      toggle.addEventListener("click", function () {
+        var next = !S.scheduleOpenById[row.id];
+        S.scheduleOpenById[row.id] = next;
+        // Opening a phase that has no schedule yet asks Python for one; it
+        // creates the timeline without writing anything to WanGP.
+        var phase = phaseOf(row);
+        if (next && !scheduleOf(row, phase)) {
+          send({ type: "schedule_enable", id: row.id, phase: phase });
+          return;
+        }
+        renderRows(true);
+      });
+      top.appendChild(toggle);
+    }
+
+    // One tap from every row to the full record.
     var inspect = document.createElement("button");
     inspect.type = "button";
     inspect.className = "lb-btn lb-icon lb-inspect";
@@ -1278,50 +1348,68 @@
     inspect.addEventListener("click", function () { openInspect(row.id); });
     top.appendChild(inspect);
 
-    // The name truncates before the controls do; the full one is in the tooltip.
-    var name = document.createElement("div");
-    name.className = "lb-row-name";
-    name.textContent = rowName(row);
-    name.title = [row.civitai_name, row.name].filter(Boolean).join("\n");
-    if (row.system_managed) { name.appendChild(note("WanGP-managed")); }
-    if (row.missing) { name.appendChild(note("Missing locally")); }
-    if (row.multiplier_kind === "scheduled") { name.appendChild(note("Scheduled")); }
-    top.appendChild(name);
-
-    if (row.multiplier_kind !== "advanced" && S.schedulingEnabled) {
-      var toggle = document.createElement("button");
-      toggle.type = "button";
-      toggle.className = "lb-btn lb-schedule-toggle" + (open ? " lb-on" : "");
-      toggle.textContent = "Schedule " + (open ? "▴" : "▾");
-      toggle.title = open
-        ? "Leave the scheduler - the schedule is kept"
-        : "Schedule this phase over the run instead of one strength";
-      toggle.setAttribute("aria-expanded", open ? "true" : "false");
-      toggle.setAttribute("aria-pressed", open ? "true" : "false");
-      toggle.addEventListener("click", function () {
-        var next = !S.scheduleOpenById[row.id];
-        S.scheduleOpenById[row.id] = next;
-        // Opening a phase that has no schedule yet asks Python for one; it
-        // creates the timeline without writing anything to WanGP.
-        if (next && !scheduleOf(row, phase)) {
-          send({ type: "schedule_enable", id: row.id, phase: phase });
-          return;
-        }
-        renderRows(true);
-      });
-      top.appendChild(toggle);
-    }
-
     // Remove stays isolated at the far edge so it is never hit by accident.
     var remove = document.createElement("button");
     remove.type = "button";
     remove.className = "lb-btn lb-icon lb-remove";
     remove.textContent = "×";
-    remove.title = "Remove " + row.name;
+    remove.title = "Remove " + row.name + (isOn(row) ? "" : " - and forget its settings");
     remove.setAttribute("aria-label", "Remove " + row.name);
     remove.addEventListener("click", function () { send({ type: "remove", id: row.id }); });
     top.appendChild(remove);
     return top;
+  }
+
+  /* Off is not removed: the LoRA keeps its strength, schedule and place, and
+     WanGP neither loads nor applies it. */
+  function powerSwitch(row) {
+    var on = isOn(row);
+    var power = document.createElement("button");
+    power.type = "button";
+    power.className = "lb-switch" + (on ? " lb-on" : "");
+    power.setAttribute("role", "switch");
+    power.setAttribute("aria-checked", on ? "true" : "false");
+    power.setAttribute("aria-label", "Apply " + rowName(row));
+    power.title = on
+      ? "Applied - switch off to skip it and keep its settings"
+      : "Switched off - kept, not applied. Switch on to apply it again";
+    power.addEventListener("click", function () {
+      send({ type: "set_enabled", id: row.id, value: !on });
+    });
+    return power;
+  }
+
+  /* What a switched-off LoRA brings back when it is switched on again. */
+  function buildOffSummary(row) {
+    var line = document.createElement("div");
+    line.className = "lb-off-summary";
+    var label = document.createElement("span");
+    label.className = "lb-off-label";
+    label.textContent = "Off";
+    line.appendChild(label);
+    var text = document.createElement("span");
+    text.className = "lb-off-text";
+    text.textContent = row.summary || row.multiplier_raw || "";
+    text.title = "Kept while it is off: " + (row.multiplier_raw || "");
+    line.appendChild(text);
+    return line;
+  }
+
+  /* A schedule in a guidance mode that cannot show one truthfully: what it
+     says, and why it waits for One Phase. Nothing here rewrites it. */
+  function buildKeptSchedule(row) {
+    var wrap = document.createElement("div");
+    wrap.className = "lb-preserved";
+    var summary = document.createElement("div");
+    summary.className = "lb-kept-summary";
+    summary.textContent = row.summary || row.multiplier_raw;
+    summary.title = row.multiplier_raw || "";
+    wrap.appendChild(summary);
+    var why = document.createElement("div");
+    why.className = "lb-preserved-note";
+    why.textContent = row.schedule_reason || S.schedulingDisabledReason;
+    wrap.appendChild(why);
+    return wrap;
   }
 
   /* A multiplier this editor will not rewrite: branch syntax, or a phase
@@ -1470,7 +1558,7 @@
     summary.appendChild(hint);
 
     summary.title = "This phase is scheduled over " + schedule.slots
-      + " slots; slots no region covers are 0. Tap to edit it.";
+      + " steps; steps no region covers are 0. Tap to edit it.";
     summary.addEventListener("click", function () {
       S.scheduleOpenById[row.id] = true;
       renderRows(true);
@@ -1637,12 +1725,15 @@
 
   /* ------------------------------------------------------- timeline */
 
+  /* Tools, then the timeline, then the strength control the plain row has --
+     so a row looks the same scheduled or not, give or take a timeline. The
+     timeline always has one slot per step: the step counter decides its
+     length, never a setting here. */
   function buildSchedule(row, phase, schedule, options) {
     options = options || {};
     var box = document.createElement("div");
     box.className = "lb-schedule";
     if (!schedule) {
-      box.appendChild(scheduleHead(row, phase, null, options));
       var pending = document.createElement("div");
       pending.className = "lb-empty";
       pending.textContent = "Opening schedule...";
@@ -1650,28 +1741,26 @@
       return { node: box, paint: null };
     }
 
-    box.appendChild(scheduleHead(row, phase, schedule, options));
-
     if (!schedule.editable) {
       var locked = document.createElement("div");
       locked.className = "lb-preserved-note";
       locked.textContent = schedule.reason ||
         "This schedule is preserved exactly as imported and is read-only.";
       box.appendChild(locked);
-      if (schedule.normalization_required) {
-        box.appendChild(normalizeButton(row, phase, schedule));
-      }
+      var fit = fitButton(row, phase, schedule);
+      if (fit) { box.appendChild(fit); }
       return { node: box, paint: null };
     }
 
     var selected = selectedRegion(row, phase, schedule);
+    box.appendChild(scheduleTools(row, phase, schedule, selected, options));
     var wrap = document.createElement("div");
     wrap.className = "lb-timeline-wrap";
     var timeline = buildTimeline(row, phase, schedule, selected);
     wrap.appendChild(timeline);
     box.appendChild(wrap);
-    var editor = buildRegionEditor(row, phase, schedule, selected, timeline);
-    box.appendChild(editor.node);
+    var weight = buildScheduleWeight(row, phase, schedule, selected, timeline);
+    box.appendChild(weight.node);
 
     // Strengths can change without any region moving, so they repaint in place
     // rather than through a rebuild that would interrupt whoever is typing.
@@ -1680,50 +1769,64 @@
       paint: function (next) {
         var nextSchedule = scheduleOf(next, phaseOf(next));
         if (!nextSchedule) { return; }
-        (nextSchedule.regions || []).forEach(function (region) {
+        var regions = nextSchedule.regions || [];
+        regions.forEach(function (region) {
           var node = timeline.querySelector('.lb-region[data-region="' + cssEscape(region.id) + '"]');
           var readout = node && node.querySelector("strong");
           if (readout) { readout.textContent = fmt(regionValue(next, phase, region)); }
         });
-        if (selected) {
-          (nextSchedule.regions || []).forEach(function (region) {
-            if (region.id === selected.id) { editor.paint(regionValue(next, phase, region)); }
-          });
+        if (!regions.length) {
+          weight.paint(currentValue(next, phase, nextSchedule));
+          return;
         }
+        regions.forEach(function (region) {
+          if (selected && region.id === selected.id) { weight.paint(regionValue(next, phase, region)); }
+        });
       }
     };
   }
 
-  function scheduleHead(row, phase, schedule, options) {
-    options = options || {};
-    var head = document.createElement("div");
-    head.className = "lb-sched-head";
+  /* One row of tools for the whole schedule, and Delete for the selected
+     region at its far end -- there only while a region is selected. */
+  function scheduleTools(row, phase, schedule, selected, options) {
+    var tools = document.createElement("div");
+    tools.className = "lb-sched-tools";
 
-    var titles = document.createElement("div");
-    titles.className = "lb-sched-titles";
-    var title = document.createElement("strong");
-    title.textContent = "Step schedule";
-    titles.appendChild(title);
-    if ((row.phase_values || []).length > 1 && !row.schedule_shared) {
-      titles.appendChild(pill(S.phaseLabels[phase] || ("Phase " + (phase + 1))));
+    if (!options.modal) {
+      // A long run leaves little room per slot inline; this is where the
+      // timeline gets the width to work in.
+      var expand = document.createElement("button");
+      expand.type = "button";
+      expand.className = "lb-btn";
+      expand.textContent = "⤢ Full screen";
+      expand.title = "Edit this schedule in a full-screen view";
+      expand.addEventListener("click", function () { openScheduleModal(row.id, phase); });
+      tools.appendChild(expand);
     }
-    if (schedule) {
-      var coordinates = pill(coordinateLabel(schedule));
-      coordinates.title = coordinateTitle(schedule);
-      titles.appendChild(coordinates);
-    }
-    var kept = schedule ? keptPastEndPill(schedule) : null;
-    if (kept) { titles.appendChild(kept); }
-    head.appendChild(titles);
 
-    var actions = document.createElement("div");
-    actions.className = "lb-actions";
+    var clear = document.createElement("button");
+    clear.type = "button";
+    clear.className = "lb-btn";
+    clear.textContent = "Clear schedule";
+    clear.title = (row.phase_values || []).length > 1 && !row.schedule_shared
+      ? "Remove only this phase's schedule and go back to one strength"
+      : "Remove the schedule and go back to one strength";
+    clear.addEventListener("click", function () {
+      if ((schedule.regions || []).length &&
+          !window.confirm("Remove this schedule and keep " + fmt(schedule.base) + " as the strength?")) {
+        return;
+      }
+      delete S.selectedRegionByKey[regionKey(row, phase)];
+      S.scheduleOpenById[row.id] = false;
+      if (options.modal) { closeScheduleModal(); }
+      send({ type: "schedule_clear_phase", id: row.id, phase: phase });
+    });
+    tools.appendChild(clear);
 
-    // An empty LTX-2 stage 2 can be drawn once from stage 1, where the two run
-    // the same noise levels. Disabled, it says why there is nothing to carry.
+    // An empty stage 2 can be drawn once from stage 1. Disabled, it says why
+    // there is nothing to carry.
     var fillInfo = row.stage_2_fill;
-    if (schedule && schedule.editable && schedule.stage === 2 && fillInfo &&
-        !(schedule.regions || []).length) {
+    if (schedule.stage === 2 && fillInfo && !(schedule.regions || []).length) {
       var fill = document.createElement("button");
       fill.type = "button";
       fill.className = "lb-btn lb-fill-stage-2";
@@ -1734,187 +1837,71 @@
         delete S.selectedRegionByKey[regionKey(row, phase)];
         send({ type: "schedule_fill_stage_2", id: row.id });
       });
-      actions.appendChild(fill);
+      tools.appendChild(fill);
     }
 
-    if (schedule && schedule.editable) {
-      var add = document.createElement("button");
-      add.type = "button";
-      add.className = "lb-btn lb-on";
-      add.textContent = "+ Region";
-      add.title = "Add a region in the next free part of the timeline";
-      add.addEventListener("click", function () {
-        // Let Python's choice of region be the selected one.
+    if (selected) {
+      var remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "lb-btn lb-delete-region";
+      remove.textContent = "Delete";
+      remove.title = "Delete the selected region (" + rangeLabel(selected, schedule).toLowerCase()
+        + "); its steps go back to 0";
+      remove.addEventListener("click", function () {
         delete S.selectedRegionByKey[regionKey(row, phase)];
-        send({ type: "schedule_add_region", id: row.id, phase: phase });
+        send({ type: "schedule_delete_region", id: row.id, phase: phase, region_id: selected.id });
       });
-      actions.appendChild(add);
-      actions.appendChild(normalizeButton(row, phase, schedule));
+      tools.appendChild(remove);
+    }
+    return tools;
+  }
 
-      var clear = document.createElement("button");
-      clear.type = "button";
-      clear.className = "lb-btn";
-      clear.textContent = "Clear phase";
-      clear.title = row.schedule_shared
-        ? "Remove this schedule and keep its base strength"
-        : "Remove only this phase's schedule and keep its base strength";
-      clear.addEventListener("click", function () {
-        if ((schedule.regions || []).length &&
-            !window.confirm("Remove this schedule and keep " + fmt(schedule.base) + " as the strength?")) {
-          return;
-        }
-        delete S.selectedRegionByKey[regionKey(row, phase)];
-        S.scheduleOpenById[row.id] = false;
-        if (options.modal) { closeScheduleModal(); }
-        send({ type: "schedule_clear_phase", id: row.id, phase: phase });
+  /* The plain row's strength control, pointed at what a scheduled phase has:
+     the selected region -- or, before anything is drawn, the strength the
+     phase is worth and new regions start at. */
+  function buildScheduleWeight(row, phase, schedule, selected, timeline) {
+    var drawn = (schedule.regions || []).length > 0;
+    if (!drawn || !selected) {
+      return buildWeightLine({
+        value: currentValue(row, phase, schedule),
+        label: (row.name + " " + (S.phaseLabels[phase] || "strength")).trim(),
+        commit: function (value) { commitBase(row, phase, value); },
+        settle: flushSync
       });
-      actions.appendChild(clear);
     }
-
-    if (!options.modal) {
-      // A long run leaves little room per slot inline; this is where the
-      // timeline gets the width to work in.
-      var expand = document.createElement("button");
-      expand.type = "button";
-      expand.className = "lb-btn";
-      expand.textContent = "\u2922 Full screen";
-      expand.title = "Edit this schedule in a full-screen view";
-      expand.addEventListener("click", function () { openScheduleModal(row.id, phase); });
-      actions.appendChild(expand);
-    }
-
-    var close = document.createElement("button");
-    close.type = "button";
-    close.className = "lb-btn";
-    close.textContent = "Close";
-    close.title = options.modal
-      ? "Close the full-screen editor"
-      : "Collapse the timeline - the schedule is kept";
-    close.addEventListener("click", function () {
-      if (options.modal) { closeScheduleModal(); return; }
-      S.scheduleOpenById[row.id] = false;
-      renderRows(true);
+    return buildWeightLine({
+      value: regionValue(row, phase, selected),
+      label: "Strength at " + rangeLabel(selected, schedule).toLowerCase(),
+      commit: function (value) {
+        var node = timeline.querySelector('.lb-region[data-region="' + cssEscape(selected.id) + '"]');
+        var readout = node && node.querySelector("strong");
+        if (readout) { readout.textContent = fmt(value); }
+        S.localValues[regionKeyFor(row.id, phase, selected.id)] = Number(value);
+        S.pendingValues[regionKeyFor(row.id, phase, selected.id)] = {
+          type: "schedule_set_region_strength", id: row.id, phase: phase,
+          region_id: selected.id, value: Number(value)
+        };
+        scheduleSync();
+      },
+      settle: flushSync
     });
-    actions.appendChild(close);
-    head.appendChild(actions);
-    return head;
   }
 
-  /* A lower step count hides the end of a schedule rather than deleting it,
-     so the timeline says when something is waiting past its last slot. */
-  function keptPastEndPill(schedule) {
-    var last = Number(schedule.drawn_past_end) || 0;
-    if (last <= schedule.slots) { return null; }
-    var more = last - schedule.slots;
-    var label = pill("+" + more + (more === 1 ? " step kept" : " steps kept"));
-    label.className += " lb-pill-kept";
-    label.title = "Steps " + (schedule.slots + 1) + "-" + last + " are past the end of this "
-      + schedule.slots + "-step run. They are kept, not deleted: raise the step count "
-      + "and they come back as they were.";
-    return label;
-  }
-
-  function coordinateLabel(schedule) {
-    var slots = schedule.slots;
-    if (schedule.coordinate_mode === "global_exact") {
-      return slots + " global steps";
-    }
-    if (schedule.coordinate_mode === "stage_exact") {
-      return (schedule.shared ? "stages 1+2" : stageName(schedule.stage)) + " • " + slots + " steps";
-    }
-    if (schedule.coordinate_mode === "normalized_readonly") {
-      return "read-only • " + slots + " values";
-    }
-    if (schedule.stage_count > 1) {
-      return "spread over " + (schedule.shared ? "both stages" : stageName(schedule.stage))
-        + " • " + slots + " values";
-    }
-    return (schedule.shared ? "spread over the run • " : "phase-relative • ")
-      + slots + " schedule slots";
-  }
-
-  /* LTX-2 runs its phases as pipeline stages: the first denoising pass, then a
-     short refinement after the upscale. */
-  function stageName(stage) {
-    return stage === 2 ? "stage 2 (refine)" : "stage " + stage;
-  }
-
-  function coordinateTitle(schedule) {
-    if (!schedule.stage_count) { return ""; }
-    if (schedule.coordinate_mode !== "stage_exact" && schedule.coordinate_mode !== "global_exact") {
-      return "WanGP stretches these " + schedule.slots + " values over the "
-        + schedule.stage_steps + " steps the stage runs.";
-    }
-    if (schedule.stage_count === 1) {
-      return "One Phase runs a single stage, so slot n is step n of the run.";
-    }
-    var refine = S.phaseSteps[1] || 0;
-    if (schedule.shared) {
-      return "A list with no ';' runs in both stages: one value per step over stage 1's "
-        + schedule.stage_steps + " steps, then squeezed into the " + refine
-        + " refinement steps of stage 2.";
-    }
-    if (schedule.stage === 2) {
-      return "Stage 2 refines the upscaled video and always runs " + schedule.stage_steps
-        + " steps, whatever the step counter says. Slot n is its step n.";
-    }
-    return "Stage 1 is the first denoising pass, " + schedule.stage_steps
-      + " steps. Slot n is its step n.";
-  }
-
-  /* Resolution is a product decision, so it is offered rather than applied:
-     re-gridding rewrites the native token, and nothing else here does that
-     without being asked. */
-  function normalizeButton(row, phase, schedule) {
+  /* A list too long to drag is offered one way back to editable: one value
+     per step of the run, which is what every editable timeline is. */
+  function fitButton(row, phase, schedule) {
+    var steps = schedule.stage_steps || S.steps;
+    if (!schedule.normalization_required || !steps) { return null; }
     var button = document.createElement("button");
     button.type = "button";
-    // Editable timelines follow the step counter on their own now, so this is
-    // for choosing a resolution deliberately -- a read-only list too long to
-    // drag, or a schedule you want coarser than the run.
     button.className = "lb-btn";
-    button.textContent = "Slots: " + schedule.slots + " ▾";
-    button.title = "Change how many schedule values this phase uses";
-    button.addEventListener("click", function (event) {
-      var rect = button.getBoundingClientRect();
-      openMenu(rect.left, rect.bottom, slotMenuItems(row, phase, schedule));
-      event.stopPropagation();
+    button.textContent = "Fit to " + steps + " steps";
+    button.title = "Resample it to one value per step - this rewrites the multiplier";
+    button.addEventListener("click", function () {
+      setStatus("Fitting this schedule to " + steps + " steps...");
+      send({ type: "schedule_normalize", id: row.id, phase: phase, slots: steps });
     });
     return button;
-  }
-
-  function slotMenuItems(row, phase, schedule) {
-    var limits = S.slotLimits || { min: 1, max: 120, default: 20 };
-    var options = [];
-    var seen = {};
-    // A stage's own length is what "one per step" means for it.
-    var perStep = schedule.stage_steps || S.steps;
-    [perStep, 8, 10, 12, 16, 20, 30, 40].forEach(function (value) {
-      var slots = Math.round(Number(value));
-      if (!slots || slots < limits.min || slots > limits.max || seen[slots]) { return; }
-      seen[slots] = true;
-      options.push(slots);
-    });
-    options.sort(function (left, right) { return left - right; });
-
-    var items = options.map(function (slots) {
-      var label = slots + " slots";
-      if (slots === perStep) { label += "  (one per step)"; }
-      if (slots === schedule.slots) { label = "✓ " + label; }
-      return {
-        label: label,
-        run: function () {
-          if (slots === schedule.slots) { return; }
-          setStatus("Re-gridding this schedule to " + slots + " values...");
-          send({ type: "schedule_normalize", id: row.id, phase: phase, slots: slots });
-        }
-      };
-    });
-    items.unshift({
-      label: "Re-grid the schedule - this rewrites the multiplier",
-      disabled: true,
-      run: function () { /* heading */ }
-    });
-    return items;
   }
 
   function buildTimeline(row, phase, schedule, selected) {
@@ -1937,14 +1924,18 @@
       timeline.appendChild(tick);
     });
 
-    // Uncovered slots are zero, and saying so is the difference between "the
-    // rest is off" and "the rest is some strength you cannot see".
+    // Uncovered steps are zero, and saying so is the difference between "the
+    // rest is off" and "the rest is some strength you cannot see". Drawing is
+    // the only way in, so an empty timeline says how.
     var gapNote = document.createElement("div");
     gapNote.className = "lb-baseline";
     gapNote.textContent = (schedule.regions || []).length
-      ? "empty slots = " + fmt(schedule.gap_strength || 0)
-      : "nothing scheduled yet — this phase is " + fmt(schedule.base);
+      ? "empty steps = " + fmt(schedule.gap_strength || 0)
+      : "Tap or drag to draw a region";
     timeline.appendChild(gapNote);
+
+    var kept = keptPastEnd(schedule);
+    if (kept) { timeline.appendChild(kept); }
 
     (schedule.regions || []).forEach(function (region) {
       timeline.appendChild(buildRegion(row, phase, schedule, region, selected));
@@ -1957,8 +1948,23 @@
       if (event.target.closest(".lb-region")) { return; }
       beginDraw(event, { row: row, phase: phase, schedule: schedule, timeline: timeline, slots: slots });
     });
-    timeline.title = "Drag across empty space to draw a region";
+    timeline.title = "Drag across empty space to draw a region, or tap for one";
     return timeline;
+  }
+
+  /* A lower step count hides the end of a schedule rather than deleting it,
+     so the timeline says when something is waiting past its last step. */
+  function keptPastEnd(schedule) {
+    var last = Number(schedule.drawn_past_end) || 0;
+    if (last <= schedule.slots) { return null; }
+    var more = last - schedule.slots;
+    var label = document.createElement("div");
+    label.className = "lb-kept";
+    label.textContent = "+" + more + (more === 1 ? " step kept" : " steps kept");
+    label.title = "Steps " + (schedule.slots + 1) + "-" + last + " are past the end of this "
+      + schedule.slots + "-step run. They are kept, not deleted: raise the step count "
+      + "and they come back as they were.";
+    return label;
   }
 
   /* ----------------------------------------------- full-screen schedule */
@@ -2021,8 +2027,11 @@
     var schedule = row ? scheduleOf(row, modal.phase) : null;
     if (!row || !schedule) { closeScheduleModal(); return; }
 
+    // The inline editor names the phase with its chip; here the title does.
+    var phased = (row.phase_values || []).length > 1 && !row.schedule_shared;
     modal.node.querySelector('[data-lb="title"]').textContent =
-      "Step schedule \u2014 " + rowName(row);
+      "Schedule \u2014 " + rowName(row) +
+      (phased ? " \u00b7 " + (S.phaseLabels[modal.phase] || ("Phase " + (modal.phase + 1))) : "");
     var body = modal.node.querySelector('[data-lb="body"]');
     body.innerHTML = "";
     body.appendChild(buildSchedule(row, modal.phase, schedule, { modal: true }).node);
@@ -2286,12 +2295,10 @@
     drag.current = next;
     drag.moved = true;
 
-    // Preview only: the canonical bounds are whatever Python returns.
+    // Preview only: the canonical bounds are whatever Python returns. The
+    // region's own label says where it is going.
     var preview = { start: next.start, end: next.end, strength: drag.context.region.strength };
     placeRegion(drag.context.node, preview, slots, drag.context.schedule);
-    var readout = drag.context.node.closest(".lb-schedule");
-    readout = readout && readout.querySelector('[data-lb="region-range"]');
-    if (readout) { readout.textContent = rangeLabel(preview, drag.context.schedule); }
   }
 
   function onDragEnd() {
@@ -2329,59 +2336,6 @@
     try { node.releasePointerCapture(drag.pointerId); } catch (error) { /* already gone */ }
     node.classList.remove("lb-dragging");
     S.drag = null;
-  }
-
-  function buildRegionEditor(row, phase, schedule, selected, timeline) {
-    var editor = document.createElement("div");
-    editor.className = "lb-region-editor";
-
-    var head = document.createElement("div");
-    head.className = "lb-region-head";
-    var title = document.createElement("strong");
-    title.textContent = "Selected region";
-    head.appendChild(title);
-
-    // Compact and read-only on purpose: start/end are dragged, not typed.
-    var range = pill(selected ? rangeLabel(selected, schedule) : "No region selected");
-    range.dataset.lb = "region-range";
-    head.appendChild(range);
-
-    var remove = document.createElement("button");
-    remove.type = "button";
-    remove.className = "lb-btn";
-    remove.textContent = "Delete";
-    remove.disabled = !selected;
-    remove.title = "Delete the selected region";
-    remove.addEventListener("click", function () {
-      if (!selected) { return; }
-      delete S.selectedRegionByKey[regionKey(row, phase)];
-      send({ type: "schedule_delete_region", id: row.id, phase: phase, region_id: selected.id });
-    });
-    head.appendChild(remove);
-    editor.appendChild(head);
-
-    var weight = buildWeightLine({
-      value: selected ? regionValue(row, phase, selected) : schedule.base,
-      label: "Selected region strength",
-      disabled: !selected,
-      commit: function (value) {
-        if (!selected) { return; }
-        var node = timeline.querySelector('.lb-region[data-region="' + cssEscape(selected.id) + '"]');
-        if (node) {
-          var readout = node.querySelector("strong");
-          if (readout) { readout.textContent = fmt(value); }
-        }
-        S.localValues[regionKeyFor(row.id, phase, selected.id)] = Number(value);
-        S.pendingValues[regionKeyFor(row.id, phase, selected.id)] = {
-          type: "schedule_set_region_strength", id: row.id, phase: phase,
-          region_id: selected.id, value: Number(value)
-        };
-        scheduleSync();
-      },
-      settle: flushSync
-    });
-    editor.appendChild(weight.node);
-    return { node: editor, paint: weight.paint };
   }
 
   function pill(label) {
@@ -2848,7 +2802,8 @@
     S.profiles = payload.profiles || [];
     S.profilesIncomplete = payload.profiles_incomplete || [];
     S.activeProfile = payload.active_profile || "";
-    S.canRestore = !!payload.can_restore;
+    S.canDisableAll = !!payload.can_disable_all;
+    S.canEnableAll = !!payload.can_enable_all;
     S.signature = payload.signature || "";
     S.sliderMin = payload.slider_min !== undefined ? payload.slider_min : 0;
     S.sliderMax = payload.slider_max !== undefined ? payload.slider_max : 1;
@@ -2859,7 +2814,6 @@
     S.valueDecimals = payload.value_decimals || 4;
     S.steps = payload.steps || 0;
     S.phaseSteps = payload.phase_steps || [];
-    if (payload.schedule_slot_limits) { S.slotLimits = payload.schedule_slot_limits; }
     S.schedulingEnabled = payload.scheduling_enabled !== false;
     S.schedulingDisabledReason = payload.scheduling_disabled_reason || "";
     // Leaving One Phase closes every timeline: there is nothing left to show.
@@ -2926,11 +2880,14 @@
   }
 
   function renderHeader() {
-    var activeCount = S.rows.length;
+    // A switched-off LoRA is listed but not applied, so it is not "active".
+    var activeCount = S.rows.filter(isOn).length;
+    var offCount = S.rows.length - activeCount;
     el.count.textContent = activeCount === 1 ? "1 active" : activeCount + " active";
     el.phase.textContent = S.phases.effective > 1 ? S.phases.effective + " phases" : "One phase";
-    el.activeTitle.textContent = "Active LoRAs (" + activeCount + ")";
-    el.restore.disabled = !S.canRestore;
+    el.activeTitle.textContent = "Active LoRAs (" + activeCount + ")" + (offCount ? " \u00B7 " + offCount + " off" : "");
+    el.disableAll.disabled = !S.canDisableAll;
+    el.enableAll.disabled = !S.canEnableAll;
 
     el.sort.value = S.sortMode;
     el.naming.setAttribute("aria-pressed", S.nameMode === "civitai" ? "true" : "false");

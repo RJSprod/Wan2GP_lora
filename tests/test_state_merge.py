@@ -7,12 +7,18 @@ from lora_browser import schedule as sch
 from lora_browser import ui_payloads as up
 from lora_browser.inventory import build_inventory
 
+# MiniMax H3 as its handler defines it: two multiplier phases in every guidance
+# mode, and a phase 2 that is a pass of its own, run for "Phase 2 Steps".
 H3_MODEL_DEF = {
     "guidance_max_phases": 2,
     "lora_multiplier_phases": 2,
     "phase_2_spatial_tiling": True,
+    "inference_steps2": True,
 }
 SINGLE_PHASE_MODEL_DEF = {"guidance_max_phases": 1}
+#: Phases cut from one run at a switch step only the sampler settles (Wan 2.2,
+#: say): a timeline can be exact in One Phase only.
+SWITCHED_MODEL_DEF = {"guidance_max_phases": 3}
 
 
 @pytest.fixture
@@ -343,11 +349,13 @@ class TestScheduleStateModel:
         )
         assert stack.tokens[0] == "0,0.8,0.4;0.64"
 
-    def test_scheduling_and_linking_never_coexist(self):
-        """Linking needs two visible phases; scheduling needs exactly one."""
-        two = up.resolve_phases(H3_MODEL_DEF, 2)
+    def test_two_phases_schedule_only_where_the_phases_are_stages(self):
+        """H3's phase 2 is a pass of its own; a switched model's starts at a
+        step nobody knows while editing."""
         assert up.scheduling_allowed(self.phases) is True
-        assert up.scheduling_allowed(two) is False
+        assert up.scheduling_allowed(up.resolve_phases(H3_MODEL_DEF, 2)) is True
+        assert up.scheduling_allowed(up.resolve_phases(SWITCHED_MODEL_DEF, 1)) is True
+        assert up.scheduling_allowed(up.resolve_phases(SWITCHED_MODEL_DEF, 2)) is False
 
     def test_reopening_a_schedule_does_not_reset_it(self):
         stack = self._stack("0.6;0.9")
@@ -373,16 +381,97 @@ class TestScheduleStateModel:
         ) is False
         assert stack.tokens[0] == "1,0.8,0.4;0.5"
 
-    def test_leaving_one_phase_resets_a_scheduled_lora_to_zero(self):
-        """No single number carries a schedule over, so it switches off."""
-        stack = self._stack("1,0.8,0.4;0.64 0.75;0.75", ids=("a.safetensors", "b.safetensors"))
-        two = up.resolve_phases(H3_MODEL_DEF, 2)
-        assert up.schedules_need_resync(stack, two, self.schedules, self.context) is True
+    def _switch(self, stack, phases, context):
+        """A guidance change, in plugin.py's order: the payload syncs, and the
+        browser answers anything out of step with a resync."""
+        up.sync_schedules(stack, phases, self.schedules, context)
+        entering = up.entering_two_phases(stack, phases)
+        if up.phase_structure_needs_fit(stack, phases, {}):
+            up.fit_phase_structure(stack, phases, {})
+            up.sync_schedules(stack, phases, self.schedules, context)
+            up.fill_stages_from_stage_1(stack, entering, phases, self.memory, self.schedules, context)
+        if up.schedules_need_resync(stack, phases, self.schedules, context):
+            up.refit_schedules(stack, phases, self.schedules, self.memory, context)
+            up.sync_schedules(stack, phases, self.schedules, context)
 
-        up.refit_schedules(stack, two, self.schedules, self.memory, self.context)
-        assert stack.tokens[0] == "0;0"          # was scheduled
-        assert stack.tokens[1] == "0.75;0.75"    # a plain strength means the same
-        assert self.schedules == {}
+    def test_switching_phase_mode_never_touches_phase_1_on_h3(self):
+        """The reported bug: entering Two Phases emptied a scheduled phase 1.
+
+        H3 runs phase 1 over every inference step in either mode -- Two Phases
+        adds an enhancement pass after it -- so the schedule means the same in
+        both, and a plain strength next to it too.
+        """
+        one = self.phases
+        two = up.resolve_phases(H3_MODEL_DEF, 2)
+        at_one = up.ScheduleContext.from_native(4, H3_MODEL_DEF, one)
+        at_two = up.ScheduleContext.from_native(4, H3_MODEL_DEF, two, steps2_value=3)
+        tokens = ["0,-2,0,0;1", "0.75;0.5"]
+        stack = up.Stack.from_native(["a.safetensors", "b.safetensors"], " ".join(tokens))
+
+        for phases, context in ((one, at_one), (two, at_two), (one, at_one), (two, at_two)):
+            self._switch(stack, phases, context)
+            assert stack.tokens == tokens
+            first = self.schedules[("a.safetensors", 0)]
+            assert (first.slots, [(r.start, r.end, r.strength) for r in first.regions]) == (4, [(2, 2, -2.0)])
+
+        # In Two Phases phase 1 is still edited one step per slot, and phase 2
+        # gets a timeline as long as the pass it drives.
+        fields = up.multiplier_fields(stack.tokens[0], two, "a.safetensors", self.memory, self.schedules, at_two)
+        assert fields["multiplier_kind"] == codec.SCHEDULED
+        assert fields["phase_schedules"][0]["coordinate_mode"] == up.COORD_STAGE_EXACT
+        up.schedule_enable(stack, "a.safetensors", 1, two, self.memory, self.schedules, at_two)
+        assert self.schedules[("a.safetensors", 1)].slots == 3
+        assert stack.tokens == tokens
+
+    def test_a_mode_that_cannot_show_a_schedule_leaves_it_as_it_is(self):
+        """Elsewhere Two Phases cannot edit a schedule truthfully, but it does
+        not zero it either: One Phase gets it back exactly."""
+        one = up.resolve_phases(SWITCHED_MODEL_DEF, 1)
+        two = up.resolve_phases(SWITCHED_MODEL_DEF, 2)
+        context = up.ScheduleContext(steps=4)
+        stack = up.Stack.from_native(["a.safetensors", "b.safetensors"], "0,1,1,0 0.75")
+        up.sync_schedules(stack, one, self.schedules, context)
+        drawn = [(r.start, r.end) for r in self.schedules[("a.safetensors", up.SHARED_PHASE)].regions]
+
+        self._switch(stack, two, context)
+        assert stack.tokens == ["0,1,1,0", "0.75"]
+        assert up.schedules_need_resync(stack, two, self.schedules, context) is False
+        assert up.refit_schedules(stack, two, self.schedules, self.memory, context) is False
+        fields = up.multiplier_fields(stack.tokens[0], two, "a.safetensors", self.memory, self.schedules, context)
+        assert fields["multiplier_kind"] == codec.SCHEDULED
+        assert fields["schedule_reason"] == up.SCHEDULING_DISABLED_REASON
+        assert fields["summary"] == "∿ 1 at steps 2\u20133"
+
+        self._switch(stack, one, context)
+        assert stack.tokens == ["0,1,1,0", "0.75"]
+        restored = self.schedules[("a.safetensors", up.SHARED_PHASE)]
+        assert [(r.start, r.end) for r in restored.regions] == drawn
+
+    def test_a_switched_off_lora_comes_back_with_everything_drawn(self):
+        """Off and on again is the same schedule -- steps a shorter run hides
+        included, which the token alone no longer says."""
+        stack = self._load("0,0,0,0,1,1;1", 6)
+        assert self._steps(stack, 4) == []            # steps 5-6 kept, past the end
+        assert stack.tokens == ["0,0,0,0;1"]
+
+        assert stack.set_enabled("a.safetensors", False)
+        assert (stack.ids, stack.disabled[0].token) == ([], "0,0,0,0;1")
+        up.sync_schedules(stack, self.phases, self.schedules, up.ScheduleContext(steps=4))
+
+        assert stack.set_enabled("a.safetensors", True)
+        assert self._steps(stack, 6) == [(5, 6, 1.0)]
+        assert stack.tokens == ["0,0,0,0,1,1;1"]
+
+    @pytest.mark.parametrize("token, phases_def, guidance, expected", [
+        ("0.7", H3_MODEL_DEF, 1, "0.7"),
+        ("0.7;0.5", H3_MODEL_DEF, 2, "Phase 1 0.7 · Phase 2 0.5"),
+        ("0,-2,0,0;1", H3_MODEL_DEF, 2, "Phase 1 ∿ -2 at step 2 · Phase 2 1"),
+        ("1,1,0,0.5", SWITCHED_MODEL_DEF, 1, "∿ 1 at steps 1\u20132, 0.5 at step 4"),
+        ("0,0,0", SWITCHED_MODEL_DEF, 1, "∿ off"),
+        ("0.5:0.9", H3_MODEL_DEF, 2, "0.5:0.9"),
+    ])
+    def test_a_token_reads_as_one_line(self, token, phases_def, guidance, expected):
+        assert up.describe_token(token, up.resolve_phases(phases_def, guidance)) == expected
 
     def _load(self, multipliers, steps, ids=("a.safetensors",)):
         """A token as it comes back after a reload: nothing but the token.
@@ -820,11 +909,19 @@ class TestLtxStages:
         assert (one.capacity, one.effective, one.staged) == (1, 1, True)
         assert up.scheduling_allowed(two) is True
 
+    def test_h3_is_staged_by_its_own_phase_2_step_count(self):
+        """Its phase 2 is an enhancement pass run for "Phase 2 Steps"."""
+        for guidance in (1, 2, up.PHASE_2_TILING_GUIDANCE_VALUE):
+            assert up.resolve_phases(H3_MODEL_DEF, guidance).staged is True
+        assert up.scheduling_allowed(up.resolve_phases(H3_MODEL_DEF, 2)) is True
+
     def test_other_two_phase_models_still_do_not_schedule(self):
         """Their phase 2 starts at a switch step nobody knows while editing."""
-        assert up.resolve_phases(H3_MODEL_DEF, 2).staged is False
-        assert up.scheduling_allowed(up.resolve_phases(H3_MODEL_DEF, 2)) is False
+        assert up.resolve_phases(SWITCHED_MODEL_DEF, 2).staged is False
+        assert up.scheduling_allowed(up.resolve_phases(SWITCHED_MODEL_DEF, 2)) is False
         assert up.resolve_phases({"architecture": "ltxv_13B", "guidance_max_phases": 2}, 2).staged is False
+        # A model whose phase 2 has no step count of its own is not a stage.
+        assert up.resolve_phases({**H3_MODEL_DEF, "inference_steps2": False}, 2).staged is False
 
     @pytest.mark.parametrize("model_def, guidance, steps, sampler, expected", [
         (LTX23_DISTILLED, 2, 8, "", (8, 3)),
@@ -836,13 +933,28 @@ class TestLtxStages:
         (LTX25_DEV, 1, 30, "distilled_8_steps", (8,)),
         (LTX25_DEV, 2, 0, "euler", ()),              # no counter, nothing to follow
         (JOYAI_ECHO, 2, 20, "", (8, 3)),
-        (H3_MODEL_DEF, 2, 30, "", ()),
+        (SWITCHED_MODEL_DEF, 2, 30, "", ()),
     ])
     def test_each_stage_runs_a_known_number_of_steps(self, model_def, guidance, steps, sampler, expected):
         phases = up.resolve_phases(model_def, guidance)
         context = up.ScheduleContext.from_native(steps, model_def, phases, sampler)
         assert context.phase_steps == expected
         assert context.boundaries_known is bool(expected)
+
+    @pytest.mark.parametrize("guidance, steps, steps2, expected", [
+        (2, 30, 3, (30, 3)),
+        (2, 20, 6, (20, 6)),           # "Phase 2 Steps" moves stage 2 only
+        (2, 30, None, (30, 3)),        # WanGP's default where it is not known
+        ("2~", 30, 4, (30, 4)),        # tiling changes how phase 2 runs, not how long
+        (1, 30, 3, (30,)),             # One Phase runs no enhancement pass
+        (2, 0, 3, ()),
+    ])
+    def test_h3_stages_follow_both_step_counters(self, guidance, steps, steps2, expected):
+        phases = up.resolve_phases(H3_MODEL_DEF, guidance)
+        context = up.ScheduleContext.from_native(steps, H3_MODEL_DEF, phases, "euler", steps2)
+        assert context.phase_steps == expected
+        # Only LTX-2's noise levels are known, so nothing is matched by them.
+        assert context.stage_2_match == ()
 
     def _at(self, model_def, guidance, steps, sampler=""):
         phases = up.resolve_phases(model_def, guidance)
@@ -1007,6 +1119,18 @@ class TestPhaseStructureFit:
         assert self._fit("0.8;0.4", LTX23_DISTILLED, 1) == "0.8"
         # Drawn in One Phase on top of the 0.8 that was left.
         assert self._fit("1,1,0,0,0,0,0,0", LTX23_DISTILLED, 2) == "1,1,0,0,0,0,0,0;0"
+        assert self.hidden == {}
+
+    def test_h3_keeps_both_stages_in_every_mode(self):
+        """H3 accepts two phases in One Phase too, so a switch cuts nothing,
+        and a list with no ';' -- which One Phase runs as drawn -- is left
+        alone until Two Phases gives it a stage 2 of its own."""
+        for guidance in (1, 2, 1):
+            assert self._fit("0,-2,0,0;1", H3_MODEL_DEF, guidance) == "0,-2,0,0;1"
+            assert self._fit("0.7;0.4", H3_MODEL_DEF, guidance) == "0.7;0.4"
+        assert self._fit("1,1,0,0", H3_MODEL_DEF, 1) == "1,1,0,0"
+        assert self._fit("1,1,0,0", H3_MODEL_DEF, 2) == "1,1,0,0;0"
+        assert self._fit("1,1,0,0;0", H3_MODEL_DEF, 1) == "1,1,0,0;0"
         assert self.hidden == {}
 
     def test_other_models_still_restore_what_a_cut_took(self):
@@ -1187,7 +1311,7 @@ class TestStage2Fill:
         (LTX23_DISTILLED, 2, "0.8;0"),                            # stage 1 not scheduled
         (LTX23_DISTILLED, 2, "1,1,1,1,0.8,0.6,0.4,0.2"),          # no ';' (before the fit)
         (LTX23_DISTILLED, 1, "1,1,1,1,0.8,0.6,0.4,0.2"),          # One Phase
-        (H3_MODEL_DEF, 1, "1,1,0.5,0;0.5"),                       # not staged
+        (H3_MODEL_DEF, 1, "1,1,0.5,0;0.5"),                       # One Phase: no stage 2 runs
         (LTX23_DISTILLED, 2, "0.5:0.9;1"),                        # preserved as imported
     ])
     def test_nothing_is_offered_where_it_could_overwrite_or_mean_nothing(self, model_def, guidance, token):
@@ -1223,7 +1347,10 @@ class TestStage2Fill:
         )
         assert up.entering_two_phases(stack, phases) == ["a.safetensors"]
         assert up.entering_two_phases(stack, self._at(LTX23_DISTILLED, 1)[0]) == []
-        assert up.entering_two_phases(stack, up.resolve_phases(H3_MODEL_DEF, 2)) == []
+        assert up.entering_two_phases(stack, up.resolve_phases(SWITCHED_MODEL_DEF, 2)) == []
+        # H3 keeps two phases in One Phase too: only Two Phases runs a stage 2.
+        assert up.entering_two_phases(stack, up.resolve_phases(H3_MODEL_DEF, 1)) == []
+        assert up.entering_two_phases(stack, up.resolve_phases(H3_MODEL_DEF, 2)) == ["a.safetensors"]
 
     def test_entering_two_phases_fills_what_there_is_to_carry(self):
         phases, context = self._at(LTX23_DISTILLED, 2)

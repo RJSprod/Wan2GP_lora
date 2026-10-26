@@ -291,6 +291,37 @@ LTX_MODEL_DEF = {
 }
 
 
+#: MiniMax H3 as its handler defines it: its phase 2 is a pass of its own, so
+#: both phases are stages and phase 1 is the same full run in either mode.
+H3_MODEL_DEF = {
+    "guidance_max_phases": 2, "lora_multiplier_phases": 2, "phase_2_spatial_tiling": True,
+    "inference_steps2": True,
+}
+
+
+@pytest.fixture(scope="module")
+def h3_panel(chromium, tmp_path_factory):
+    """The reported setup: H3 in One Phase, a four-step run, phase 1 scheduled."""
+    host = _Host(tmp_path_factory.mktemp("browser-h3"))
+    host.plugin.get_model_def = lambda model_type: H3_MODEL_DEF
+    host.steps, host.guidance = 4, 1
+    host.selected = ["lora_01.safetensors", "lora_02.safetensors"]
+    host.multipliers = "0,-2,0,0;1 0.7;0.5"
+    with _open_panel(chromium, host) as opened:
+        yield opened
+
+
+@pytest.fixture(scope="module")
+def off_panel(chromium, tmp_path_factory):
+    """Three LoRAs, the middle one scheduled, for switching them off and on."""
+    host = _Host(tmp_path_factory.mktemp("browser-off"))
+    host.steps = 4
+    host.selected = ["lora_01.safetensors", "lora_02.safetensors", "lora_03.safetensors"]
+    host.multipliers = "0.7;0.7 1,1,0,0;0.5 0.4;0.4"
+    with _open_panel(chromium, host) as opened:
+        yield opened
+
+
 @pytest.fixture(scope="module")
 def ltx_panel(chromium, tmp_path_factory):
     """The same harness on LTX-2.3 Distilled, in WanGP's default Two Phases."""
@@ -518,9 +549,11 @@ class TestPanelInTheBrowser:
         assert native(page) == before
 
     def test_a_phase_specific_schedule_never_claims_global_steps(self, panel):
+        """This model's phases are cut from one run, so a slot is not a step."""
         page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
-        assert "phase-relative" in row.locator(".lb-sched-head .lb-pill").last.inner_text()
+        assert schedule_of(page, "lora_02.safetensors")["coordinate_mode"] == "phase_relative"
+        assert row.locator(".lb-region .lb-region-body span").first.inner_text().startswith("Slot")
 
     def test_dragging_a_region_commits_one_canonical_update(self, panel):
         page, _, _ = panel
@@ -572,9 +605,21 @@ class TestPanelInTheBrowser:
         open_timeline(page, row)
         assert row.locator(".lb-timeline").count() == 1
         assert row.locator(".lb-weight-main").count() == 0
-        # Exactly one strength control on the row, and it belongs to the region.
+        # Exactly one strength control on the row -- the plain row's, under
+        # the timeline -- and it belongs to the selected region.
         assert row.locator("input[type=range]").count() == 1
-        assert row.locator(".lb-region-editor input[type=range]").count() == 1
+        assert row.locator(".lb-schedule .lb-weight input[type=range]").count() == 1
+        selected = row.locator(".lb-region.lb-on strong").inner_text()
+        assert row.locator(".lb-schedule .lb-weight input[type=number]").input_value() == selected
+        # The old header line, region panel, "+ Region" and "Slots" are gone;
+        # one row of tools is left, with Delete for the selected region.
+        tools = row.locator(".lb-sched-tools button")
+        assert [tools.nth(i).inner_text() for i in range(tools.count())] == [
+            "\u2922 Full screen", "Clear schedule", "Delete",
+        ]
+        for gone in (".lb-sched-head", ".lb-region-editor", "button:has-text('+ Region')",
+                     "button:has-text('Slots')"):
+            assert row.locator(gone).count() == 0, gone
         # Scheduling needs One Phase, so there are no phase chips to link.
         assert row.locator(".lb-phase-strip").count() == 0
 
@@ -605,7 +650,8 @@ class TestPanelInTheBrowser:
         row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
         before = native(page)
         regions = row.locator(".lb-region").count()
-        row.locator(".lb-sched-head button:has-text('Close')").click()
+        # The Schedule button closes it as it opened it; nothing else does.
+        row.locator("button.lb-schedule-toggle").click()
         settle(page)
         assert row.locator(".lb-timeline").count() == 0
         assert native(page) == before
@@ -642,7 +688,7 @@ class TestPanelInTheBrowser:
         inline = row.locator(".lb-timeline").bounding_box()
 
         try:
-            row.locator(".lb-sched-head button:has-text('Full screen')").click()
+            row.locator(".lb-sched-tools button:has-text('Full screen')").click()
             settle(page, 700)
             modal = page.locator(".lb-sched-modal")
             assert modal.count() == 1
@@ -657,7 +703,9 @@ class TestPanelInTheBrowser:
             # It is live: an edit here reaches WanGP like any other.
             modal.locator(".lb-region").first.click()
             settle(page, 400)
-            strength = modal.locator(".lb-region-editor input[type=number]")
+            # The same tools, minus the way into full screen.
+            assert modal.locator(".lb-sched-tools button:has-text('Full screen')").count() == 0
+            strength = modal.locator(".lb-weight input[type=number]")
             strength.fill("0.44")
             strength.press("Enter")
             settle(page, 1500)
@@ -676,7 +724,7 @@ class TestPanelInTheBrowser:
         page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
         hidden = native(page).split()[1].split(";")[1]
-        row.locator(".lb-sched-head button:has-text('Clear phase')").click()
+        row.locator(".lb-sched-tools button:has-text('Clear schedule')").click()
         settle(page, 900)
         token = native(page).split()[1]
         assert "," not in token.split(";")[0]
@@ -759,16 +807,18 @@ class TestPanelInTheBrowser:
         page.mouse.up()
         settle(page, 1200)
 
-        assert row.locator('[data-lb="region-range"]').inner_text() == "Slots 8\u201314"
-        # A new region starts at the strength the row already had.
-        assert row.locator(".lb-region-editor input[type=number]").input_value() == "0.37"
+        assert row.locator(".lb-region.lb-on .lb-region-body span").inner_text() == "Slots 8\u201314"
+        # A new region starts at the strength the row already had, and the
+        # strength control is now the region's.
+        assert row.locator(".lb-schedule .lb-weight input[type=number]").input_value() == "0.37"
+        assert row.locator(".lb-sched-tools button:has-text('Delete')").count() == 1
 
     def test_the_drawn_region_is_what_wangp_is_given(self, panel):
         page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_01.safetensors"]')
         phase_two = native(page).split()[0].split(";")[1]
 
-        strength = row.locator(".lb-region-editor input[type=number]")
+        strength = row.locator(".lb-schedule .lb-weight input[type=number]")
         strength.fill("0.9")
         strength.press("Enter")
         settle(page, 1500)
@@ -792,7 +842,7 @@ class TestPanelInTheBrowser:
         page.mouse.click(box["x"] + slot * 20.5, box["y"] + box["height"] / 2)
         settle(page, 1200)
         assert row.locator(".lb-region").count() == 2
-        assert row.locator('[data-lb="region-range"]').inner_text().startswith("Slots 21")
+        assert row.locator(".lb-region.lb-on .lb-region-body span").inner_text().startswith("Slots 21")
 
         row.locator("button.lb-schedule-toggle").click()   # tidy up for later tests
         settle(page, 400)
@@ -846,14 +896,14 @@ class TestPanelInTheBrowser:
             assert grown["slots"] == 5
             assert phase_one() == ["0.5", "0.5", "0.3", "0.8", "0"]
             assert grown["regions"] == drawn["regions"]
-            assert row.locator(".lb-pill-kept").count() == 0
+            assert row.locator(".lb-kept").count() == 0
 
             # Shorter: the run stops sooner, and the step it no longer reaches
             # is kept -- and the timeline says so.
             set_steps(page, 3)
             assert schedule_of(page, "lora_02.safetensors")["slots"] == 3
             assert phase_one() == ["0.5", "0.5", "0.3"]
-            kept = row.locator(".lb-pill-kept")
+            kept = row.locator(".lb-timeline .lb-kept")
             assert kept.count() == 1
             assert kept.inner_text() == "+1 step kept"
 
@@ -861,12 +911,13 @@ class TestPanelInTheBrowser:
             set_steps(page, 4)
             assert phase_one() == ["0.5", "0.5", "0.3", "0.8"]
             assert schedule_of(page, "lora_02.safetensors")["regions"] == drawn["regions"]
-            assert row.locator(".lb-pill-kept").count() == 0
+            assert row.locator(".lb-kept").count() == 0
         finally:
             set_steps(page, STEPS)
 
-    def test_leaving_one_phase_resets_a_scheduled_lora(self, panel):
-        """No single strength carries a schedule over, so it switches off."""
+    def test_leaving_one_phase_keeps_a_schedule_it_cannot_show(self, panel):
+        """This model's Two Phases cannot show a schedule truthfully, so it
+        shows what the schedule does instead -- and changes nothing."""
         page, _, _ = panel
         row = page.locator('.lb-row[data-id="lora_01.safetensors"]')
         row.locator("button.lb-schedule-toggle").click()
@@ -881,14 +932,19 @@ class TestPanelInTheBrowser:
         assert row.locator(".lb-region").count() >= 1
         assert "," in native(page).split()[0]
 
+        drawn = native(page).split()[0]
         try:
             set_guidance(page, 2)
             settle(page, 900)
-            assert native(page).split()[0] == "0;0"
+            assert native(page).split()[0] == drawn
             assert row.locator("button.lb-schedule-toggle").count() == 0
             assert row.locator(".lb-timeline").count() == 0
+            assert "\u223f" in row.locator(".lb-kept-summary").inner_text()
+            assert "One Phase" in row.locator(".lb-preserved-note").inner_text()
         finally:
             set_guidance(page, 1)
+        assert native(page).split()[0] == drawn
+        assert row.locator("button.lb-schedule-toggle").count() == 1
 
     def test_the_panel_fits_a_phone(self, panel):
         page, _, _ = panel
@@ -915,12 +971,14 @@ class TestLtxInTheBrowser:
 
         select_phase(page, row, 0)
         open_timeline(page, row)
-        assert "stage 1 • 8 steps" in row.locator(".lb-sched-titles").inner_text()
+        first = schedule_of(page, "lora_01.safetensors", 0)
+        assert (first["stage"], first["stage_steps"]) == (1, 8)
         assert row.locator(".lb-tick").last.inner_text() == "8"
 
         select_phase(page, row, 1)
         settle(page, 900)
-        assert "stage 2 (refine) • 3 steps" in row.locator(".lb-sched-titles").inner_text()
+        second = schedule_of(page, "lora_01.safetensors", 1)
+        assert (second["stage"], second["stage_steps"]) == (2, 3)
         assert row.locator(".lb-tick").last.inner_text() == "3"
 
         # A tap on the refinement's last step lands in the token's second part.
@@ -955,9 +1013,11 @@ class TestLtxInTheBrowser:
         select_phase(page, row, 1)
         open_timeline(page, row)
         settle(page, 600)
-        assert "stage 2 (refine) • 3 steps" in row.locator(".lb-sched-titles").inner_text()
+        assert schedule_of(page, "lora_02.safetensors", 1)["stage_steps"] == 3
         assert row.locator(".lb-region").count() == 0
-        assert "this phase is 0" in row.locator(".lb-baseline").inner_text()
+        # Nothing drawn: the strength control is what the stage is worth, 0.
+        assert row.locator(".lb-schedule .lb-weight input[type=number]").input_value() == "0"
+        assert "draw" in row.locator(".lb-baseline").inner_text().lower()
 
         # Drawing on it starts at full strength, in the token's second part.
         timeline = row.locator(".lb-timeline")
@@ -987,8 +1047,8 @@ class TestLtxInTheBrowser:
         open_timeline(page, row)
         select_phase(page, row, 1)
         settle(page, 900)
-        assert "stage 2 (refine) • 3 steps" in row.locator(".lb-sched-titles").inner_text()
         second = schedule_of(page, "lora_02.safetensors", 1)
+        assert second["stage_steps"] == 3
         assert [(r["start"], r["end"], r["strength"]) for r in second["regions"]] == [(1, 3, 1)]
         assert row.locator(".lb-region").count() == 1
         assert row.locator("button.lb-fill-stage-2").count() == 0
@@ -1022,4 +1082,84 @@ class TestLtxInTheBrowser:
         assert row.locator(".lb-region").count() == 3
         # Drawn once: stage 2 is regions now, with nothing left to fill.
         assert row.locator("button.lb-fill-stage-2").count() == 0
+        assert problems == []
+
+
+class TestH3InTheBrowser:
+    """MiniMax H3: phase 1 is the same full run in One Phase and Two, so a
+    switch between them leaves it -- schedule and all -- exactly as it was."""
+
+    def test_two_phases_keep_phase_1_and_its_timeline(self, h3_panel):
+        page, _, problems = h3_panel
+        token = "0,-2,0,0;1 0.7;0.5"
+        row = page.locator('.lb-row[data-id="lora_01.safetensors"]')
+        open_timeline(page, row)
+        assert row.locator(".lb-region").count() == 1
+        try:
+            set_guidance(page, 2)
+            settle(page, 900)
+            assert native(page) == token
+            assert row.locator(".lb-phase-strip .lb-chip").count() >= 2
+            select_phase(page, row, 0)
+            open_timeline(page, row)
+            first = schedule_of(page, "lora_01.safetensors", 0)
+            assert first["slots"] == 4
+            assert [(r["start"], r["end"], r["strength"]) for r in first["regions"]] == [(2, 2, -2)]
+            assert row.locator(".lb-region").count() == 1
+            # Phase 2 is the enhancement pass: a timeline as long as it runs.
+            select_phase(page, row, 1)
+            settle(page, 900)
+            assert schedule_of(page, "lora_01.safetensors", 1)["slots"] == 3
+            assert native(page) == token
+        finally:
+            set_guidance(page, 1)
+            settle(page, 900)
+        assert native(page) == token
+        assert schedule_of(page, "lora_01.safetensors", 0)["regions"][0]["strength"] == -2
+        assert problems == []
+
+
+class TestSwitchingOffInTheBrowser:
+    """Off keeps a LoRA where it was, with everything it had, and applies none
+    of it: it leaves WanGP's selection for a comment line WanGP never reads."""
+
+    def test_a_switched_off_lora_keeps_its_place_and_its_settings(self, off_panel):
+        page, _, problems = off_panel
+        page.locator('.lb-row[data-id="lora_02.safetensors"] button.lb-switch').click()
+        settle(page, 1200)
+        assert native(page) == "0.7;0.7 0.4;0.4\n#lora_off 1 1,1,0,0;0.5 lora_02.safetensors"
+
+        rows = page.evaluate("() => [...document.querySelectorAll('.lb-row')].map(r => r.dataset.id)")
+        assert rows == ["lora_01.safetensors", "lora_02.safetensors", "lora_03.safetensors"]
+        row = page.locator('.lb-row[data-id="lora_02.safetensors"]')
+        assert "lb-row-off" in row.get_attribute("class")
+        assert row.locator("button.lb-switch").get_attribute("aria-checked") == "false"
+        # Nothing to edit while it is off -- only the way back, and out.
+        assert row.locator("input, button.lb-schedule-toggle").count() == 0
+        assert "\u223f 1 at steps 1\u20132" in row.locator(".lb-off-summary").inner_text()
+        assert "1 off" in page.locator('[data-lb="active-title"]').inner_text()
+        tile = page.locator('.lb-tile[data-id="lora_02.safetensors"]')
+        assert tile.locator(".lb-check.lb-check-off").count() == 1
+
+        # Its tile brings it back, exactly as it was.
+        tile.click()
+        settle(page, 1200)
+        assert native(page) == "0.7;0.7 1,1,0,0;0.5 0.4;0.4"
+        assert page.locator(".lb-row.lb-row-off").count() == 0
+        assert problems == []
+
+    def test_disable_all_and_enable_all(self, off_panel):
+        page, _, problems = off_panel
+        before = native(page)
+        page.locator('[data-lb="disable-all"]').click()
+        settle(page, 1200)
+        assert native(page).count("#lora_off") == 3
+        assert page.locator(".lb-row.lb-row-off").count() == 3
+        assert page.locator('[data-lb="disable-all"]').is_disabled()
+
+        page.locator('[data-lb="enable-all"]').click()
+        settle(page, 1200)
+        assert native(page) == before
+        assert page.locator(".lb-row.lb-row-off").count() == 0
+        assert page.locator('[data-lb="enable-all"]').is_disabled()
         assert problems == []
