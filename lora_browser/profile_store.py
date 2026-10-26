@@ -36,9 +36,16 @@ class ProfileEntry:
     id: str
     multiplier: str = "1"
     linked: bool = False
+    #: False for a LoRA switched off in the panel: recalled in the stack, off.
+    enabled: bool = True
 
     def to_dict(self) -> dict[str, Any]:
-        return {"id": self.id, "multiplier": self.multiplier, "linked": bool(self.linked)}
+        return {
+            "id": self.id,
+            "multiplier": self.multiplier,
+            "linked": bool(self.linked),
+            "enabled": bool(self.enabled),
+        }
 
 
 @dataclass
@@ -69,6 +76,9 @@ class Profile:
                     id=lora_id,
                     multiplier=str(item.get("multiplier", "1") or "1"),
                     linked=bool(item.get("linked", False)),
+                    # Profiles saved before LoRAs could be switched off had
+                    # every one on.
+                    enabled=bool(item.get("enabled", True)),
                 )
             )
         return cls(
@@ -184,4 +194,6 @@ class ProfileStore:
 
 def _signature(entries: list[ProfileEntry]) -> tuple:
     """Order matters: WanGP multiplier tokens are positional."""
-    return tuple((entry.id, str(entry.multiplier).strip()) for entry in entries)
+    return tuple(
+        (entry.id, str(entry.multiplier).strip(), bool(entry.enabled)) for entry in entries
+    )

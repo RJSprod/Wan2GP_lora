@@ -33,10 +33,14 @@ list per phase.  Anything in between -- two expressions for a three-phase
 model, say -- expands according to ``model_switch_phase`` inside WanGP's own
 parser, which this plugin does not replicate: those tokens stay ADVANCED and
 read-only rather than being re-serialised from a guess.
+
+A LoRA switched off in the panel rides along as a comment line of its own --
+see ``DISABLED_MARK``.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from .utils import format_number, is_finite_number
@@ -46,6 +50,20 @@ SCHEDULED = "scheduled"
 ADVANCED = "advanced"
 
 DEFAULT_TOKEN = "1"
+
+#: A LoRA switched off in the panel is kept in ``loras_multipliers`` as a
+#: comment line.  WanGP drops ``#`` lines before it reads a single token, so the
+#: LoRA is neither loaded nor applied -- and it is not in ``loras_choices``
+#: either -- while everything that keeps the multiplier text keeps it too:
+#: presets, ``.lset`` files, the queue, settings saved with generated media.
+#:
+#:     #lora_off <position> <multiplier> <lora>
+#:
+#: ``position`` is its place among the user's LoRAs, counting switched-off
+#: ones, so it comes back where it was.  The LoRA goes last, so a name with
+#: spaces in it reads back whole; a multiplier never has one.
+DISABLED_MARK = "#lora_off"
+_DISABLED_LINE = re.compile(r"^\s*#lora_off\s+(\d+)\s+(\S+)\s+(\S.*?)\s*$")
 
 
 @dataclass
@@ -108,6 +126,32 @@ class ScheduledToken:
         if 0 <= index < len(self.phase_values):
             return list(self.phase_values[index])
         return []
+
+
+@dataclass
+class DisabledLora:
+    """A LoRA in the stack that is switched off: kept, not applied."""
+
+    id: str
+    #: Its multiplier exactly as it was, so switching it back on changes nothing.
+    token: str = DEFAULT_TOKEN
+    #: Its place among the user's LoRAs, counting switched-off ones.
+    at: int = 0
+
+
+def parse_disabled(text: str) -> list[DisabledLora]:
+    """The switched-off LoRAs a multiplier text carries, in the order written."""
+    entries = []
+    for line in str(text or "").replace("\r", "").split("\n"):
+        match = _DISABLED_LINE.match(line)
+        if match:
+            entries.append(DisabledLora(id=match.group(3), token=match.group(2), at=int(match.group(1))))
+    return entries
+
+
+def disabled_line(entry: DisabledLora) -> str:
+    token = str(entry.token or "").strip() or DEFAULT_TOKEN
+    return f"{DISABLED_MARK} {max(0, int(entry.at))} {token} {entry.id}"
 
 
 def strip_comments(text: str) -> str:
@@ -274,19 +318,26 @@ def default_token(phases: int) -> str:
     return build_token([1.0] * max(1, int(phases or 1)), phases)
 
 
-def serialize(tokens: list[str], separator_index: int = -1) -> str:
+def serialize(
+    tokens: list[str], separator_index: int = -1, disabled: list[DisabledLora] | None = None
+) -> str:
     """Rebuild the native multiplier string.
 
     No space is placed around the ``|``: WanGP replaces the bar with a space
     and then splits on single spaces, so ``"1 | 1"`` would tokenise into empty
     strings and fail validation.
+
+    Switched-off LoRAs follow, one comment line each, after every token.
     """
     cleaned = [str(token).strip() or DEFAULT_TOKEN for token in tokens]
     if separator_index is None or separator_index < 0:
-        return " ".join(cleaned)
+        text = " ".join(cleaned)
+    else:
+        index = min(max(int(separator_index), 0), len(cleaned))
+        text = " ".join(cleaned[:index]) + "|" + " ".join(cleaned[index:])
 
-    index = min(max(int(separator_index), 0), len(cleaned))
-    return " ".join(cleaned[:index]) + "|" + " ".join(cleaned[index:])
+    lines = [disabled_line(entry) for entry in disabled or []]
+    return "\n".join(([text] if text else []) + lines)
 
 
 def separator_after_removal(separator_index: int, removed_positions: list[int]) -> int:

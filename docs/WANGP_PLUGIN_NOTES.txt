@@ -229,8 +229,11 @@ WHY IT TOOK FOUR ROUNDS
 
       In One Phase guidance both switch points default to the total, so phase 1
       covers every step and a ';' token is still step-exact. That is why this
-      plugin offers step schedules only in One Phase: with more, "0.8,0.8,0.8,0"
-      at 4 steps renders [0.8, 0.8, 0.64, 0.64], not what was drawn.
+      plugin offers step schedules only in One Phase on such models: with more,
+      "0.8,0.8,0.8,0" at 4 steps renders [0.8, 0.8, 0.64, 0.64], not what was
+      drawn. It does not REWRITE a schedule there either: leaving One Phase used
+      to zero every scheduled token, which emptied phase 1 on a mere mode switch.
+      The token is now kept as it is and shown read-only until One Phase.
 
     LTX-2 IS DIFFERENT: ITS PHASES ARE STAGES (models/ltx2/ltx_pipelines)
       The LTX-2 handler sets guidance_max_phases = 2 and no lora_multiplier_
@@ -267,6 +270,25 @@ WHY IT TOOK FOUR ROUNDS
       checkpoints hide the step slider (lock_inference_steps) and ignore its
       value.
 
+    MINIMAX H3 IS STAGED TOO (models/minimax_h3/pipeline.py, WanGP 18.83)
+      H3's Two Phases is not a switch inside one run either. activate_lora_phase
+      calls, per pass,
+          phase 1: update_loras_slists(transformer, slists, sampling_steps,
+                       phase_switch_step=sampling_steps, phase_switch_step2=sampling_steps)
+          phase 2: update_loras_slists(transformer, slists, sampling_steps2,
+                       phase_switch_step=0, phase_switch_step2=sampling_steps2)
+      with sampling_steps = num_inference_steps and sampling_steps2 =
+      num_inference_steps2 ("Phase 2 Steps", default 3). So phase 1's list is
+      expanded over the FULL step count in either guidance mode -- Two Phases
+      runs it at low resolution, then upscales the latent and runs phase 2 as an
+      enhancement pass from switch_threshold ("Phase 2 Noise Level Start"). A
+      phase 1 schedule therefore means the same thing in One Phase and Two, and
+      a mode switch must never touch it. H3 is recognised by the model_def key
+      "inference_steps2" (the "Phase 2 Steps" slider, which only it sets); the
+      plugin requests num_inference_steps2 as an optional component.
+      A comma-only token is shared: phase 2 squeezes it into its few steps, as
+      on LTX-2, so it gets a stage 2 of its own on entering Two Phases.
+
     A ';' TOKEN CAN OUTLIVE ITS MODE
       lora_multiplier_phases defaults to guidance_phases, so on LTX-2 (and any
       model without a fixed lora_multiplier_phases) switching Two Phases to One
@@ -294,6 +316,22 @@ WHY IT TOOK FOUR ROUNDS
       scalars is NOT a safe substitute for scheduled lists. This plugin does not
       replicate that expansion: such tokens are classified ADVANCED and kept
       byte-for-byte rather than re-serialised from a guess.
+
+    COMMENT LINES ARE SAFE PAYLOAD
+      Every WanGP reader of the multiplier text drops lines starting with '#':
+      preparse_loras_multipliers (generation, the video info panel), _find_bar
+      (a '|' inside a comment is not the accelerator bar) and _spans (token
+      counting when accelerator profiles merge). The plugin keeps a LoRA that
+      is switched off as such a line -- "#lora_off <position> <multiplier>
+      <lora>" -- with the LoRA itself out of loras_choices, so nothing loads or
+      applies it while presets, .lset files, the queue and saved media keep it.
+      Note: WanGP only drops a WHOLE line starting with '#'; a '#' after a token
+      on the same line is not a comment to preparse_loras_multipliers.
+      One edge: merge_loras_settings (an accelerator profile being applied)
+      composes "before|after" only from sides that still have a token, so
+      with EVERY user LoRA switched off the comment lines on that side go with
+      it. Nothing in the panel can tell that apart from a preset that simply
+      has no switched-off LoRAs.
 
     CRITICAL SERIALIZATION GOTCHA
       preparse_loras_multipliers() does:
@@ -323,10 +361,11 @@ WHY IT TOOK FOUR ROUNDS
     to remember the hidden value yourself.
 
     The one thing model_def cannot tell you is how long each phase runs; that
-    lives in the family's pipeline code. LTX-2 is the only family where it is
-    knowable while editing (see 3.4), so PhaseConfig.staged is set for it alone,
-    recognised by architecture ("ltx2*", "joyai_echo") with the "ltx2_22B_class"
-    key the LTX-2 handler adds to every definition it builds as the backstop.
+    lives in the family's pipeline code. LTX-2 and MiniMax H3 are the families
+    where it is knowable while editing (see 3.4), so PhaseConfig.staged is set
+    for them: LTX-2 recognised by architecture ("ltx2*", "joyai_echo") with the
+    "ltx2_22B_class" key the LTX-2 handler adds to every definition it builds
+    as the backstop, H3 by "inference_steps2".
 
 3.6 LoRA identity
     setup_loras() stores LoRAs as paths RELATIVE to the model's LoRA dir, via

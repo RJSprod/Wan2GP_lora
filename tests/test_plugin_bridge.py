@@ -76,11 +76,16 @@ def _load_plugin_module():
 
 plugin_module = _load_plugin_module()
 
+# MiniMax H3 as its handler defines it: two multiplier phases in every guidance
+# mode, and a phase 2 that is a pass of its own, run for "Phase 2 Steps".
 H3_MODEL_DEF = {
     "guidance_max_phases": 2,
     "lora_multiplier_phases": 2,
     "phase_2_spatial_tiling": True,
+    "inference_steps2": True,
 }
+#: Phases cut from one run at a switch step (Wan 2.2, say).
+SWITCHED_MODEL_DEF = {"guidance_max_phases": 3, "lora_multiplier_phases": 2}
 LORAS = ["a.safetensors", "b.safetensors", "sub/c.safetensors"]
 
 
@@ -101,17 +106,17 @@ def state():
     return {"model_type": "minimax_h3", "loras": list(LORAS)}
 
 
-def payload_of(plugin, state, selected, multipliers, guidance=2, steps=None, sampler=None):
+def payload_of(plugin, state, selected, multipliers, guidance=2, steps=None, sampler=None, steps2=None):
     instance = plugin._instance("test")
     return json.loads(
-        plugin._build_payload(instance, state, selected, multipliers, guidance, steps, sampler)
+        plugin._build_payload(instance, state, selected, multipliers, guidance, steps, sampler, steps2)
     )
 
 
-def act(plugin, action, state, selected, multipliers, guidance=2, steps=None, sampler=None):
+def act(plugin, action, state, selected, multipliers, guidance=2, steps=None, sampler=None, steps2=None):
     instance = plugin._instance("test")
     choices, mults, payload = plugin._apply_action(
-        instance, json.dumps(action), state, selected, multipliers, guidance, steps, sampler
+        instance, json.dumps(action), state, selected, multipliers, guidance, steps, sampler, steps2
     )
     return choices, mults, json.loads(payload)
 
@@ -178,8 +183,8 @@ class TestSetup:
         instance.setup_ui()
         for name in ("loras_choices", "loras_multipliers", "guidance_phases", "state", "main"):
             assert name in instance._component_requests
-        # Optional, but what decides the length of an LTX-2 schedule.
-        for name in ("num_inference_steps", "sample_solver"):
+        # Optional, but what decides how long each stage's schedule is.
+        for name in ("num_inference_steps", "sample_solver", "num_inference_steps2"):
             assert name in instance._component_requests
 
     def test_declares_itself_an_extension(self):
@@ -319,27 +324,97 @@ class TestActions:
         assert "value" not in choices and "value" not in mults
 
 
-class TestDisableAllAndRestore:
-    def test_disable_all_then_restore(self, plugin, state):
+class TestSwitchingLorasOff:
+    """Off keeps a LoRA -- multiplier, schedule and place -- in the multiplier
+    text as a comment line WanGP never reads, and out of its selection."""
+
+    def test_disable_all_then_enable_all(self, plugin, state):
         choices, mults, payload = act(plugin, {"type": "disable_all"}, state, LORAS, "0.1;0.1 0.2;0.2 0.3;0.3")
         assert choices["value"] == []
-        assert payload["can_restore"] is True
+        assert mults["value"] == (
+            "#lora_off 0 0.1;0.1 a.safetensors\n"
+            "#lora_off 1 0.2;0.2 b.safetensors\n"
+            "#lora_off 2 0.3;0.3 sub/c.safetensors"
+        )
+        assert [row["id"] for row in payload["active"]] == LORAS
+        assert [row["enabled"] for row in payload["active"]] == [False, False, False]
+        assert (payload["can_enable_all"], payload["can_disable_all"]) == (True, False)
 
-        choices, mults, _ = act(plugin, {"type": "restore"}, state, [], "")
+        choices, mults, payload = act(plugin, {"type": "enable_all"}, state, [], mults["value"])
         assert choices["value"] == LORAS
         assert mults["value"] == "0.1;0.1 0.2;0.2 0.3;0.3"
+        assert (payload["can_enable_all"], payload["can_disable_all"]) == (False, True)
 
     def test_wangp_managed_loras_are_not_part_of_a_bulk_disable(self, plugin, state):
         choices, mults, _ = act(
             plugin, {"type": "disable_all"}, state, ["a.safetensors", "b.safetensors"], "1;1|0.9;0.9"
         )
         assert choices["value"] == ["a.safetensors"]
+        assert mults["value"] == "1;1|\n#lora_off 0 0.9;0.9 b.safetensors"
+        _, mults, _ = act(plugin, {"type": "set_enabled", "id": "a.safetensors", "value": False},
+                          state, ["a.safetensors", "b.safetensors"], "1;1|0.9;0.9")
+        assert "value" not in mults
 
-    def test_a_stale_snapshot_is_dropped_when_native_state_moves(self, plugin, state):
-        act(plugin, {"type": "disable_all"}, state, LORAS, "0.1;0.1 0.2;0.2 0.3;0.3")
-        # Something else (a preset, an .lset) changed the selection meanwhile.
-        payload = payload_of(plugin, state, ["b.safetensors"], "0.7;0.7")
-        assert payload["can_restore"] is False
+    def test_one_lora_goes_off_in_place_and_comes_back_there(self, plugin, state):
+        choices, mults, payload = act(
+            plugin, {"type": "set_enabled", "id": "b.safetensors", "value": False},
+            state, LORAS, "0.1;0.1 0.2;0.4 0.3;0.3",
+        )
+        assert choices["value"] == ["a.safetensors", "sub/c.safetensors"]
+        assert mults["value"] == "0.1;0.1 0.3;0.3\n#lora_off 1 0.2;0.4 b.safetensors"
+        rows = payload["active"]
+        assert [(row["id"], row["enabled"]) for row in rows] == [
+            ("a.safetensors", True), ("b.safetensors", False), ("sub/c.safetensors", True),
+        ]
+        assert rows[1]["summary"] == "Phase 1 0.2 · Phase 2 0.4"
+        # Nothing about it can be edited until it is back on.
+        _, unchanged, _ = act(plugin, {"type": "set_strength", "id": "b.safetensors", "phase": 0, "value": 0.9},
+                              state, choices["value"], mults["value"])
+        assert "value" not in unchanged
+
+        choices, mults, _ = act(plugin, {"type": "set_enabled", "id": "b.safetensors", "value": True},
+                                state, choices["value"], mults["value"])
+        assert choices["value"] == LORAS
+        assert mults["value"] == "0.1;0.1 0.2;0.4 0.3;0.3"
+
+    def test_its_tile_brings_a_switched_off_lora_back(self, plugin, state):
+        off = "0.1;0.1\n#lora_off 1 0.5;0.2 b.safetensors"
+        payload = payload_of(plugin, state, ["a.safetensors"], off)
+        tile = next(item for item in payload["items"] if item["id"] == "b.safetensors")
+        assert (tile["active"], tile["disabled"]) == (False, True)
+        choices, mults, _ = act(plugin, {"type": "toggle", "id": "b.safetensors", "enabled": True},
+                                state, ["a.safetensors"], off)
+        assert (choices["value"], mults["value"]) == (["a.safetensors", "b.safetensors"], "0.1;0.1 0.5;0.2")
+
+    def test_removing_a_switched_off_lora_forgets_it(self, plugin, state):
+        choices, mults, _ = act(plugin, {"type": "remove", "id": "b.safetensors"},
+                                state, ["a.safetensors"], "0.1;0.1\n#lora_off 0 0.5 b.safetensors")
+        assert (choices["value"], mults["value"]) == (["a.safetensors"], "0.1;0.1")
+
+    def test_a_selection_that_brings_it_back_wins(self, plugin, state):
+        """A preset, or WanGP's own picker, selecting it again: it is on."""
+        payload = payload_of(plugin, state, ["b.safetensors"], "0.7\n#lora_off 0 0.5 b.safetensors")
+        assert [(row["id"], row["enabled"]) for row in payload["active"]] == [("b.safetensors", True)]
+        assert payload["can_enable_all"] is False
+
+    def test_other_edits_keep_a_switched_off_lora(self, plugin, state):
+        choices, mults, _ = act(plugin, {"type": "set_strength", "id": "a.safetensors", "phase": 0, "value": 0.4},
+                                state, ["a.safetensors"], "0.1;0.1\n#lora_off 1 0.5 b.safetensors")
+        assert mults["value"] == "0.4;0.1\n#lora_off 1 0.5 b.safetensors"
+        choices, mults, _ = act(plugin, {"type": "toggle", "id": "sub/c.safetensors", "enabled": True},
+                                state, choices["value"], mults["value"])
+        assert choices["value"] == ["a.safetensors", "sub/c.safetensors"]
+        assert mults["value"] == "0.4;0.1 1;1\n#lora_off 1 0.5 b.safetensors"
+
+    def test_a_profile_keeps_which_loras_were_off(self, plugin, state):
+        stack = "0.1;0.1\n#lora_off 1 0.5 b.safetensors"
+        act(plugin, {"type": "profile_save", "name": "mixed"}, state, ["a.safetensors"], stack)
+        payload = payload_of(plugin, state, ["a.safetensors"], stack)
+        assert payload["active_profile"] == "mixed"
+        choices, mults, _ = act(plugin, {"type": "profile_recall", "name": "mixed"}, state, [], "")
+        assert (choices["value"], mults["value"]) == (["a.safetensors"], stack)
+        # The same LoRAs, all on, are a different stack.
+        assert payload_of(plugin, state, ["a.safetensors", "b.safetensors"], "0.1;0.1 0.5")["active_profile"] == ""
 
 
 class TestProfiles:
@@ -796,11 +871,10 @@ class TestDefaultProfile:
 class TestModelChange:
     def test_switching_model_drops_per_model_caches(self, plugin, state):
         instance = plugin._instance("test")
-        act(plugin, {"type": "disable_all"}, state, LORAS, "1;1 1;1 1;1")
-        assert instance.restore_snapshot is not None
+        payload_of(plugin, state, LORAS, "0.8;0.4 1;1 1;1")
+        assert instance.inventory_ids and instance.phase_memory
 
         plugin.on_model_change({"model_type": "wan22"}, "wan22")
-        assert instance.restore_snapshot is None
         assert instance.inventory_ids == []
         assert instance.phase_memory == {}
 
@@ -980,6 +1054,8 @@ class TestScheduleActions:
         assert payload["steps"] == 30
 
     def test_a_phase_specific_schedule_never_claims_global_steps(self, plugin, state):
+        """Where phases are cut from one run, phase 1's steps are not the run's."""
+        plugin.get_model_def = lambda model_type: SWITCHED_MODEL_DEF
         payload = spayload(plugin, state, self.LORAS, "1,0.8;0.7,0.5 1;1", steps=30)
         assert self._schedule(payload, "a.safetensors", 0)["coordinate_mode"] == "phase_relative"
         assert payload["phase_boundaries_known"] is False
@@ -1001,8 +1077,10 @@ class TestScheduleActions:
         assert schedule["slots"] == 24 and schedule["coordinate_mode"] == "global_exact"
 
     def test_scheduling_is_refused_with_more_than_one_guidance_phase(self, plugin, state):
-        """WanGP squeezes each phase's values into that phase, so a timeline
-        there would not be showing what runs."""
+        """On a model whose phases are cut from one run, WanGP squeezes each
+        phase's values into that phase, so a timeline there would not be
+        showing what runs."""
+        plugin.get_model_def = lambda model_type: SWITCHED_MODEL_DEF
         _, mults, payload = sact(
             plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 0},
             state, self.LORAS, "0.8;0.5 1;1", guidance=2, steps=24,
@@ -1011,6 +1089,40 @@ class TestScheduleActions:
         assert payload["scheduling_enabled"] is False
         assert payload["status_warn"] is True
         assert row_of(payload, "a.safetensors")["phase_schedules"] == []
+
+    def test_h3_carries_phase_1_through_every_phase_mode(self, plugin, state):
+        """The reported bug: entering Two Phases emptied a scheduled phase 1.
+        On H3 phase 1 is the same full-length pass in every mode."""
+        multipliers = "0,-2,0,0;1 0.7;0.5"
+        for guidance in (1, 2, "2~", 1, 2):
+            payload = payload_of(plugin, state, self.LORAS, multipliers, guidance, steps=4, steps2=3)
+            assert payload["scheduling_enabled"] is True
+            assert payload["schedules_out_of_sync"] is False
+            row = row_of(payload, "a.safetensors")
+            first = row["phase_schedules"][0]
+            assert first["slots"] == 4
+            assert [(r["start"], r["end"], r["strength"]) for r in first["regions"]] == [(2, 2, -2.0)]
+            _, mults, _ = act(plugin, {"type": "schedule_resync"}, state, self.LORAS, multipliers,
+                              guidance, steps=4, steps2=3)
+            assert "value" not in mults            # nothing to rewrite
+
+    def test_h3_stage_2_follows_phase_2_steps(self, plugin, state):
+        _, _, payload = act(plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 1},
+                            state, self.LORAS, "0,-2,0,0;1 1;1", 2, steps=4, steps2=3)
+        assert self._schedule(payload, "a.safetensors", 1)["slots"] == 3
+        _, mults, payload = act(plugin, {"type": "schedule_add_region", "id": "a.safetensors",
+                                         "phase": 1, "start": 3, "end": 3},
+                                state, self.LORAS, "0,-2,0,0;1 1;1", 2, steps=4, steps2=3)
+        assert mults["value"].split()[0] == "0,-2,0,0;0,0,1"
+
+        token = mults["value"]
+        payload = payload_of(plugin, state, self.LORAS, token, 2, steps=4, steps2=5)
+        assert payload["schedules_out_of_sync"] is True
+        _, mults, payload = act(plugin, {"type": "schedule_resync"}, state, self.LORAS, token,
+                                2, steps=4, steps2=5)
+        # Drawn step by step, so more steps arrive empty at the end.
+        assert mults["value"].split()[0] == "0,-2,0,0;0,0,1,0,0"
+        assert self._schedule(payload, "a.safetensors", 1)["slots"] == 5
 
     def test_an_empty_timeline_follows_the_step_counter(self, plugin, state):
         sact(plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 0},
@@ -1124,9 +1236,9 @@ class TestScheduleActions:
         _, mults, _ = sact(plugin, {"type": "profile_recall", "name": "sched"}, state, [], "")
         assert mults["value"].split()[0] == "1,0.8,0.4;0.7"
 
-    def test_disable_all_and_restore_keep_a_schedule(self, plugin, state):
-        sact(plugin, {"type": "disable_all"}, state, self.LORAS, "1,0.8,0.4;0.7 1;1")
-        _, mults, _ = sact(plugin, {"type": "restore"}, state, [], "")
+    def test_switching_off_and_on_keeps_a_schedule(self, plugin, state):
+        _, off, _ = sact(plugin, {"type": "disable_all"}, state, self.LORAS, "1,0.8,0.4;0.7 1;1")
+        _, mults, _ = sact(plugin, {"type": "enable_all"}, state, [], off["value"])
         assert mults["value"].split()[0] == "1,0.8,0.4;0.7"
 
     def test_the_slider_grid_and_precision_are_published(self, plugin, state):
@@ -1229,8 +1341,8 @@ class TestImportSafety:
         _, mults, _ = act(plugin, {"type": "profile_recall", "name": "zeros"}, state, [], "")
         assert mults["value"].split()[0] == "0,0,0.5,0.5,0;0.7"
 
-        act(plugin, {"type": "disable_all"}, state, self.LORAS, multipliers)
-        _, mults, _ = act(plugin, {"type": "restore"}, state, [], "")
+        _, off, _ = act(plugin, {"type": "disable_all"}, state, self.LORAS, multipliers)
+        _, mults, _ = act(plugin, {"type": "enable_all"}, state, [], off["value"])
         assert mults["value"].split()[0] == "0,0,0.5,0.5,0;0.7"
 
     def test_editing_a_token_canonicalises_its_formatting_but_not_its_values(self, plugin, state):

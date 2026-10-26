@@ -198,3 +198,59 @@ class TestRescale:
 
     def test_shrinking_truncates(self):
         assert codec.rescale_values([0.5, 0.9], 1) == [0.5]
+
+
+def _wangp_preparse(text):
+    """``preparse_loras_multipliers`` as WanGP 18.x writes it, for the string
+    case: what WanGP actually reads out of the multiplier text."""
+    text = text.strip(" \r\n")
+    lines = text.replace("\r", "").split("\n")
+    lines = [line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")]
+    return " ".join(lines).replace("|", " ").split()
+
+
+def _wangp_find_bar(text):
+    """``_find_bar``: the accelerator bar, outside comment lines."""
+    comment = False
+    for index, char in enumerate(text):
+        if char in ("\n", "\r"):
+            comment = False
+        elif char == "#":
+            comment = True
+        elif char == "|" and not comment:
+            return index
+    return -1
+
+
+class TestSwitchedOffLoras:
+    """A switched-off LoRA is a comment line WanGP drops before reading."""
+
+    OFF = [
+        codec.DisabledLora(id="sub/my lora v2.safetensors", token="0,-2,0,0;1", at=1),
+        codec.DisabledLora(id="b.safetensors", token="0.5", at=3),
+    ]
+
+    def test_it_round_trips_names_with_spaces(self):
+        text = codec.serialize(["1", "0.7;0.5"], -1, self.OFF)
+        assert text == (
+            "1 0.7;0.5\n"
+            "#lora_off 1 0,-2,0,0;1 sub/my lora v2.safetensors\n"
+            "#lora_off 3 0.5 b.safetensors"
+        )
+        assert codec.parse_disabled(text) == self.OFF
+
+    @pytest.mark.parametrize("tokens, separator", [
+        (["1", "0.7;0.5"], -1),
+        (["1", "1", "0.7;0.5"], 2),     # behind WanGP's accelerator bar
+        ([], -1),                       # every LoRA switched off
+    ])
+    def test_wangp_reads_only_the_tokens(self, tokens, separator):
+        text = codec.serialize(tokens, separator, self.OFF)
+        assert _wangp_preparse(text) == tokens
+        assert codec.parse_multipliers(text).tokens == tokens
+        bar = _wangp_find_bar(text)
+        assert (bar >= 0) is (separator >= 0)
+
+    def test_ordinary_comments_are_not_mistaken_for_one(self):
+        text = "1\n# lora_off is a fine thing to write\n#lora_off x 1 a.safetensors\n#lora_off 0 1"
+        assert codec.parse_disabled(text) == []

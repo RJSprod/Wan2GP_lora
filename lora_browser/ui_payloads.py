@@ -43,7 +43,7 @@ VALUE_DECIMALS = 4
 #:
 #: ``GLOBAL_EXACT``  - the timeline really is inference steps 1..N.
 #: ``STAGE_EXACT``   - the timeline is one pipeline stage's steps 1..N, and the
-#:                      plugin knows that stage's length (LTX-2).
+#:                      plugin knows that stage's length (LTX-2, MiniMax H3).
 #: ``PHASE_RELATIVE`` - slots inside one phase, whose global step numbers depend
 #:                      on runtime phase boundaries the plugin cannot see.
 #: ``NORMALIZED_READONLY`` - preserved, but not offered for dragging.
@@ -67,6 +67,10 @@ LTX2_DISTILLED_STEPS = len(LTX2_DISTILLED_SIGMAS) - 1
 LTX2_REFINE_STEPS = len(LTX2_STAGE_2_SIGMAS) - 1
 LTX2_DISTILLED_SAMPLERS = frozenset({"distilled_8_steps", "distilled_8_steps_ancestral"})
 
+#: WanGP's default for "Phase 2 Steps" (``num_inference_steps2``), used when the
+#: plugin could not obtain that component.  MiniMax H3 sets it to 3.
+PHASE_2_STEPS_DEFAULT = 3
+
 #: Field separator used only inside the canonical fingerprint below.
 _SIGNATURE_SEP = "\x1f"
 
@@ -88,8 +92,9 @@ class PhaseConfig:
     effective: int = 1
     #: True when every phase is a pipeline stage that runs a known number of
     #: steps -- LTX-2, where phase 1 is the first denoising pass and phase 2 the
-    #: refinement after the upscale.  Elsewhere a second phase starts at a switch
-    #: step the sampler only settles at generation time.
+    #: refinement after the upscale, and MiniMax H3, whose phase 2 is a separate
+    #: enhancement pass with a step count of its own.  Elsewhere a second phase
+    #: starts at a switch step the sampler only settles at generation time.
     staged: bool = False
 
     @property
@@ -111,6 +116,24 @@ def is_ltx2(model_def: dict | None) -> bool:
         or architecture == "joyai_echo"
         or "ltx2_22B_class" in model_def
     )
+
+
+def has_own_phase_2_steps(model_def: dict | None) -> bool:
+    """A model whose phase 2 is a pass of its own, run for "Phase 2 Steps".
+
+    WanGP shows that slider (``num_inference_steps2``) for a model that sets
+    ``inference_steps2``, and such a model runs each phase as its own stage:
+    MiniMax H3 expands phase 1's list over the full ``num_inference_steps``
+    denoise and phase 2's over the enhancement pass after the latent upscale
+    (``activate_lora_phase`` in its pipeline).  So in either guidance mode
+    phase 1 is the same run, and a schedule on it means the same thing.
+    """
+    return bool((model_def or {}).get("inference_steps2", False))
+
+
+def is_staged(model_def: dict | None) -> bool:
+    """Whether every LoRA phase is a pipeline stage of known length."""
+    return is_ltx2(model_def) or has_own_phase_2_steps(model_def)
 
 
 def ltx2_runs_distilled_steps(model_def: dict | None, sampler: Any = "") -> bool:
@@ -177,21 +200,36 @@ def ltx2_stage_2_match(model_def: dict | None, sampler: Any = "") -> tuple[int, 
 
 
 def phase_step_counts(
-    model_def: dict | None, phases: PhaseConfig, steps: int, sampler: Any = ""
+    model_def: dict | None, phases: PhaseConfig, steps: int, sampler: Any = "", steps2: Any = None
 ) -> tuple[int, ...]:
     """How many steps each LoRA phase runs, when the model makes that knowable.
 
-    Empty for everything but LTX-2.  There WanGP expands phase 1's list over
-    the first stage and phase 2's over the refinement stage, each at its own
-    length -- see ``update_loras_slists`` in its two LTX-2 pipelines -- so a
-    timeline per phase can be exact.  One Phase skips the refinement stage.
+    Empty unless the phases are stages.  There WanGP expands phase 1's list
+    over the first stage and phase 2's over the second, each at its own length
+    -- see ``update_loras_slists`` in the LTX-2 and MiniMax H3 pipelines -- so a
+    timeline per phase can be exact.  One Phase runs the first stage only.
+
+    LTX-2's refinement always runs three steps.  An H3-style phase 2 runs
+    "Phase 2 Steps" (``steps2``), WanGP's default where that is not known.
     """
     if not phases.staged:
         return ()
-    first = LTX2_DISTILLED_STEPS if ltx2_runs_distilled_steps(model_def, sampler) else int(steps or 0)
+    if is_ltx2(model_def):
+        first = LTX2_DISTILLED_STEPS if ltx2_runs_distilled_steps(model_def, sampler) else int(steps or 0)
+        second = LTX2_REFINE_STEPS
+    else:
+        first = int(steps or 0)
+        second = _step_count(steps2) or PHASE_2_STEPS_DEFAULT
     if first <= 0:
         return ()
-    return (first,) if phases.effective <= 1 else (first, LTX2_REFINE_STEPS)
+    return (first,) if phases.effective <= 1 else (first, second)
+
+
+def _step_count(value: Any) -> int:
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return 0
 
 
 def resolve_phases(model_def: dict | None, guidance_phases_value: Any) -> PhaseConfig:
@@ -227,7 +265,7 @@ def resolve_phases(model_def: dict | None, guidance_phases_value: Any) -> PhaseC
     return PhaseConfig(
         capacity=capacity,
         effective=max(1, min(capacity, guidance_count or 1)),
-        staged=is_ltx2(model_def),
+        staged=is_staged(model_def),
     )
 
 
@@ -237,11 +275,11 @@ class ScheduleContext:
 
     ``steps`` is WanGP's ``num_inference_steps`` when the plugin could obtain
     the component, else 0.  ``phase_steps`` is how many steps each phase runs
-    where the model makes that knowable (``phase_step_counts``: LTX-2's
-    stages); elsewhere it is empty, a phase-specific schedule is expanded inside
-    a runtime interval that depends on model switching, and labelling its slots
-    with step numbers the plugin cannot verify would be a lie.
-    ``boundaries_known`` says which of the two this is.
+    where the model makes that knowable (``phase_step_counts``: the stages of
+    LTX-2 and MiniMax H3); elsewhere it is empty, a phase-specific schedule is
+    expanded inside a runtime interval that depends on model switching, and
+    labelling its slots with step numbers the plugin cannot verify would be a
+    lie.  ``boundaries_known`` says which of the two this is.
 
     ``stage_2_match`` is, for each refinement step of an LTX-2 run in Two
     Phases, the stage-1 step at the nearest noise level, where stage 1's noise
@@ -260,17 +298,18 @@ class ScheduleContext:
         model_def: dict | None = None,
         phases: PhaseConfig | None = None,
         sampler: Any = "",
+        steps2_value: Any = None,
     ) -> "ScheduleContext":
-        try:
-            steps = max(0, int(float(steps_value)))
-        except (TypeError, ValueError):
-            steps = 0
-        phase_steps = phase_step_counts(model_def, phases, steps, sampler) if phases else ()
+        steps = _step_count(steps_value)
+        phase_steps = phase_step_counts(model_def, phases, steps, sampler, steps2_value) if phases else ()
+        # Noise levels are matched across LTX-2's stages only: its sigma tables
+        # are the ones mirrored here.
+        matched = len(phase_steps) > 1 and is_ltx2(model_def)
         return cls(
             steps=steps,
             boundaries_known=bool(phase_steps),
             phase_steps=phase_steps,
-            stage_2_match=ltx2_stage_2_match(model_def, sampler) if len(phase_steps) > 1 else (),
+            stage_2_match=ltx2_stage_2_match(model_def, sampler) if matched else (),
         )
 
     def phase_length(self, phase: int = 0) -> int:
@@ -326,20 +365,21 @@ def scheduling_allowed(phases: PhaseConfig) -> bool:
     four-slot schedule drawn against a four-step run would be squeezed into
     however many steps phase 1 turns out to be, so the timeline would be showing
     something WanGP is not going to do.  Rather than draw that, the editor does
-    not offer scheduling at all there.
+    not offer scheduling there -- and does not touch a schedule already in a
+    token either: switching the mode back brings it back exactly as it was.
 
-    LTX-2 is the exception, and it is why ``staged`` exists.  Its phases are
-    not cut out of one run at a switch step; each is a pipeline stage that
-    runs its own sigma table, with a length known while editing.  A list as
-    long as its stage runs one value per step there, in either mode.
+    LTX-2 and MiniMax H3 are the exception, and they are why ``staged``
+    exists.  Their phases are not cut out of one run at a switch step; each is
+    a pipeline stage with a length known while editing.  A list as long as its
+    stage runs one value per step there, in either mode.
     """
     return phases.effective <= 1 or phases.staged
 
 
 SCHEDULING_DISABLED_REASON = (
-    "Step schedules need One Phase guidance: with more phases WanGP squeezes "
-    "each phase's values into that phase, so a timeline could not show what "
-    "actually runs."
+    "Kept exactly as it is. With more than one phase, this model only settles "
+    "where each phase starts while generating, so a timeline could not show what "
+    "runs - switch to One Phase to edit it."
 )
 
 
@@ -364,21 +404,36 @@ def sanitize_value(value: Any, fallback: float = 1.0) -> float:
 
 @dataclass
 class Stack:
-    """The selected LoRAs and their multiplier tokens, in native order."""
+    """The selected LoRAs and their multiplier tokens, in native order.
+
+    ``ids``/``tokens`` are what WanGP applies.  ``disabled`` are LoRAs switched
+    off in the panel: kept with their multipliers, as comment lines in the
+    multiplier text (``codec.DISABLED_MARK``), and applied by nothing.
+    """
 
     ids: list[str] = field(default_factory=list)
     tokens: list[str] = field(default_factory=list)
     separator_index: int = -1
+    disabled: list[codec.DisabledLora] = field(default_factory=list)
 
     @classmethod
     def from_native(cls, selected, multipliers: str) -> "Stack":
         ids = [normalize_id(value) for value in (selected or []) if normalize_id(value)]
         parsed = codec.parse_multipliers(multipliers)
-        return cls(
+        stack = cls(
             ids=ids,
             tokens=codec.align_tokens(parsed.tokens, len(ids)),
             separator_index=min(parsed.separator_index, len(ids)) if parsed.has_separator else -1,
         )
+        seen = set(ids)
+        for entry in codec.parse_disabled(multipliers):
+            lora_id = normalize_id(entry.id)
+            # Selected again -- by a preset, say, or WanGP's own picker: the
+            # selection is what runs, so it wins over the switched-off copy.
+            if lora_id and lora_id not in seen:
+                seen.add(lora_id)
+                stack.disabled.append(codec.DisabledLora(id=lora_id, token=entry.token, at=entry.at))
+        return stack
 
     def index_of(self, lora_id: str) -> int:
         target = normalize_id(lora_id)
@@ -399,23 +454,90 @@ class Stack:
         """Include a LoRA on the user side of the stack, at 1.0 per phase.
 
         A newly included LoRA never inherits the strength of whichever row
-        previously occupied its index.
+        previously occupied its index.  One that is switched off is already
+        included: it comes back on, as it was.
         """
         lora_id = normalize_id(lora_id)
         if not lora_id or self.index_of(lora_id) >= 0:
             return False
+        if self.disabled_entry(lora_id) is not None:
+            return self.set_enabled(lora_id, True)
         self.ids.append(lora_id)
         self.tokens.append(codec.default_token(capacity))
         return True
 
     def remove(self, lora_id: str) -> bool:
+        """Take a LoRA out of the stack, switched on or off."""
         position = self.index_of(lora_id)
-        if position < 0:
+        if position >= 0 and self.is_system(position):
+            self.ids.pop(position)
+            self.tokens.pop(position)
+            self.separator_index = codec.separator_after_removal(self.separator_index, [position])
+            return True
+        target = normalize_id(lora_id)
+        entries = self.user_entries()
+        kept = [entry for entry in entries if entry[0] != target]
+        if len(kept) == len(entries):
             return False
-        self.ids.pop(position)
-        self.tokens.pop(position)
-        self.separator_index = codec.separator_after_removal(self.separator_index, [position])
+        self.set_user_entries(kept)
         return True
+
+    def disabled_entry(self, lora_id: str) -> codec.DisabledLora | None:
+        target = normalize_id(lora_id)
+        return next((entry for entry in self.disabled if entry.id == target), None)
+
+    def user_entries(self) -> list[tuple[str, bool, str]]:
+        """``(id, on, token)`` for the user's LoRAs, in the order the panel
+        lists them: a switched-off LoRA stays where it was."""
+        entries = [
+            (lora_id, True, self.tokens[position])
+            for position, lora_id in enumerate(self.ids) if not self.is_system(position)
+        ]
+        for entry in sorted(self.disabled, key=lambda entry: entry.at):
+            entries.insert(max(0, min(int(entry.at), len(entries))), (entry.id, False, entry.token))
+        return entries
+
+    def set_user_entries(self, entries: list[tuple[str, bool, str]]) -> None:
+        """Write the user's side back: on ones into the selection, in order,
+        off ones as comment lines that remember their place."""
+        keep = self.separator_index if self.separator_index >= 0 else 0
+        self.ids = self.ids[:keep] + [lora_id for lora_id, on, _ in entries if on]
+        self.tokens = self.tokens[:keep] + [token for _, on, token in entries if on]
+        self.disabled = [
+            codec.DisabledLora(id=lora_id, token=token, at=index)
+            for index, (lora_id, on, token) in enumerate(entries) if not on
+        ]
+
+    def set_enabled(self, lora_id: str, on: bool) -> bool:
+        """Switch one of the user's LoRAs on or off, keeping its multiplier and
+        its place.  WanGP-managed LoRAs are left to WanGP."""
+        target = normalize_id(lora_id)
+        if not on and ("\n" in target or "\r" in target):
+            return False                 # a comment line could not hold it
+        entries = self.user_entries()
+        for index, (entry_id, entry_on, token) in enumerate(entries):
+            if entry_id == target:
+                if entry_on == bool(on):
+                    return False
+                entries[index] = (entry_id, bool(on), token)
+                self.set_user_entries(entries)
+                return True
+        return False
+
+    def set_all_enabled(self, on: bool) -> int:
+        """Switch every user LoRA on or off; returns how many changed."""
+        entries = self.user_entries()
+        changed = [
+            entry for entry in entries
+            if entry[1] != bool(on) and (on or not ("\n" in entry[0] or "\r" in entry[0]))
+        ]
+        if changed:
+            moved = {entry[0] for entry in changed}
+            self.set_user_entries([
+                (lora_id, bool(on) if lora_id in moved else entry_on, token)
+                for lora_id, entry_on, token in entries
+            ])
+        return len(changed)
 
     def set_token(self, lora_id: str, token: str) -> bool:
         position = self.index_of(lora_id)
@@ -435,7 +557,7 @@ class Stack:
         for lora_id in self.ids:
             entry = inventory.get(lora_id) if inventory else None
             values.append(entry.native_value if entry else lora_id)
-        return values, codec.serialize(self.tokens, self.separator_index)
+        return values, codec.serialize(self.tokens, self.separator_index, self.disabled)
 
 
 def build_items(
@@ -456,6 +578,7 @@ def build_items(
     memory = memory or {}
     catalogue = catalogue or {}
     items = []
+    off = {lora.id for lora in stack.disabled}
     for entry in inventory.entries:
         position = stack.index_of(entry.id)
         index = catalogue.get(entry.id)
@@ -465,6 +588,8 @@ def build_items(
             "label": entry.label,
             "parent": entry.parent,
             "active": position >= 0,
+            # In the stack, switched off: a tile click switches it back on.
+            "disabled": entry.id in off,
             "favorite": bool(metadata.is_favorite(model_key, entry.id)) if metadata else False,
             "tag": metadata.tag(model_key, entry.id) if metadata else "",
             "system_managed": stack.is_system(position),
@@ -494,29 +619,44 @@ def build_active_rows(
     schedules: dict[tuple[str, int], sch.PhaseSchedule] | None = None,
     context: ScheduleContext | None = None,
 ) -> list[dict[str, Any]]:
-    """Editable rows, in native order, including LoRAs missing from disk."""
+    """Editable rows, including LoRAs missing from disk.
+
+    WanGP-managed LoRAs first, then the user's in the panel's order, with the
+    switched-off ones where they were: ``enabled`` is off for those, and they
+    carry only a ``summary`` of what switching them back on brings back.
+    """
     memory = memory or {}
     catalogue = catalogue or {}
     schedules = schedules if schedules is not None else {}
-    rows = []
-    for position, lora_id in enumerate(stack.ids):
+
+    def base(lora_id: str, system: bool, enabled: bool) -> dict[str, Any]:
         entry = inventory.get(lora_id)
         index = catalogue.get(lora_id)
         fallback_name = lora_id.rsplit("/", 1)[-1]
-        row: dict[str, Any] = {
+        return {
             "id": lora_id,
             "name": entry.name if entry else fallback_name,
             "label": entry.label if entry else fallback_name,
             "civitai_name": getattr(index, "civitai_name", "") if index else "",
             "has_catalogue": bool(getattr(index, "has_sidecar", False)) if index else False,
-            "system_managed": stack.is_system(position),
+            "system_managed": system,
             "missing": entry is None,
+            "enabled": enabled,
         }
-        row.update(
-            multiplier_fields(
-                stack.tokens[position], phases, lora_id, memory, schedules, context
-            )
-        )
+
+    rows = []
+    listed = [
+        (lora_id, True, stack.tokens[position], True)
+        for position, lora_id in enumerate(stack.ids) if stack.is_system(position)
+    ] + [(lora_id, on, token, False) for lora_id, on, token in stack.user_entries()]
+    for lora_id, on, token, system in listed:
+        row = base(lora_id, system, on)
+        if on:
+            row.update(multiplier_fields(token, phases, lora_id, memory, schedules, context))
+        else:
+            # Nothing to edit until it is back on: what it would bring back.
+            row.update(multiplier_fields(token, phases, lora_id, {}, with_schedules=False))
+            row["summary"] = describe_token(token, phases)
         rows.append(row)
     return rows
 
@@ -557,8 +697,9 @@ def multiplier_fields(
         return _scheduled_fields(info, phases, lora_id, schedules or {}, context, with_schedules)
 
     if info.kind == codec.SCHEDULED:
-        # More than one guidance phase: this token is on its way to being reset,
-        # and until it is there is nothing here a strength control can mean.
+        # A mode with more than one guidance phase on a model whose phases are
+        # not stages: the schedule is kept as it is, and is shown -- not edited
+        # -- until One Phase can edit it truthfully again.
         return {
             "multiplier_raw": info.raw,
             "multiplier_kind": codec.SCHEDULED,
@@ -570,6 +711,7 @@ def multiplier_fields(
             "schedule_reason": SCHEDULING_DISABLED_REASON,
             "advanced_preserved": False,
             "stage_2_fill": None,
+            "summary": describe_token(info.raw, phases),
         }
 
     values = full_values(info, phases, lora_id, memory)
@@ -633,7 +775,7 @@ def _scheduled_fields(
         "schedule_shared": shared,
         "schedule_reason": "",
         "advanced_preserved": False,
-        # What "Fill from stage 1" would draw on an empty LTX-2 stage 2.
+        # What "Fill from stage 1" would draw on an empty stage 2.
         "stage_2_fill": (
             stage_2_fill_payload(stage_2_fill(info, phases, context)) if with_schedules else None
         ),
@@ -743,7 +885,7 @@ def coordinate_mode(
 
     A staged model's phase is a stage of known length, so a timeline exactly
     that long is exact within its stage -- and when the stage is the whole run
-    (LTX-2 in One Phase), within the run.
+    (One Phase), within the run.
     """
     if not schedule.editable:
         return COORD_NORMALIZED_READONLY
@@ -756,6 +898,40 @@ def coordinate_mode(
     if shared and steps and slots == steps:
         return COORD_GLOBAL_EXACT
     return COORD_PHASE_RELATIVE
+
+
+def describe_token(raw: str, phases: PhaseConfig) -> str:
+    """One line saying what a multiplier does, for a row that only shows it.
+
+    ``0.7``, ``Phase 1 0.7 · Phase 2 1``, ``∿ 1 at steps 1–4, 0.5 at step 6``:
+    a scheduled phase is read as its regions, the way the timeline draws it.
+    """
+    info = codec.classify(raw, phases.capacity)
+    if info.kind == codec.ADVANCED:
+        return info.raw
+    if info.kind == codec.SIMPLE:
+        parts = [format_number(value) for value in (info.values or [1.0])[: phases.effective]]
+    else:
+        token = info.schedule
+        count = 1 if token.shared else max(1, min(phases.effective, phases.capacity))
+        parts = [_describe_values(token.values_for(phase)) for phase in range(count)]
+    if len(parts) == 1:
+        return parts[0]
+    labels = phase_labels(len(parts))
+    return " · ".join(f"{labels[index]} {part}" for index, part in enumerate(parts))
+
+
+def _describe_values(values: list[float]) -> str:
+    if len(values) <= 1:
+        return format_number(values[0] if values else 1.0)
+    regions = sch.reconstruct_schedule(values).regions
+    if not regions:
+        return "∿ off"
+    return "∿ " + ", ".join(
+        f"{format_number(region.strength)} at "
+        + (f"step {region.start}" if region.start == region.end else f"steps {region.start}\u2013{region.end}")
+        for region in regions
+    )
 
 
 def full_values(
@@ -823,14 +999,18 @@ def normalize_stack_tokens(stack: "Stack", phases: PhaseConfig, memory: dict[str
 # fit every token to the mode as soon as the mode changes, and keep what they
 # cut so the mode coming back restores it.
 #
-# LTX-2 schedules are the exception to the keeping.  Its phases are stages of
-# different lengths -- eight distilled steps, then three of refinement -- so a
-# list written for one stage means nothing in the other, and WanGP squeezing a
-# comma-only list into both is not a schedule anyone drew.  There, a stage-1
-# schedule entering Two Phases gets an empty stage 2 of its own, and a stage 2
-# a narrower mode cut is not held: it starts empty again when the mode widens.
-# The switch then fills that empty stage 2 from stage 1 by noise level, as
-# "Fill from stage 1" does (``fill_stages_from_stage_1``).
+# Schedules on a staged model are the exception to the keeping.  Its phases
+# are stages of different lengths -- eight distilled steps, then three of
+# refinement, on LTX-2 -- so a list written for one stage means nothing in the
+# other, and WanGP squeezing a comma-only list into both is not a schedule
+# anyone drew.  There, a stage-1 schedule entering Two Phases gets an empty
+# stage 2 of its own, and a stage 2 a narrower mode cut is not held: it starts
+# empty again when the mode widens.  The switch then fills that empty stage 2
+# from stage 1, as "Fill from stage 1" does (``fill_stages_from_stage_1``).
+#
+# MiniMax H3 keeps two phases in every mode, so One Phase cuts nothing from it:
+# both stages stay in the token, and the mode only decides whether the second
+# runs.  Phase 1 is the same run either way, so a switch never changes it.
 
 
 def _value_list(part: str) -> bool:
@@ -883,8 +1063,8 @@ def _fitted_token(token: str, lora_id: str, phases: PhaseConfig, hidden: HiddenP
     alone: WanGP spreads its last part over the phases it does not name, which
     is valid and was someone's choice.
 
-    An LTX-2 token that schedules any stage is the exception: it follows
-    ``_fitted_stages``, which holds nothing and restores nothing.
+    A token that schedules any stage of a staged model is the exception: it
+    follows ``_fitted_stages``, which holds nothing and restores nothing.
     """
     parts = _phase_parts(token)
     if parts is None:
@@ -892,7 +1072,7 @@ def _fitted_token(token: str, lora_id: str, phases: PhaseConfig, hidden: HiddenP
 
     capacity = max(1, phases.capacity)
     if phases.staged and any(_is_list(part) for part in parts):
-        return _fitted_stages(parts, capacity)
+        return _fitted_stages(parts, phases)
     full = _remembered_phases(parts, hidden.get(normalize_id(lora_id))) or parts
     if len(parts) > capacity:
         return ";".join(parts[:capacity]), (capacity, full[capacity:])
@@ -912,19 +1092,25 @@ def _is_list(part: str) -> bool:
 EMPTY_STAGE = format_number(sch.GAP_STRENGTH)
 
 
-def _fitted_stages(parts: list[str], capacity: int):
-    """``_fitted_token`` for an LTX-2 token that schedules some stage.
+def _fitted_stages(parts: list[str], phases: PhaseConfig):
+    """``_fitted_token`` for a staged token that schedules some stage.
 
-    Stages beyond the mode are cut and not remembered.  A stage-1 schedule
-    with no stage 2 -- a One Phase token entering Two Phases -- gets an empty
-    one, never a copy of itself: WanGP would otherwise expand that one list
-    over both stages, squeezing eight steps' worth into the refinement's three.
-    The resync then fills it by noise level (``fill_stages_from_stage_1``).
+    Stages beyond what the model accepts are cut and not remembered.  A
+    stage-1 schedule with no stage 2 -- a One Phase token entering Two Phases
+    -- gets an empty one, never a copy of itself: WanGP would otherwise expand
+    that one list over both stages, squeezing eight steps' worth into the
+    refinement's three.  The resync then fills it from stage 1
+    (``fill_stages_from_stage_1``).
+
+    Only a stage the mode runs is added.  H3 accepts two in One Phase too, and
+    a list with no ';' runs exactly as drawn there, so it is left alone.
     """
+    capacity = max(1, phases.capacity)
+    running = max(1, min(phases.effective, capacity))
     if len(parts) > capacity:
         return ";".join(parts[:capacity]), None
-    if len(parts) < capacity and _is_list(parts[-1]):
-        return ";".join(parts + [EMPTY_STAGE] * (capacity - len(parts))), None
+    if len(parts) < running and _is_list(parts[-1]):
+        return ";".join(parts + [EMPTY_STAGE] * (running - len(parts))), None
     return None
 
 
@@ -950,7 +1136,7 @@ def fit_phase_structure(stack: "Stack", phases: PhaseConfig, hidden: HiddenPhase
 
     Returns ``True`` when any token changed.  What a cut removes is kept in
     ``hidden`` verbatim and handed back when the mode widens again -- except
-    from an LTX-2 token that schedules a stage, whose stage 2 starts empty in
+    from a staged token that schedules a stage, whose stage 2 starts empty in
     every Two Phases it enters (``_fitted_stages``).
     """
     changed = False
@@ -1095,7 +1281,7 @@ def token_is_shared(
     editor would lose the timeline.  An already-open shared schedule therefore
     keeps its answer.
 
-    Except across LTX-2's two stages, which are never shared: they run
+    Except across a staged model's two stages, which are never shared: they run
     different numbers of steps, so each gets a timeline of its own, and a
     comma-only token there is only waiting for ``fit_phase_structure`` to give
     it an empty stage 2.  A shared timeline left open by One Phase is not
@@ -1137,8 +1323,8 @@ def sync_schedules(
     """
     live: set[tuple[str, int]] = set()
     if not scheduling_allowed(phases):
-        # Nothing here could be edited truthfully; the tokens themselves are
-        # reset by refit_schedules, which is the only thing allowed to write.
+        # Nothing here could be edited truthfully.  The tokens are left exactly
+        # as they are, so One Phase picks every schedule up again.
         schedules.clear()
         return
 
@@ -1197,7 +1383,10 @@ def sync_schedules(
                     rebuilt.history = stored.history
                 schedules[key] = rebuilt
 
-    for key in [key for key in schedules if key not in live]:
+    # A switched-off LoRA's timelines wait for it, so switching it back on finds
+    # the same regions -- anything kept past the end of the run included.
+    off = {entry.id for entry in stack.disabled}
+    for key in [key for key in schedules if key not in live and key[0] not in off]:
         del schedules[key]
 
 
@@ -1232,11 +1421,9 @@ def schedules_need_resync(
 ) -> bool:
     """True when some timeline is not the length its phase runs."""
     if not scheduling_allowed(phases):
-        # Any schedule still in a token has to go; see refit_schedules.
-        return any(
-            codec.classify(token, phases.capacity).kind == codec.SCHEDULED
-            for token in stack.tokens
-        )
+        # Nothing is edited in this mode, so nothing follows the counter
+        # either; a schedule waits in its token for One Phase.
+        return False
 
     context = context or ScheduleContext()
     for _, phase, _, schedule in _drawn_schedules(stack, phases, schedules):
@@ -1266,14 +1453,14 @@ def refit_schedules(
       Truncating that would change what it renders, so it is **resampled** into
       step alignment once, and is step-aligned from then on.
 
-    When the guidance mode has more than one phase, no schedule can be shown
-    truthfully at all, so instead of refitting them this clears them -- see
-    ``_clear_schedules_for_phase_mode``.
+    In a guidance mode that cannot show a schedule truthfully, nothing is
+    refitted and nothing is cleared: a phase switch never rewrites a
+    schedule, so switching back finds it exactly as it was.
 
     ``step_aligned`` is what tells them apart; ``sync_schedules`` decides it.
     """
     if not scheduling_allowed(phases):
-        return _clear_schedules_for_phase_mode(stack, phases, schedules, memory)
+        return False
 
     context = context or ScheduleContext()
     changed = False
@@ -1289,35 +1476,6 @@ def refit_schedules(
         )
         target_state = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=False)
         changed = _commit(stack, lora_id, target_state, phases, memory) or changed
-    return changed
-
-
-def _clear_schedules_for_phase_mode(
-    stack: "Stack",
-    phases: PhaseConfig,
-    schedules: dict[tuple[str, int], sch.PhaseSchedule],
-    memory: dict[str, list[float]],
-) -> bool:
-    """Drop every schedule when the guidance mode stops supporting them.
-
-    A scheduled LoRA goes to 0 rather than to some strength picked on its
-    behalf: the schedule said the multiplier varies over the run, and no single
-    number carries that over, so the honest move is to switch the LoRA off and
-    let the user set what they want.  Unscheduled LoRAs keep their strengths --
-    those mean the same thing in any phase mode.
-    """
-    schedules.clear()
-    changed = False
-    for position, token in enumerate(stack.tokens):
-        info = codec.classify(token, phases.capacity)
-        if info.kind != codec.SCHEDULED:
-            continue
-        lora_id = stack.ids[position]
-        zeroed = codec.build_token([0.0] * phases.capacity, phases.capacity)
-        if stack.tokens[position] != zeroed:
-            stack.tokens[position] = zeroed
-            memory[normalize_id(lora_id)] = [0.0] * phases.capacity
-            changed = True
     return changed
 
 
@@ -1660,7 +1818,7 @@ def schedule_set_base(
 def seed_strength(schedule: sch.PhaseSchedule) -> float:
     """The strength a newly drawn region starts at: the schedule's base.
 
-    Unless the base is what an empty slot is already worth -- an empty LTX-2
+    Unless the base is what an empty slot is already worth -- an empty
     stage 2, an all-zero import -- when a region seeded at it would draw
     nothing at all.  It starts at full strength then, as a new LoRA does.
     """
@@ -1862,7 +2020,7 @@ def schedule_normalize(
 
 # ----------------------------------------------------------- stage 2 fill
 #
-# An LTX-2 stage 2 is a timeline of its own: nothing keeps it in step with
+# A stage 2 is a timeline of its own: nothing keeps it in step with
 # stage 1.  It is drawn from stage 1 at two moments only -- entering Two
 # Phases, and "Fill from stage 1" on an empty stage 2 -- each time once, from
 # what stage 1 applies where the two stages share noise levels, and it is
@@ -1956,7 +2114,7 @@ def stage_2_fill(
 ) -> Stage2Fill | None:
     """What "Fill from stage 1" offers this token, or ``None`` for nothing.
 
-    Offered on LTX-2 in Two Phases, for a token whose stage 1 is scheduled and
+    Offered on a staged model in Two Phases, for a token whose stage 1 is scheduled and
     whose stage 2 has nothing drawn on it.  Whatever plain strength stage 2 has
     stays its schedule's base, so Clear phase puts it back.
     """
@@ -1982,14 +2140,15 @@ def stage_2_fill_payload(fill: Stage2Fill | None) -> dict[str, Any] | None:
 
 
 def entering_two_phases(stack: "Stack", phases: PhaseConfig) -> list[str]:
-    """LoRAs whose LTX-2 stage-1 schedule has no stage 2 in Two Phases yet:
-    the ones ``fit_phase_structure`` is about to give an empty one."""
-    if not (phases.staged and phases.capacity > 1):
+    """LoRAs whose stage-1 schedule has no stage 2 in Two Phases yet: the ones
+    ``fit_phase_structure`` is about to give an empty one."""
+    running = min(phases.effective, phases.capacity)
+    if not (phases.staged and running > 1):
         return []
     entering = []
     for lora_id, token in zip(stack.ids, stack.tokens):
         parts = _phase_parts(token)
-        if parts and len(parts) < phases.capacity and _is_list(parts[-1]):
+        if parts and len(parts) < running and _is_list(parts[-1]):
             entering.append(lora_id)
     return entering
 
@@ -2040,7 +2199,7 @@ def schedule_fill_stage_2(
     fill = stage_2_fill(codec.classify(stack.tokens[position], phases.capacity), phases, context)
     if fill is None:
         raise sch.ScheduleError(
-            "Fill from stage 1 needs Two Phases on LTX-2, a schedule on stage 1 and "
+            "Fill from stage 1 needs Two Phases on a staged model, a schedule on stage 1 and "
             "nothing drawn on stage 2."
         )
     if fill.empty:
@@ -2065,7 +2224,9 @@ def stack_signature(selected, multipliers: str) -> str:
     knows the incoming payload is the echo of its own write and skips the
     resend that would otherwise loop.
     """
+    stack = Stack.from_native(selected, multipliers)
     ids = [normalize_id(value) for value in (selected or [])]
-    parsed = codec.parse_multipliers(multipliers)
-    tokens = codec.align_tokens(parsed.tokens, len(ids))
-    return _SIGNATURE_SEP.join(ids) + _SIGNATURE_SEP + codec.serialize(tokens, parsed.separator_index)
+    tokens = codec.align_tokens(codec.parse_multipliers(multipliers).tokens, len(ids))
+    return _SIGNATURE_SEP.join(ids) + _SIGNATURE_SEP + codec.serialize(
+        tokens, stack.separator_index, stack.disabled
+    )

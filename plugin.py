@@ -131,10 +131,6 @@ class InstanceState:
         #: stage 2 that was scheduled, which starts empty instead. See
         #: ui_payloads.fit_phase_structure.
         self.hidden_phases: up.HiddenPhases = {}
-        #: Snapshot taken by "Disable all"; invalidated when native state moves
-        #: on its own, so Restore never overwrites newer settings unnoticed.
-        self.restore_snapshot: tuple[list[str], str] | None = None
-        self.restore_signature = ""
         self.pending_status = ""
         self.pending_warn = False
         self.ready = False
@@ -185,10 +181,13 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         # schedule may label its slots with real step numbers, so a WanGP build
         # that does not expose it still gets a working timeline. sample_solver
         # is optional for the same reason: on LTX-2 Dev a distilled sampler
-        # runs eight first-stage steps whatever the counter says.
+        # runs eight first-stage steps whatever the counter says. And
+        # num_inference_steps2 ("Phase 2 Steps") is how long MiniMax H3's
+        # second stage runs.
         for component in (
             "loras_choices", "loras_multipliers", "guidance_phases", "state",
             "lset_name", "main", "num_inference_steps", "sample_solver",
+            "num_inference_steps2",
         ):
             self.request_component(component)
 
@@ -229,7 +228,6 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             instance.hidden_phases.clear()
             instance.catalogue_cache.clear()
             instance.schedules.clear()
-            instance.restore_snapshot = None
             instance.next_revision()
 
     # ------------------------------------------------------------ stores
@@ -305,6 +303,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         lset_name = components.get("lset_name")
         num_inference_steps = components.get("num_inference_steps")
         sample_solver = components.get("sample_solver")
+        num_inference_steps2 = components.get("num_inference_steps2")
 
         instance_id = getattr(loras_multipliers, "_id", id(loras_multipliers))
         instance = self._instance(instance_id)
@@ -352,23 +351,22 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         if sample_solver is not None:
             sync_inputs.append(sample_solver)
             optional.append("sampler")
+        if num_inference_steps2 is not None:
+            sync_inputs.append(num_inference_steps2)
+            optional.append("steps2")
 
         def unpack(extra):
-            values = {"guidance": None, "steps": None, "sampler": None}
+            values = {"guidance": None, "steps": None, "sampler": None, "steps2": None}
             for name, value in zip(optional, extra):
                 values[name] = value
-            return values["guidance"], values["steps"], values["sampler"]
+            return values["guidance"], values["steps"], values["sampler"], values["steps2"]
 
         def sync(state_value, selected, multipliers, *extra):
-            guidance, steps, sampler = unpack(extra)
-            return self._build_payload(
-                instance, state_value, selected, multipliers, guidance, steps, sampler
-            )
+            return self._build_payload(instance, state_value, selected, multipliers, *unpack(extra))
 
         def act(action_json, state_value, selected, multipliers, *extra):
-            guidance, steps, sampler = unpack(extra)
             return self._apply_action(
-                instance, action_json, state_value, selected, multipliers, guidance, steps, sampler
+                instance, action_json, state_value, selected, multipliers, *unpack(extra)
             )
 
         def serve_media(request_json, state_value):
@@ -412,7 +410,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         # and queue edits all resynchronise without being special-cased.
         watched = [loras_choices, loras_multipliers]
         watched += [
-            component for component in (guidance_phases, num_inference_steps, sample_solver)
+            component
+            for component in (guidance_phases, num_inference_steps, sample_solver, num_inference_steps2)
             if component is not None
         ]
         for component in watched:
@@ -496,7 +495,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
     def _context(
         self, instance: InstanceState, state_value, selected, multipliers, guidance, steps=None,
-        sampler=None,
+        sampler=None, steps2=None,
     ):
         model_type = self._model_type(state_value)
         model_def = self._model_def(model_type)
@@ -504,7 +503,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         lora_dir = self._lora_dir(model_type)
         inventory = build_inventory(self._native_loras(state_value, selected), lora_dir)
         stack = up.Stack.from_native(selected, multipliers)
-        context = up.ScheduleContext.from_native(steps, model_def, phases, sampler)
+        context = up.ScheduleContext.from_native(steps, model_def, phases, sampler, steps2)
 
         instance.model_key = model_type
         instance.lora_dir = lora_dir
@@ -518,20 +517,16 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
     def _build_payload(
         self, instance: InstanceState, state_value, selected, multipliers, guidance, steps=None,
-        sampler=None,
+        sampler=None, steps2=None,
     ) -> str:
         try:
             model_type, inventory, stack, phases, context = self._context(
-                instance, state_value, selected, multipliers, guidance, steps, sampler
+                instance, state_value, selected, multipliers, guidance, steps, sampler, steps2
             )
             status, warn = instance.take_status()
 
             entries = self._user_entries(stack, phases)
             signature = up.stack_signature(selected, multipliers)
-            if instance.restore_snapshot and instance.restore_signature != signature:
-                # Native state moved on its own; a stale snapshot must not be
-                # applied over newer settings.
-                instance.restore_snapshot = None
 
             catalogue = self._catalogue_index(instance, inventory)
             rows = up.build_active_rows(
@@ -577,7 +572,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 # Schedule coordinates: how long the run is, and whether the
                 # plugin may claim exact step numbers for a phase-specific
                 # schedule -- only where each phase is a stage of known length
-                # (LTX-2), and then how long each one is.
+                # (LTX-2, MiniMax H3), and then how long each one is.
                 "steps": context.steps,
                 "phase_boundaries_known": context.boundaries_known,
                 "phase_steps": list(context.phase_steps),
@@ -594,7 +589,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 "schedule_slot_limits": {
                     "min": sch.MIN_SLOTS, "max": sch.MAX_SLOTS, "default": sch.DEFAULT_SLOTS,
                 },
-                "can_restore": instance.restore_snapshot is not None,
+                # What the two bulk switches would change right now.
+                "can_disable_all": any(on for _, on, _ in stack.user_entries()),
+                "can_enable_all": bool(stack.disabled),
                 "signature": signature,
                 "status": status,
                 "status_warn": warn,
@@ -606,19 +603,18 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             return json.dumps({"error": f"LoRA Browser could not render: {error}"})
 
     def _user_entries(self, stack: up.Stack, phases: up.PhaseConfig) -> list[ProfileEntry]:
-        """User-editable part of the stack -- accelerator LoRAs are excluded."""
-        entries = []
-        for position, lora_id in enumerate(stack.ids):
-            if stack.is_system(position):
-                continue
-            entries.append(ProfileEntry(id=lora_id, multiplier=stack.tokens[position]))
-        return entries
+        """User-editable part of the stack, switched-off LoRAs included where
+        they sit -- accelerator LoRAs are excluded."""
+        return [
+            ProfileEntry(id=lora_id, multiplier=token, enabled=on)
+            for lora_id, on, token in stack.user_entries()
+        ]
 
     # ----------------------------------------------------------- actions
 
     def _apply_action(
         self, instance: InstanceState, action_json, state_value, selected, multipliers, guidance,
-        steps=None, sampler=None,
+        steps=None, sampler=None, steps2=None,
     ):
         no_change = (gr.update(), gr.update())
         try:
@@ -626,7 +622,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         except (TypeError, ValueError):
             return no_change + (gr.update(),)
 
-        native = (guidance, steps, sampler)
+        native = (guidance, steps, sampler, steps2)
         try:
             model_type, inventory, stack, phases, context = self._context(
                 instance, state_value, selected, multipliers, *native
@@ -668,6 +664,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             lora_id = normalize_id(action.get("id"))
             # Only LoRAs WanGP actually offers may be activated.
             if action.get("enabled"):
+                if stack.disabled_entry(lora_id) is not None:
+                    # Switched off, not gone: its tile brings it back as it was.
+                    return stack.add(lora_id, phases.capacity)
                 if inventory.get(lora_id) is None:
                     instance.note("That LoRA is not available for the current model.", True)
                     return False
@@ -676,6 +675,11 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
         if kind == "remove":
             return stack.remove(normalize_id(action.get("id")))
+
+        if kind == "set_enabled":
+            # Off keeps the multiplier -- schedule and all -- where WanGP keeps
+            # the rest of the stack, and applies none of it.
+            return stack.set_enabled(normalize_id(action.get("id")), bool(action.get("value")))
 
         if kind == "set_strength":
             # Routes itself: a scheduled phase moves its schedule base, an
@@ -734,10 +738,10 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             return False
 
         if kind == "disable_all":
-            return self._disable_all(instance, stack, inventory)
+            return self._set_all_enabled(instance, stack, False)
 
-        if kind == "restore":
-            return self._restore(instance, stack, inventory)
+        if kind == "enable_all":
+            return self._set_all_enabled(instance, stack, True)
 
         if kind.startswith("profile_"):
             return self._profile_action(instance, action, stack, inventory, phases, model_type)
@@ -805,10 +809,10 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
             if kind == "schedule_resync":
                 # First the phase structure: a token declaring more phases than
-                # this mode runs is one WanGP refuses outright, and on LTX-2 a
-                # stage-1 schedule entering Two Phases gets a stage 2 of its
-                # own. The timelines are then re-derived from what it became
-                # before they move.
+                # this mode runs is one WanGP refuses outright, and on a staged
+                # model (LTX-2, MiniMax H3) a stage-1 schedule entering Two
+                # Phases gets a stage 2 of its own. The timelines are then
+                # re-derived from what it became before they move.
                 scheduled = up.has_step_schedule(stack)
                 entering = up.entering_two_phases(stack, phases)
                 fitted = up.fit_phase_structure(stack, phases, instance.hidden_phases)
@@ -821,11 +825,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                     stack, phases, instance.schedules, instance.phase_memory, context
                 )
                 if changed:
-                    instance.note(
-                        _follow_note(context)
-                        if up.scheduling_allowed(phases)
-                        else "Guidance uses more than one phase; scheduled LoRAs were reset to 0."
-                    )
+                    instance.note(_follow_note(context))
                 elif fitted:
                     instance.note(_fit_note(phases, scheduled, context, bool(entering)))
                 return changed or fitted
@@ -843,32 +843,14 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
         return False
 
-    def _disable_all(self, instance, stack, inventory) -> bool:
-        removable = [lora_id for position, lora_id in enumerate(stack.ids) if not stack.is_system(position)]
-        if not removable:
-            instance.note("No user LoRAs to disable.")
+    def _set_all_enabled(self, instance, stack, on: bool) -> bool:
+        """Every user LoRA on, or every one off -- each keeping its multiplier
+        and its place.  WanGP-managed LoRAs are not the user's to switch."""
+        changed = stack.set_all_enabled(on)
+        if not changed:
+            instance.note("Every LoRA is already on." if on else "No LoRAs are on.")
             return False
-
-        values, text = stack.to_native(inventory)
-        instance.restore_snapshot = (list(values), text)
-        for lora_id in removable:
-            stack.remove(lora_id)
-        remaining_values, remaining_text = stack.to_native(inventory)
-        instance.restore_signature = up.stack_signature(remaining_values, remaining_text)
-        instance.note(f"Disabled {len(removable)} LoRA(s).")
-        return True
-
-    def _restore(self, instance, stack, inventory) -> bool:
-        if not instance.restore_snapshot:
-            instance.note("Nothing to restore.", True)
-            return False
-        values, text = instance.restore_snapshot
-        restored = up.Stack.from_native(values, text)
-        stack.ids = restored.ids
-        stack.tokens = restored.tokens
-        stack.separator_index = restored.separator_index
-        instance.restore_snapshot = None
-        instance.note("Restored the previous LoRA stack.")
+        instance.note(f"Switched {changed} LoRA(s) {'on' if on else 'off'}.")
         return True
 
     # ---------------------------------------------------------- profiles
@@ -954,14 +936,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             return False
 
         # WanGP-managed LoRAs (left of the accelerator bar) are preserved; a
-        # profile only ever replaces the user side of the stack.
-        keep = max(0, stack.separator_index) if stack.separator_index >= 0 else 0
-        system_ids = stack.ids[:keep]
-        system_tokens = stack.tokens[:keep]
-
-        stack.ids = system_ids + [entry.id for entry in applied]
-        stack.tokens = system_tokens + [entry.multiplier for entry in applied]
-        stack.separator_index = keep if keep else -1
+        # profile only ever replaces the user side of the stack, switched-off
+        # LoRAs included.
+        stack.set_user_entries([(entry.id, entry.enabled, entry.multiplier) for entry in applied])
 
         if missing:
             instance.note(
