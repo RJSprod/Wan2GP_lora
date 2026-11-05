@@ -1392,3 +1392,153 @@ class TestRowsStandApart:
 
         tick = '.lb-tile[data-id="lora_01.safetensors"] .lb-check'
         assert contrast(colour(page, tick, "color"), colour(page, tick)) >= 3
+
+
+@pytest.fixture(scope="module")
+def pictures_panel(chromium, tmp_path_factory):
+    """LTX-2.3 in Two Phases: two LoRAs with a picture, one whose preview is
+    only a video, one with none; a phase 1 and a phase 2 scheduled."""
+    pillow = pytest.importorskip("PIL.Image")
+    root = tmp_path_factory.mktemp("browser-pictures")
+    loras = root / "loras"
+    loras.mkdir()
+    for name in ("lora_01", "lora_02", "lora_03", "lora_04"):
+        (loras / f"{name}.safetensors").write_bytes(b"")
+    pillow.new("RGB", (64, 96), (200, 60, 40)).save(str(loras / "lora_01.png"))
+    pillow.new("RGB", (64, 96), (40, 160, 90)).save(str(loras / "lora_03.png"))
+    (loras / "lora_02.mp4").write_bytes(b"\x00")
+    host = _Host(root)
+    host.plugin.get_model_def = lambda model_type: LTX_MODEL_DEF
+    host.steps, host.guidance = 8, 2
+    host.selected = ["lora_01.safetensors", "lora_02.safetensors", "lora_03.safetensors"]
+    host.multipliers = (
+        "0,0,0,0,1,1,0,0;0 0.8;0.375,0.25,0.25 1;0.25\n#lora_off 3 0.5;0.5 lora_04.safetensors"
+    )
+    with _open_panel(chromium, host) as opened:
+        settle(opened[0], 800)
+        yield opened
+
+
+def row_cells(page):
+    """Each row's picture cell and where the rest of the row starts."""
+    return {cell["id"]: cell for cell in page.evaluate("""() =>
+        [...document.querySelectorAll('.lb-row')].map(row => {
+          const cell = row.firstElementChild;
+          const box = cell.getBoundingClientRect();
+          return {
+            id: row.dataset.id, first: cell.className, width: box.width, height: box.height,
+            inner: row.clientHeight, main: row.querySelector('.lb-row-main').getBoundingClientRect().left,
+            image: !!cell.querySelector('img.lb-thumb'),
+            placeholder: !!cell.querySelector('.lb-placeholder'),
+            play: !!cell.querySelector('.lb-play'),
+          };
+        })""")}
+
+
+class TestRowPictures:
+    """Every row starts with its LoRA's picture, in one column."""
+
+    def test_every_row_starts_with_its_picture_and_the_rows_stay_aligned(self, pictures_panel):
+        page, _, problems = pictures_panel
+        cells = row_cells(page)
+        assert list(cells) == [f"lora_0{index}.safetensors" for index in range(1, 5)]
+        assert {cell["first"] for cell in cells.values()} == {"lb-row-thumb"}
+        # One width for every row, so every row's controls start in one place...
+        assert len({round(cell["width"]) for cell in cells.values()}) == 1
+        assert len({round(cell["main"]) for cell in cells.values()}) == 1
+        # ...and each picture is as tall as its own row, switched off or not.
+        for cell in cells.values():
+            assert abs(cell["height"] - cell["inner"]) <= 1
+        # A row at rest, its strengths showing, is a square (the 1px is the
+        # line between picture and controls).
+        rest = cells["lora_03.safetensors"]
+        assert abs((rest["width"] - 1) - rest["height"]) <= 2
+
+        assert [(cells[f"lora_0{i}.safetensors"]["image"], cells[f"lora_0{i}.safetensors"]["play"])
+                for i in range(1, 5)] == [(True, False), (False, True), (True, False), (False, False)]
+        assert cells["lora_04.safetensors"]["placeholder"]
+        assert problems == []
+
+    def test_pressing_the_picture_opens_inspect(self, pictures_panel):
+        page, host, _ = pictures_panel
+        before = native(page)
+        page.locator('.lb-row[data-id="lora_01.safetensors"] .lb-row-thumb-open').click()
+        page.wait_for_selector(".lb-modal .lb-fetch-btn", timeout=5000)
+        assert page.locator(".lb-modal-overlay").count() == 1
+        assert native(page) == before
+        page.keyboard.press("Escape")
+        settle(page, 200)
+
+    def test_a_scheduled_phase_wears_a_badge_and_a_plain_one_its_number(self, pictures_panel):
+        page, _, _ = pictures_panel
+        chips = page.evaluate("""() => Object.fromEntries([...document.querySelectorAll('.lb-row')]
+          .filter(row => row.querySelector('.lb-phase-strip'))
+          .map(row => [row.dataset.id, [...row.querySelectorAll('.lb-phase-strip .lb-chip')].slice(0, 2)
+            .map(chip => [chip.classList.contains('lb-chip-sched'),
+                          chip.querySelector('.lb-sched-badge')?.textContent ?? null,
+                          chip.querySelector('strong')?.textContent ?? null])]))""")
+        assert chips["lora_01.safetensors"] == [[True, "∿Scheduled", None], [False, None, "0"]]
+        assert chips["lora_02.safetensors"] == [[False, None, "0.8"], [True, "∿Scheduled", None]]
+        assert chips["lora_03.safetensors"] == [[False, None, "1"], [False, None, "0.25"]]
+        # The Schedule button says the same of the LoRA as a whole.
+        toggles = {
+            lora: "lb-scheduled" in page.locator(
+                f'.lb-row[data-id="{lora}"] button.lb-schedule-toggle').get_attribute("class")
+            for lora in ("lora_01.safetensors", "lora_02.safetensors", "lora_03.safetensors")
+        }
+        assert toggles == {"lora_01.safetensors": True, "lora_02.safetensors": True,
+                           "lora_03.safetensors": False}
+
+    def test_the_badge_contrasts_with_its_pill_in_wangps_dark_theme(self, pictures_panel):
+        page, _, _ = pictures_panel
+        page.evaluate(
+            "(vars) => { for (const [k, v] of Object.entries(vars)) document.body.style.setProperty(k, v); }",
+            WANGP_DARK,
+        )
+        settle(page, 100)
+        try:
+            badge = '.lb-row[data-id="lora_02.safetensors"] .lb-chip-sched .lb-sched-badge'
+            pill = '.lb-row[data-id="lora_02.safetensors"] .lb-chip-sched'
+            plain = '.lb-row[data-id="lora_03.safetensors"] .lb-phase-strip .lb-chip:not(.lb-on)'
+            # Text on the badge reads as text; the badge reads as a mark on
+            # its pill, and on a plain pill's colour too.
+            assert contrast(colour(page, badge, "color"), colour(page, badge)) >= 4.5
+            assert contrast(colour(page, badge), colour(page, pill)) >= 3
+            assert contrast(colour(page, badge), colour(page, plain)) >= 3
+        finally:
+            page.evaluate(
+                "(vars) => { for (const k of Object.keys(vars)) document.body.style.removeProperty(k); }",
+                WANGP_DARK,
+            )
+
+    def test_collapse_all_closes_every_open_schedule_and_changes_nothing(self, pictures_panel):
+        page, _, problems = pictures_panel
+        before = native(page)
+        collapse = page.locator('[data-lb="collapse-all"]')
+        assert collapse.is_disabled()
+        for lora in ("lora_01.safetensors", "lora_02.safetensors"):
+            page.locator(f'.lb-row[data-id="{lora}"] button.lb-schedule-toggle').click()
+            settle(page, 1000)
+        assert page.locator(".lb-timeline").count() == 2
+        assert not collapse.is_disabled()
+        assert "2 open schedules" in collapse.get_attribute("title")
+
+        collapse.click()
+        settle(page, 500)
+        assert page.locator(".lb-timeline").count() == 0
+        assert collapse.is_disabled()
+        assert native(page) == before
+        # Closed, not cleared: the schedule is still there, said in one line.
+        assert page.locator('.lb-row[data-id="lora_01.safetensors"] .lb-sched-summary').count() == 1
+        assert problems == []
+
+    def test_a_video_preview_plays_in_its_row(self, pictures_panel):
+        page, _, _ = pictures_panel
+        cell = page.locator('.lb-row[data-id="lora_02.safetensors"] .lb-row-thumb')
+        cell.locator(".lb-play").click()
+        settle(page, 1000)
+        assert cell.locator("video.lb-thumb").count() == 1
+        cell.locator(".lb-play").click()
+        settle(page, 300)
+        assert cell.locator("video").count() == 0
+        assert cell.locator(".lb-placeholder").count() == 1

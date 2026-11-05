@@ -24,6 +24,13 @@ thumbnail browser and a real-time strength editor.
   truth until you actually move the slider.
 - **Phase chips.** On a multi-phase model each phase is a chip showing its own
   value; tapping one chooses what the strength control and the timeline edit.
+  A scheduled phase has no single value, so its chip wears a `∿ Scheduled`
+  badge instead of a number — `∿` is the panel's mark for "the strength changes
+  from step to step".
+- **Every active row starts with its LoRA's picture** — the tile's preview, a
+  video preview's first frame with a play button, or a placeholder — in one
+  column the same width on every row, so the rows stay aligned. Pressing the
+  picture opens Inspect.
 - **Step schedules you can draw.** WanGP's comma multipliers (`1,0.8,0.4,0`) are
   a first-class editing surface: regions you draw, move, resize and re-weight on
   an inline timeline, one slot per inference step, per phase — and on LTX-2 and
@@ -132,7 +139,7 @@ timeline and its tools sit above the one strength control every row has.
 
 ```
 [●] Detail Enhancer                       [∿ Schedule ▴]  [i]  [×]
-    [Phase 1 ∿2]  [Phase 2 0.5]
+    [Phase 1 (∿ Scheduled)]  [Phase 2 0.5]
 
     [⤢ Full screen]  [Clear schedule]                       [Delete]
     empty steps = 0
@@ -148,6 +155,15 @@ at the selected region — the highlighted one; tap another to switch. **Delete*
 removes that region and is only there while one is selected. Before anything is
 drawn, the control edits what the phase is worth, which is also the strength a
 new region starts at.
+
+**`∿` means scheduled.** A phase whose strength changes from step to step shows
+a solid `∿ Scheduled` badge on its chip where a plain phase shows its number;
+the wave on the row's *Schedule* button fills in the same way while any phase
+of that LoRA is scheduled, and so does the line a closed timeline leaves
+behind. The badge is drawn in the theme's text colour, so it stands out in
+any theme — including WanGP's dark one, whose accent is the same white as its
+text. The chip's own outline still marks the phase being edited, so the two
+never share a cue.
 
 **Where a timeline can be exact.** WanGP stretches each phase's comma list to
 fill the steps that phase runs, so a list runs one value per step only when its
@@ -240,10 +256,11 @@ nothing.
   dragged there goes straight to WanGP, and the row behind it stays in step.
   Close it with `×`, the backdrop, or Escape.
 - **Schedule ▴** hides the timeline and keeps the schedule; the row then shows
-  what it is doing (`∿ 0.95 at steps 4–10, 0.2 at steps 13–19`) and tapping that
-  goes back in. **Clear schedule** is the one that removes it, returning that
-  phase — and only that phase — to a plain multiplier and its ordinary strength
-  control.
+  what it is doing (`∿ Scheduled  0.95 at steps 4–10, 0.2 at steps 13–19`) and
+  tapping that goes back in. **Collapse all**, above the rows, hides every open
+  timeline at once, the same way. **Clear schedule** is the one that removes
+  it, returning that phase — and only that phase — to a plain multiplier and its
+  ordinary strength control.
 - Schedule state is held **per phase** internally, so a model that carries a
   phase 2 value in One Phase mode keeps it untouched while phase 1 is scheduled.
   Linking acts on plain strengths only, so it is not offered while a timeline is

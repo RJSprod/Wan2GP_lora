@@ -307,6 +307,8 @@
       '<div class="lb-grid-wrap" data-lb="grid-wrap"><div class="lb-grid" data-lb="grid" role="listbox" aria-multiselectable="true"></div></div>' +
       '<div class="lb-active-head"><span data-lb="active-title">Active LoRAs (0)</span>' +
         '<span class="lb-actions">' +
+          '<button type="button" class="lb-btn" data-lb="collapse-all" disabled ' +
+            'title="Close every open schedule - nothing in them changes">Collapse all</button>' +
           '<button type="button" class="lb-btn" data-lb="paste" aria-haspopup="dialog" aria-expanded="false" ' +
             'title="Load a LoRA stack from text - one name: x multiplier per line">Paste stack</button>' +
           '<button type="button" class="lb-btn" data-lb="disable-all" ' +
@@ -330,7 +332,8 @@
       search: pick("search"), zoom: pick("zoom"), zoomValue: pick("zoom-value"),
       zoomIn: pick("zoom-in"), zoomOut: pick("zoom-out"),
       gridWrap: pick("grid-wrap"), grid: pick("grid"),
-      activeTitle: pick("active-title"), paste: pick("paste"), disableAll: pick("disable-all"),
+      activeTitle: pick("active-title"), collapseAll: pick("collapse-all"),
+      paste: pick("paste"), disableAll: pick("disable-all"),
       enableAll: pick("enable-all"), rows: pick("rows"), status: pick("status"),
       nativeToggle: pick("native")
     };
@@ -454,6 +457,7 @@
       openMenu(event.clientX, event.clientY, profileMenuItems());
     });
 
+    el.collapseAll.addEventListener("click", collapseAll);
     el.paste.addEventListener("click", togglePaste);
     el.disableAll.addEventListener("click", function () { send({ type: "disable_all" }); });
     el.enableAll.addEventListener("click", function () { send({ type: "enable_all" }); });
@@ -783,21 +787,7 @@
     if ((item.words || []).length) { tooltip.push("Triggers: " + item.words.join(", ")); }
     tile.title = tooltip.filter(Boolean).join("\n");
 
-    var thumb = S.thumbs[item.id];
-    var media;
-    if (thumb) {
-      media = document.createElement("img");
-      media.className = "lb-thumb";
-      media.loading = "lazy";
-      media.alt = "";
-      media.src = thumb;
-    } else {
-      media = document.createElement("div");
-      media.className = "lb-thumb lb-placeholder";
-      media.setAttribute("aria-hidden", "true");
-      media.textContent = "\u25A6";
-    }
-    tile.appendChild(media);
+    tile.appendChild(thumbMedia(item.id));
 
     var badges = document.createElement("div");
     badges.className = "lb-badges";
@@ -835,19 +825,7 @@
 
     // A tile whose preview is a video gets a play control. The still frame
     // stays the thumbnail; the video itself is only fetched on click.
-    if (item.has_video) {
-      var play = document.createElement("button");
-      play.type = "button";
-      play.className = "lb-play";
-      play.title = "Play preview";
-      play.setAttribute("aria-label", "Play preview for " + displayName(item));
-      play.textContent = "\u25B6";
-      play.addEventListener("click", function (event) {
-        event.stopPropagation();          // play, do not toggle the LoRA
-        togglePreviewVideo(item.id, tile);
-      });
-      tile.appendChild(play);
-    }
+    if (item.has_video) { tile.appendChild(playButton(item.id, tile, displayName(item))); }
 
     // textContent, never innerHTML: filenames and tags are user-controlled.
     var name = document.createElement("div");
@@ -864,9 +842,44 @@
     return tile;
   }
 
+  /* A tile's or a row's picture: the cached preview, or the placeholder a
+     LoRA with none shows. */
+  function thumbMedia(id) {
+    var thumb = S.thumbs[id];
+    if (thumb) {
+      var image = document.createElement("img");
+      image.className = "lb-thumb";
+      image.loading = "lazy";
+      image.alt = "";
+      image.src = thumb;
+      return image;
+    }
+    var placeholder = document.createElement("div");
+    placeholder.className = "lb-thumb lb-placeholder";
+    placeholder.setAttribute("aria-hidden", "true");
+    placeholder.textContent = "\u25A6";
+    return placeholder;
+  }
+
+  /* Plays ``holder``'s preview video in place of its still, or stops it. */
+  function playButton(id, holder, name) {
+    var play = document.createElement("button");
+    play.type = "button";
+    play.className = "lb-play";
+    play.title = "Play preview";
+    play.setAttribute("aria-label", "Play preview for " + name);
+    play.textContent = "\u25B6";
+    play.addEventListener("click", function (event) {
+      event.stopPropagation();          // play, do not toggle or inspect the LoRA
+      togglePreviewVideo(id, holder);
+    });
+    return play;
+  }
+
   /* Swap a tile's still frame for a muted looping video, and back again.
      Only one plays at a time and the bytes are fetched on demand, so a library
-     full of video previews costs nothing until something is clicked. */
+     full of video previews costs nothing until something is clicked. A row's
+     picture plays the same way. */
   function togglePreviewVideo(id, tile) {
     var existing = tile.querySelector("video.lb-thumb");
     if (existing) { stopPreviewVideo(tile); return; }
@@ -905,19 +918,7 @@
     var video = tile.querySelector("video.lb-thumb");
     if (video) {
       video.pause();
-      var still = document.createElement("div");
-      still.className = "lb-thumb lb-placeholder";
-      still.setAttribute("aria-hidden", "true");
-      still.textContent = "\u25A6";
-      var id = tile.dataset.id;
-      if (S.thumbs[id]) {
-        still = document.createElement("img");
-        still.className = "lb-thumb";
-        still.loading = "lazy";
-        still.alt = "";
-        still.src = S.thumbs[id];
-      }
-      video.replaceWith(still);
+      video.replaceWith(thumbMedia(tile.dataset.id));
     }
     tile.classList.remove("lb-playing", "lb-loading");
     var play = tile.querySelector(".lb-play");
@@ -954,12 +955,25 @@
   }
 
   function observeResize() {
+    var onResize = function () {
+      capHeight();
+      // Only a change of width refits the picture column. A row's height
+      // changes with what it shows -- and the column's width can decide
+      // whether a chip strip needs a scrollbar -- so following heights could
+      // see-saw between two sizes.
+      var width = el.rows ? el.rows.clientWidth : 0;
+      if (width !== S.rowsWidth) {
+        S.rowsWidth = width;
+        fitThumbColumn();
+      }
+    };
     if (typeof ResizeObserver === "function") {
-      resizeObserver = new ResizeObserver(function () { capHeight(); });
+      resizeObserver = new ResizeObserver(onResize);
       resizeObserver.observe(el.gridWrap);
+      resizeObserver.observe(el.rows);
       return;
     }
-    window.addEventListener("resize", capHeight);
+    window.addEventListener("resize", onResize);
   }
 
   /* ------------------------------------------------------- thumbnails */
@@ -1059,21 +1073,31 @@
       if (map[id]) { S.thumbs[id] = map[id]; }
     });
 
-    // Swap placeholders in place; rebuilding the grid here would fight scroll.
+    // Swap placeholders in place -- the tile's and the row's -- because
+    // rebuilding the grid here would fight scroll.
     Object.keys(map).forEach(function (id) {
       if (!map[id]) { return; }
-      var tile = el.grid.querySelector('.lb-tile[data-id="' + cssEscape(id) + '"]');
-      if (!tile) { return; }
-      var placeholder = tile.querySelector(".lb-thumb");
-      if (!placeholder || placeholder.tagName !== "DIV") { return; }
-      var image = document.createElement("img");
-      image.className = "lb-thumb";
-      image.loading = "lazy";
-      image.alt = "";
-      image.src = map[id];
-      placeholder.replaceWith(image);
+      var key = cssEscape(id);
+      [el.grid.querySelector('.lb-tile[data-id="' + key + '"]'),
+       el.rows && el.rows.querySelector('.lb-row[data-id="' + key + '"] .lb-row-thumb')]
+        .forEach(function (holder) {
+          var placeholder = holder && holder.querySelector(".lb-thumb");
+          if (!placeholder || placeholder.tagName !== "DIV") { return; }
+          placeholder.replaceWith(thumbMedia(id));
+        });
     });
     if (S.pendingThumbs.length) { flushThumbnails(); }
+  }
+
+  /* A row shows its LoRA's picture too, and a row's tile can be scrolled out
+     of view or filtered away -- so the rows ask for theirs themselves. */
+  function requestRowThumbs() {
+    S.rows.forEach(function (row) {
+      if (!S.byId[row.id] || S.thumbs[row.id] || S.requested[row.id]) { return; }
+      S.requested[row.id] = true;
+      S.pendingThumbs.push(row.id);
+    });
+    flushThumbnails();
   }
 
   function cssEscape(value) {
@@ -1172,12 +1196,16 @@
       // ';' turning into one per stage keeps the same stage-1 shape.
       // So is what "Fill from stage 1" offers: its tooltip names the values.
       var fill = row.stage_2_fill;
+      // Which phases are scheduled: each one's pill wears a badge for it.
+      var scheduled = (row.phase_schedules || []).map(function (each) {
+        return each && each.active ? "1" : "0";
+      }).join("");
       return [
         row.id, rowName(row), row.multiplier_kind, (row.phase_values || []).length,
         row.missing ? "m" : "", row.system_managed ? "s" : "",
         isOn(row) ? "on" : "off:" + (row.summary || ""),
         phase, S.scheduleOpenById[row.id] ? "open" : "shut", shape,
-        row.schedule_shared ? "shared" : "own", hasActiveSchedule(row) ? "sched" : "plain",
+        row.schedule_shared ? "shared" : "own", scheduled,
         fill ? (fill.empty ? "fill-none" : "fill-" + fill.values.join(",")) : ""
       ].join(":");
     }).join("|") + "#" + S.phases.effective + "#" + S.nameMode + "#" + S.steps
@@ -1207,6 +1235,56 @@
     } else {
       el.rows.appendChild(fragment);
     }
+    fitThumbColumn();
+    requestRowThumbs();
+    paintCollapseAll();
+  }
+
+  /* Rows whose Schedule menu is open right now. */
+  function openScheduleCount() {
+    if (!S.schedulingEnabled) { return 0; }
+    return S.rows.filter(function (row) {
+      return !!S.scheduleOpenById[row.id] && rowEditable(row);
+    }).length;
+  }
+
+  /* Every open Schedule menu closed in one go. A view change, as each row's own
+     Schedule button is: every schedule stays exactly as it is. */
+  function collapseAll() {
+    S.scheduleOpenById = {};
+    closeScheduleModal();
+    renderRows(true);
+  }
+
+  function paintCollapseAll() {
+    if (!el.collapseAll) { return; }
+    var count = openScheduleCount();
+    el.collapseAll.disabled = !count;
+    el.collapseAll.title = count
+      ? "Close the " + (count === 1 ? "open schedule" : count + " open schedules") + " - nothing in them changes"
+      : "No schedule is open";
+  }
+
+  /* The picture column is as wide as a row at rest is tall -- a row showing
+     its strengths, not an open timeline -- so such a row shows a square; and
+     it is that wide on every row, so switches, names and controls stay in one
+     column. A taller row (an open timeline) or a shorter one (switched off)
+     crops its picture to its own height rather than pushing its controls
+     sideways. A narrow panel gives the picture less of its width. */
+  function fitThumbColumn() {
+    if (!el.rows) { return; }
+    var width = el.rows.clientWidth;
+    if (!width) { return; }                  // a hidden tab measures nothing
+    var rest = 0;
+    el.rows.querySelectorAll(".lb-row").forEach(function (node) {
+      if (node.querySelector(".lb-weight-main, .lb-sched-summary")) {
+        rest = Math.max(rest, node.clientHeight);
+      }
+    });
+    if (!rest) { return; }                   // nothing at rest: keep the last size
+    var side = Math.round(Math.max(56, Math.min(rest, 168, width * 0.24)));
+    var current = parseFloat(el.rows.style.getPropertyValue("--lb-thumb")) || 0;
+    if (Math.abs(side - current) >= 2) { el.rows.style.setProperty("--lb-thumb", side + "px"); }
   }
 
   /* Repaint values without touching structure, for payloads that only moved a
@@ -1229,38 +1307,44 @@
     var editable = rowEditable(row);
     var open = editable && !!S.scheduleOpenById[row.id] && S.schedulingEnabled;
 
-    node.appendChild(buildRowTop(row, open, editable));
+    // The picture first, then everything the row edits in a column of its own.
+    node.appendChild(buildRowThumb(row));
+    var main = document.createElement("div");
+    main.className = "lb-row-main";
+    node.appendChild(main);
+
+    main.appendChild(buildRowTop(row, open, editable));
 
     if (!isOn(row)) {
-      node.appendChild(buildOffSummary(row));
+      main.appendChild(buildOffSummary(row));
       return node;
     }
     if (row.multiplier_kind === "advanced") {
-      node.appendChild(buildPreserved(row));
+      main.appendChild(buildPreserved(row));
       return node;
     }
     if (!editable) {
       // A schedule this guidance mode cannot show: kept as it is, read-only.
-      node.appendChild(buildKeptSchedule(row));
+      main.appendChild(buildKeptSchedule(row));
       return node;
     }
 
     var painters = [];
     if ((row.phase_values || []).length > 1) {
       var strip = buildPhaseStrip(row, phase, open);
-      node.appendChild(strip.node);
+      main.appendChild(strip.node);
       painters.push(strip.paint);
     }
 
     if (open) {
       // Scheduler mode: the timeline, its tools, and the same strength control.
       var built = buildSchedule(row, phase, schedule);
-      node.appendChild(built.node);
+      main.appendChild(built.node);
       if (built.paint) { painters.push(built.paint); }
     } else if (schedule && schedule.active) {
       // Collapsed, but this phase is still scheduled: say so instead of
       // offering a strength that is not the one being applied.
-      node.appendChild(buildScheduleSummary(row, schedule));
+      main.appendChild(buildScheduleSummary(row, schedule));
     } else {
       var weight = buildWeightLine({
         value: currentValue(row, phase, schedule),
@@ -1269,7 +1353,7 @@
         settle: flushSync
       });
       weight.node.classList.add("lb-weight-main");
-      node.appendChild(weight.node);
+      main.appendChild(weight.node);
       painters.push(function (next) {
         var nextPhase = phaseOf(next);
         weight.paint(currentValue(next, nextPhase, scheduleOf(next, nextPhase)));
@@ -1299,6 +1383,31 @@
      control so two of them cannot overwrite each other. */
   function baseKey(id, phase) { return id + "#" + phase; }
   function regionKeyFor(id, phase, regionId) { return id + "#" + phase + "#" + regionId; }
+
+  /* The LoRA's picture, so a row is known at a glance: the tile's preview -- a
+     video's first frame, with the tile's play control -- or the placeholder a
+     LoRA with none shows, so every row keeps the same margin. Pressing it
+     opens Inspect, as the "i" beside the name does. */
+  function buildRowThumb(row) {
+    var cell = document.createElement("div");
+    cell.className = "lb-row-thumb";
+    cell.dataset.id = row.id;
+
+    var label = (row.has_catalogue ? "Inspect " : "Inspect / fetch info for ")
+      + (row.civitai_name || row.name);
+    var open = document.createElement("button");
+    open.type = "button";
+    open.className = "lb-row-thumb-open";
+    open.title = label;
+    open.setAttribute("aria-label", label);
+    open.appendChild(thumbMedia(row.id));
+    open.addEventListener("click", function () { openInspect(row.id); });
+    cell.appendChild(open);
+
+    var item = S.byId[row.id];
+    if (item && item.has_video) { cell.appendChild(playButton(row.id, cell, rowName(row))); }
+    return cell;
+  }
 
   function buildRowTop(row, open, editable) {
     var top = document.createElement("div");
@@ -1333,7 +1442,7 @@
           span.textContent = part[1];
           toggle.appendChild(span);
         });
-      toggle.setAttribute("aria-label", "Schedule");
+      toggle.setAttribute("aria-label", scheduled ? "Schedule - this LoRA is scheduled" : "Schedule");
       toggle.title = open
         ? "Hide the timeline - the schedule is kept"
         : scheduled
@@ -1462,20 +1571,47 @@
     return wrap;
   }
 
+  /* The one mark for "this phase is scheduled" -- its strength changes from
+     step to step, which is what the wave stands for -- wherever it shows: a
+     phase chip, the Schedule button's wave, a collapsed schedule. The theme's
+     text colour as a fill with the card colour on it, so it stands out from a
+     plain value in any theme, whatever its accent. */
+  function schedBadge(label) {
+    var badge = document.createElement("span");
+    badge.className = "lb-sched-badge";
+    var wave = document.createElement("span");
+    wave.className = "lb-wave";
+    wave.setAttribute("aria-hidden", "true");
+    wave.textContent = "\u223F";
+    badge.appendChild(wave);
+    badge.appendChild(document.createTextNode(label));
+    return badge;
+  }
+
   /* Phase chips: every effective phase, its current value, and which one the
      strength control and timeline are editing. */
   /* What a phase chip says it is worth. A scheduled phase has no single value:
-     it is its regions, so the chip shows how many rather than a number that is
-     not applied anywhere. */
+     it is its regions, so the chip says it is scheduled rather than show a
+     number that is not applied anywhere. */
   function chipReadout(row, index) {
+    var phaseName = S.phaseLabels[index] || ("Phase " + (index + 1));
     var schedule = scheduleOf(row, index);
     if (schedule && schedule.active) {
       var count = (schedule.regions || []).length;
-      return { text: "∿" + count, title: "Scheduled - " + count + " region" + (count === 1 ? "" : "s") };
+      return {
+        scheduled: true,
+        text: "Scheduled",
+        title: phaseName + " is scheduled: its strength changes over the steps (" + count +
+          (count === 1 ? " region" : " regions") + "; steps no region covers are 0)"
+      };
     }
     var values = row.phase_values || [];
     var value = values[index] !== undefined ? values[index] : 1;
-    return { text: fmt(schedule ? schedule.base : value), title: "" };
+    return {
+      scheduled: false,
+      text: fmt(schedule ? schedule.base : value),
+      title: phaseName + " is one strength over every step"
+    };
   }
 
   function buildPhaseStrip(row, phase, scheduling) {
@@ -1485,16 +1621,23 @@
     var chipValues = [];
 
     values.forEach(function (value, index) {
+      var shown = chipReadout(row, index);
       var chip = document.createElement("button");
       chip.type = "button";
-      chip.className = "lb-chip" + (index === phase ? " lb-on" : "");
+      chip.className = "lb-chip" + (index === phase ? " lb-on" : "") +
+        (shown.scheduled ? " lb-chip-sched" : "");
       chip.setAttribute("aria-pressed", index === phase ? "true" : "false");
       chip.appendChild(document.createTextNode((S.phaseLabels[index] || ("Phase " + (index + 1))) + " "));
-      var readout = document.createElement("strong");
-      var shown = chipReadout(row, index);
-      readout.textContent = shown.text;
-      chip.appendChild(readout);
-      chip.title = shown.title || ("Edit " + (S.phaseLabels[index] || ("phase " + (index + 1))));
+      // A plain value can change under a drag and is repainted in place; a
+      // scheduled phase's badge only changes with the structure.
+      var readout = shown.scheduled ? null : document.createElement("strong");
+      if (readout) {
+        readout.textContent = shown.text;
+        chip.appendChild(readout);
+      } else {
+        chip.appendChild(schedBadge(shown.text));
+      }
+      chip.title = shown.title;
       chip.addEventListener("click", function () {
         if (S.selectedPhaseById[row.id] === index) { return; }
         S.selectedPhaseById[row.id] = index;
@@ -1540,8 +1683,9 @@
       node: strip,
       paint: function (next) {
         (next.phase_values || []).forEach(function (value, index) {
-          if (!chipValues[index]) { return; }
-          chipValues[index].textContent = chipReadout(next, index).text;
+          var shown = chipReadout(next, index);
+          if (!chipValues[index] || shown.scheduled) { return; }
+          chipValues[index].textContent = shown.text;
         });
       }
     };
@@ -1556,10 +1700,7 @@
     summary.type = "button";
     summary.className = "lb-sched-summary";
 
-    var badge = document.createElement("span");
-    badge.className = "lb-chip-mark";
-    badge.textContent = "∿";
-    summary.appendChild(badge);
+    summary.appendChild(schedBadge("Scheduled"));
 
     var label = document.createElement("span");
     label.className = "lb-sched-summary-text";
@@ -1567,7 +1708,7 @@
       ? regions.map(function (region) {
           return fmt(region.strength) + " at " + rangeLabel(region, schedule).toLowerCase();
         }).join(",  ")
-      : "Scheduled";
+      : "nothing drawn - every step is 0";
     summary.appendChild(label);
 
     var hint = document.createElement("span");
@@ -3132,6 +3273,7 @@
     el.activeTitle.textContent = "Active LoRAs (" + activeCount + ")" + (offCount ? " \u00B7 " + offCount + " off" : "");
     el.disableAll.disabled = !S.canDisableAll;
     el.enableAll.disabled = !S.canEnableAll;
+    paintCollapseAll();
     paintPaste();
 
     el.sort.value = S.sortMode;
