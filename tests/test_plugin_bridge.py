@@ -483,6 +483,196 @@ class TestProfiles:
         assert payload["profiles"] == []
 
 
+def paste(plugin, state, text, selected=(), multipliers="", guidance=2, steps=None, seq=1):
+    return act(
+        plugin, {"type": "stack_paste", "text": text, "seq": seq},
+        state, list(selected), multipliers, guidance, steps,
+    )
+
+
+class TestPastingAStack:
+    """A stack pasted as text replaces the user's LoRAs, the way a profile does."""
+
+    #: The stack the feature was asked for with: two-phase LTX, some scheduled.
+    EXAMPLE = (
+        "Vocal_Enhance_1: x0,0,0,0,0.325,0.325,0,0;0\n"
+        "Vocal_Percussion_1: x0.8;0.375,0.25,0.25\n"
+        "Body_Structure_1: x1;0.25\n"
+        "Camera_Movement_1: x1,1,0.875,0.875,0.875,0.875,0.25,0.25;0\n"
+    )
+    LTX_LORAS = [
+        "Vocal_Enhance_1.safetensors", "Vocal_Percussion_1.safetensors",
+        "ltx/Body_Structure_1.safetensors", "Camera_Movement_1.safetensors",
+        "Petite.LD.LTX2.3.safetensors",
+    ]
+
+    @pytest.fixture
+    def ltx(self, plugin):
+        plugin.get_model_def = lambda model_type: LTX23_DISTILLED
+        return plugin
+
+    @pytest.fixture
+    def ltx_state(self):
+        return {"model_type": "ltx2_distilled", "loras": list(self.LTX_LORAS)}
+
+    def test_the_example_loads_as_written_on_ltx_in_two_phases(self, ltx, ltx_state):
+        choices, mults, payload = paste(
+            ltx, ltx_state, self.EXAMPLE, ["Petite.LD.LTX2.3.safetensors"], "1;0", steps=8
+        )
+        # In the text's order, found by name -- one of them in a folder.
+        assert choices["value"] == [
+            "Vocal_Enhance_1.safetensors", "Vocal_Percussion_1.safetensors",
+            "ltx/Body_Structure_1.safetensors", "Camera_Movement_1.safetensors",
+        ]
+        assert mults["value"] == (
+            "0,0,0,0,0.325,0.325,0,0;0 0.8;0.375,0.25,0.25 1;0.25 "
+            "1,1,0.875,0.875,0.875,0.875,0.25,0.25;0"
+        )
+        assert (payload["status"], payload["status_warn"]) == ("Loaded 4 LoRAs from text.", False)
+        assert payload["paste_report"] == {
+            "seq": 1, "ok": True, "loaded": 4, "lines": 4, "problems": [], "notes": [],
+        }
+        # Nothing is left for a resync to settle.
+        assert payload["schedules_out_of_sync"] is False
+
+        # Each stage's schedule is a timeline one slot per step of that stage.
+        enhance = row_of(payload, "Vocal_Enhance_1.safetensors")["phase_schedules"][0]
+        assert enhance["slots"] == 8
+        assert [(r["start"], r["end"], r["strength"]) for r in enhance["regions"]] == [(5, 6, 0.325)]
+        percussion = row_of(payload, "Vocal_Percussion_1.safetensors")["phase_schedules"]
+        assert percussion[0] is None and percussion[1]["slots"] == 3
+
+    def test_the_payload_carries_the_stack_as_text_that_pastes_back(self, ltx, ltx_state):
+        _, _, payload = paste(ltx, ltx_state, self.EXAMPLE, steps=8)
+        assert payload["stack_text"] == self.EXAMPLE.strip()
+        # It is what runs: a LoRA switched off is not in it.
+        payload = payload_of(
+            ltx, ltx_state, ["Vocal_Enhance_1.safetensors", "Camera_Movement_1.safetensors"],
+            "0.5;0.5 1;0\n#lora_off 1 1;0.25 ltx/Body_Structure_1.safetensors", 2, 8,
+        )
+        assert payload["stack_text"] == "Vocal_Enhance_1: x0.5;0.5\nCamera_Movement_1: x1;0"
+
+    def test_it_replaces_the_users_side_and_keeps_what_wangp_manages(self, plugin, state):
+        choices, mults, _ = paste(
+            plugin, state, "c: x0.5", ["a.safetensors", "b.safetensors"],
+            "1;1|0.7;0.7\n#lora_off 1 0.2;0.2 sub/c.safetensors",
+        )
+        assert choices["value"] == ["a.safetensors", "sub/c.safetensors"]
+        assert mults["value"] == "1;1|0.5;0.5"
+
+    def test_a_lora_wangp_manages_is_not_pasted_again(self, plugin, state):
+        _, mults, payload = paste(plugin, state, "a: x0.3\nb: x0.4", ["a.safetensors"], "1;1|")
+        assert mults["value"] == "1;1|0.4;0.4"
+        assert payload["paste_report"]["problems"] == [
+            {"line": 1, "text": "a: x0.3", "reason": "a.safetensors is managed by WanGP"},
+        ]
+
+    def test_lines_that_cannot_load_are_listed_and_the_rest_loads(self, plugin, state):
+        choices, mults, payload = paste(plugin, state, "a: x0.5\nnope: x1\nb: x1,,2\na: x0.2\n")
+        assert (choices["value"], mults["value"]) == (["a.safetensors"], "0.5;0.5")
+        report = payload["paste_report"]
+        assert (report["ok"], report["loaded"], report["lines"]) == (False, 1, 4)
+        assert [(problem["line"], problem["text"]) for problem in report["problems"]] == [
+            (2, "nope: x1"), (3, "b: x1,,2"), (4, "a: x0.2"),
+        ]
+        reasons = [problem["reason"] for problem in report["problems"]]
+        assert "no LoRA named 'nope'" in reasons[0]
+        assert "not a multiplier WanGP can read" in reasons[1]
+        assert "already on line 1" in reasons[2]
+        assert payload["status_warn"] is True
+        assert payload["status"].startswith("Loaded 1 of 4 LoRAs from text. Skipped line 2")
+
+    def test_nothing_changes_when_no_line_can_load(self, plugin, state):
+        choices, mults, payload = paste(plugin, state, "nope: x1\nzilch", ["b.safetensors"], "0.7;0.7")
+        assert "value" not in choices and "value" not in mults
+        assert payload["status_warn"] is True
+        assert payload["status"].startswith("Nothing loaded")
+        assert payload["paste_report"]["loaded"] == 0
+
+    def test_text_with_no_lora_lines_loads_nothing(self, plugin, state):
+        choices, _, payload = paste(plugin, state, "  \n# only a note\n```", ["b.safetensors"], "0.7;0.7")
+        assert "value" not in choices
+        assert payload["status"].startswith("Nothing to load")
+        assert payload["paste_report"]["lines"] == 0
+
+    def test_a_stack_already_loaded_writes_nothing(self, plugin, state):
+        choices, mults, payload = paste(plugin, state, "a: x0.8;0.4", ["a.safetensors"], "0.8;0.4")
+        assert "value" not in choices and "value" not in mults
+        assert payload["paste_report"]["ok"] is True
+
+    def test_one_value_means_every_phase_whatever_was_remembered(self, plugin, state):
+        # b was 0.3;0.6 a moment ago. WanGP reads "1" as 1 in every phase, and
+        # a phase 2 remembered from before must not change that.
+        _, mults, _ = paste(plugin, state, "b: x1\nsub/c", ["b.safetensors"], "0.3;0.6")
+        assert mults["value"] == "1;1 1;1"
+
+    def test_names_match_by_file_folder_and_civitai_name(self, plugin, state, tmp_path):
+        side = tmp_path / "loras" / "a"
+        side.mkdir(parents=True)
+        (tmp_path / "loras" / "a.safetensors").write_bytes(b"")
+        (side / "summary.txt").write_text("Civitai model name: Alpha Motion\n", encoding="utf-8")
+        choices, _, payload = paste(
+            plugin, state, "alpha motion: x0.5\nB.SAFETENSORS: x0.25\nsub/c: x0.75"
+        )
+        assert choices["value"] == ["a.safetensors", "b.safetensors", "sub/c.safetensors"]
+        assert payload["paste_report"]["ok"] is True
+
+    def test_a_name_two_loras_share_is_refused_not_guessed(self, plugin):
+        state = {"model_type": "m", "loras": ["x/c.safetensors", "y/c.safetensors"]}
+        choices, _, payload = paste(plugin, state, "c: x1")
+        assert "value" not in choices
+        reason = payload["paste_report"]["problems"][0]["reason"]
+        assert "x/c.safetensors" in reason and "y/c.safetensors" in reason
+        # Its folder decides it.
+        choices, _, _ = paste(plugin, state, "y/c: x1")
+        assert choices["value"] == ["y/c.safetensors"]
+
+    def test_a_branch_token_naming_more_phases_than_the_model_takes_is_refused(self, plugin, state):
+        # Branch syntax is never cut to fit, so WanGP would refuse it whole.
+        choices, _, payload = paste(plugin, state, "a: x0.5:0.9;1;1")
+        assert "value" not in choices
+        assert "names 3 phases" in payload["paste_report"]["problems"][0]["reason"]
+        _, mults, _ = paste(plugin, state, "a: x0.5:0.9;1")
+        assert mults["value"] == "0.5:0.9;1"
+
+    def test_one_phase_cuts_phase_2_at_once_and_says_so(self, ltx, ltx_state):
+        _, mults, payload = paste(ltx, ltx_state, self.EXAMPLE, guidance=1, steps=8)
+        # Never a token WanGP refuses in One Phase, not even for a round trip.
+        assert mults["value"] == (
+            "0,0,0,0,0.325,0.325,0,0 0.8 1 1,1,0.875,0.875,0.875,0.875,0.25,0.25"
+        )
+        assert payload["schedules_out_of_sync"] is False
+        assert payload["status_warn"] is True
+        assert "phase 2 from 4 lines is not applied" in payload["status"]
+        assert payload["paste_report"]["ok"] is True
+        assert "switch to Two Phases and paste again" in payload["paste_report"]["notes"][0]
+
+    def test_a_plain_phase_2_one_phase_cut_comes_back_with_two(self, ltx, ltx_state):
+        selected = ["ltx/Body_Structure_1.safetensors"]
+        _, mults, _ = paste(ltx, ltx_state, "Body_Structure_1: x1;0.25", guidance=1, steps=8)
+        assert mults["value"] == "1"
+        # WanGP's mode goes back to Two Phases, and the panel resyncs.
+        assert payload_of(ltx, ltx_state, selected, "1", 2, 8)["schedules_out_of_sync"] is True
+        _, mults, _ = act(ltx, {"type": "schedule_resync"}, ltx_state, selected, "1", 2, 8)
+        assert mults["value"] == "1;0.25"
+
+    def test_a_stage_1_list_in_two_phases_carries_on_into_stage_2(self, ltx, ltx_state):
+        # As a preset with no ';' would: stage 2 re-runs stage 1's steps 6-8.
+        _, mults, payload = paste(
+            ltx, ltx_state, "Camera_Movement_1: x1,1,0.875,0.875,0.875,0.875,0.25,0.25", steps=8
+        )
+        assert mults["value"] == "1,1,0.875,0.875,0.875,0.875,0.25,0.25;0.875,0.25,0.25"
+        assert payload["paste_report"]["notes"] == [
+            "1 line gave stage 1 only; stage 2 carries on from where stage 1 ends."
+        ]
+        assert payload["status_warn"] is False
+
+    def test_the_report_rides_only_on_the_answer(self, plugin, state):
+        _, mults, payload = paste(plugin, state, "a: x0.5", seq=42)
+        assert payload["paste_report"]["seq"] == 42
+        assert payload_of(plugin, state, ["a.safetensors"], mults["value"])["paste_report"] is None
+
+
 class TestCivitaiFetch:
     """The Inspect view can build a catalogue for a LoRA that has none."""
 

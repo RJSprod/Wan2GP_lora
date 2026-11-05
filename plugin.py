@@ -28,6 +28,7 @@ from shared.utils.plugins import WAN2GPPlugin
 from .lora_browser import catalogue as cat
 from .lora_browser import civitai
 from .lora_browser import schedule as sch
+from .lora_browser import stack_text
 from .lora_browser import ui_payloads as up
 from .lora_browser.inventory import build_inventory, diff_ids
 from .lora_browser.metadata_store import MetadataStore, resolve_store_path
@@ -142,6 +143,9 @@ class InstanceState:
         #: of a scheduled multiplier; re-derived from the native token whenever
         #: the two disagree, so WanGP stays the truth.
         self.schedules: dict[tuple[str, int], Any] = {}
+        #: What the last pasted stack did, line by line, for the paste box --
+        #: carried by the next payload only, the one answering the paste.
+        self.paste_report: dict | None = None
 
     def next_revision(self) -> int:
         self.revision += 1
@@ -151,6 +155,10 @@ class InstanceState:
         status, warn = self.pending_status, self.pending_warn
         self.pending_status, self.pending_warn = "", False
         return status, warn
+
+    def take_paste_report(self) -> dict | None:
+        report, self.paste_report = self.paste_report, None
+        return report
 
     def note(self, message: str, warn: bool = False) -> None:
         self.pending_status = message
@@ -529,6 +537,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             signature = up.stack_signature(selected, multipliers)
 
             catalogue = self._catalogue_index(instance, inventory)
+            name_index = stack_text.NameIndex(inventory, self._civitai_names(catalogue))
             rows = up.build_active_rows(
                 inventory, stack, phases, instance.phase_memory, catalogue,
                 instance.schedules, context,
@@ -592,6 +601,12 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 # What the two bulk switches would change right now.
                 "can_disable_all": any(on for _, on, _ in stack.user_entries()),
                 "can_enable_all": bool(stack.disabled),
+                # The LoRAs that run, as text the paste box reads back.
+                "stack_text": stack_text.format_stack(
+                    [(lora_id, token) for lora_id, on, token in stack.user_entries() if on], name_index
+                ),
+                # Set only on the payload answering a pasted stack.
+                "paste_report": instance.take_paste_report(),
                 "signature": signature,
                 "status": status,
                 "status_warn": warn,
@@ -743,6 +758,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         if kind == "enable_all":
             return self._set_all_enabled(instance, stack, True)
 
+        if kind == "stack_paste":
+            return self._paste_stack(instance, action, stack, inventory, phases, context)
+
         if kind.startswith("profile_"):
             return self._profile_action(instance, action, stack, inventory, phases, model_type)
 
@@ -852,6 +870,145 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             return False
         instance.note(f"Switched {changed} LoRA(s) {'on' if on else 'off'}.")
         return True
+
+    # ----------------------------------------------------- pasted stacks
+
+    @staticmethod
+    def _civitai_names(catalogue: dict) -> dict[str, str]:
+        return {
+            lora_id: str(getattr(record, "civitai_name", "") or "")
+            for lora_id, record in (catalogue or {}).items()
+        }
+
+    def _paste_stack(self, instance, action, stack, inventory, phases, context) -> bool:
+        """Load a stack pasted as text -- ``name: x<multiplier>`` per line.
+
+        It replaces the user's side of the stack, switched-off LoRAs included,
+        the way recalling a profile does; WanGP-managed LoRAs stay.  A line
+        loads when its name is a LoRA this model offers and its multiplier is
+        one WanGP can read.  Every other line is reported, and when no line
+        can load nothing changes.
+
+        What loaded is then settled the way a preset arriving in this phase
+        mode would be (see ``schedule_resync``), so WanGP is never handed a
+        token the mode refuses, not even until the next round trip.
+        """
+        report = {"seq": action.get("seq"), "ok": False, "loaded": 0, "lines": 0,
+                  "problems": [], "notes": []}
+        instance.paste_report = report
+        lines = stack_text.parse(action.get("text", ""))
+        report["lines"] = len(lines)
+        if not lines:
+            instance.note("Nothing to load - paste one LoRA per line, as name: x multiplier.", True)
+            return False
+
+        names = stack_text.NameIndex(
+            inventory, self._civitai_names(self._catalogue_index(instance, inventory))
+        )
+        managed = {lora_id for position, lora_id in enumerate(stack.ids) if stack.is_system(position)}
+        entries, problems, first_line = [], [], {}
+        for line in lines:
+            lora_id, candidates = names.resolve(line.name)
+            token = line.token or up.codec.default_token(phases.capacity)
+            if candidates:
+                reason = (f"'{line.name}' matches {len(candidates)} LoRAs ("
+                          + ", ".join(candidates[:3]) + ") - name one by its file or folder path")
+            elif not lora_id:
+                reason = f"no LoRA named '{line.name}' for this model"
+            elif lora_id in managed:
+                reason = f"{names.label(lora_id)} is managed by WanGP"
+            elif lora_id in first_line:
+                reason = f"{names.label(lora_id)} is already on line {first_line[lora_id]}"
+            else:
+                reason = stack_text.token_problem(token) or self._paste_phase_problem(token, phases)
+            if reason:
+                problems.append(stack_text.LineProblem(line.number, line.text, reason))
+                continue
+            first_line[lora_id] = line.number
+            entries.append((lora_id, True, token))
+
+        report["problems"] = [problem.to_dict() for problem in problems]
+        if not entries:
+            instance.note(
+                f"Nothing loaded - line {problems[0].number}: {problems[0].reason}." if len(problems) == 1
+                else f"Nothing loaded - none of the {len(problems)} lines names a LoRA this model can load.",
+                True,
+            )
+            return False
+
+        before = self._stack_snapshot(stack)
+        for lora_id, _, _ in entries:
+            # The text is the truth for these now: nothing remembered about how
+            # they were set before -- a phase a narrower mode hid, a timeline
+            # -- may carry over into what was pasted.
+            instance.phase_memory.pop(lora_id, None)
+            instance.hidden_phases.pop(lora_id, None)
+            for key in [key for key in instance.schedules if key[0] == lora_id]:
+                del instance.schedules[key]
+        stack.set_user_entries(entries)
+
+        unrun = sum(1 for _, _, token in entries if stack_text.phase_count(token) > phases.effective)
+        pasted = {lora_id for lora_id, _, _ in entries}
+        entering = up.entering_two_phases(stack, phases)
+        up.fit_phase_structure(stack, phases, instance.hidden_phases)
+        up.sync_schedules(stack, phases, instance.schedules, context)
+        up.fill_stages_from_stage_1(
+            stack, entering, phases, instance.phase_memory, instance.schedules, context
+        )
+        up.refit_schedules(stack, phases, instance.schedules, instance.phase_memory, context)
+
+        notes = []
+        if unrun:
+            notes.append(self._unrun_note(unrun, phases))
+        carried = sum(1 for lora_id in entering if lora_id in pasted)
+        if carried:
+            notes.append(
+                f"{carried} line{'s' if carried != 1 else ''} gave stage 1 only; "
+                "stage 2 carries on from where stage 1 ends."
+            )
+
+        loaded = len(entries)
+        if problems:
+            skipped = "; ".join(f"line {problem.number}: {problem.reason}" for problem in problems[:2])
+            more = f" (+{len(problems) - 2} more)" if len(problems) > 2 else ""
+            message = f"Loaded {loaded} of {len(lines)} LoRAs from text. Skipped {skipped}{more}."
+        else:
+            message = f"Loaded {loaded} LoRA{'s' if loaded != 1 else ''} from text."
+        # A phase the text sets but the mode will not run is worth a warning
+        # too: what renders is not everything that was pasted.
+        instance.note(" ".join([message] + notes), bool(problems) or bool(unrun))
+        report.update(ok=not problems, loaded=loaded, notes=notes)
+        return self._stack_snapshot(stack) != before
+
+    @staticmethod
+    def _paste_phase_problem(token: str, phases: up.PhaseConfig) -> str:
+        """A pasted token naming more phases than WanGP accepts here.
+
+        Plain lists are cut to fit with the rest of the stack, as a preset's
+        are; branch syntax never is (``fit_phase_structure``), so a branch
+        token naming too many phases could only be refused by WanGP.
+        """
+        count = stack_text.phase_count(token)
+        if ":" in token and count > phases.capacity:
+            return f"names {count} phases; this model takes {phases.capacity} here"
+        return ""
+
+    @staticmethod
+    def _unrun_note(count: int, phases: up.PhaseConfig) -> str:
+        lines = f"{count} line{'s' if count != 1 else ''}"
+        if phases.effective <= 1:
+            # On LTX-2 a stage 2 One Phase cut does not come back as it was
+            # pasted, so say how to load it as written.
+            advice = " - switch to Two Phases and paste again to use it" if phases.staged else ""
+            return f"One Phase runs phase 1 only: phase 2 from {lines} is not applied{advice}."
+        return f"This mode runs {phases.effective} phases: later phases from {lines} are not applied."
+
+    @staticmethod
+    def _stack_snapshot(stack: up.Stack) -> tuple:
+        return (
+            tuple(stack.ids), tuple(stack.tokens), stack.separator_index,
+            tuple((entry.id, entry.token, entry.at) for entry in stack.disabled),
+        )
 
     # ---------------------------------------------------------- profiles
 
