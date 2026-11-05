@@ -13,6 +13,18 @@
   gap: 10px;
   color: var(--body-text-color);
   font-size: var(--text-sm, 13px);
+
+  /* Active rows are cards on a tray.  A theme's panel, field and row
+     backgrounds can all be the same colour -- WanGP's dark theme gives them
+     all #282828 -- which left a hairline as the only edge between two rows.
+     So the card is the darkest surface the theme has, and the tray between
+     cards is the panel colour lifted toward the theme's border colour: every
+     row is framed by a band of lighter colour.  A light theme gets white
+     cards on a grey tray from the same tokens. */
+  --lb-card: var(--background-fill-primary);
+  --lb-tray: color-mix(in srgb, var(--border-color-primary) 62%, var(--background-fill-secondary));
+  /* Controls that sit on a card: lighter than it, so they read as controls. */
+  --lb-raised: var(--input-background-fill);
 }
 
 /* WanGP groups the LoRA inputs into a Gradio form and the panel is injected
@@ -128,7 +140,8 @@
   overflow-x: hidden;
   border: 1px solid var(--border-color-primary);
   border-radius: var(--radius-sm, 6px);
-  background: var(--input-background-fill);
+  /* The same tray as the active rows, so the tiles stand off it the same way. */
+  background: var(--lb-tray);
   padding: 6px;
 }
 .__NS__ .lb-grid {
@@ -196,9 +209,12 @@
   pointer-events: none;
   font-size: 11px;
 }
+/* The tick is the card colour on the accent, like the switch's knob: white on
+   a white accent was a blank dot. */
 .__NS__ .lb-check {
   background: var(--color-accent, #2563eb);
-  color: #fff;
+  color: var(--lb-card, #fff);
+  font-weight: 700;
   border-radius: 999px;
   width: 16px;
   height: 16px;
@@ -245,7 +261,16 @@
   gap: 8px;
   font-weight: 600;
 }
-.__NS__ .lb-rows { display: flex; flex-direction: column; gap: 6px; }
+/* The tray: its colour shows around and between the cards, so where one row
+   ends and the next begins is a band, not a line. */
+.__NS__ .lb-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  border-radius: var(--radius-md, 8px);
+  background: var(--lb-tray);
+}
 
 /* An active row is a small card with the same frame in every state: on/off,
    identity and actions on the top line, then the phase chips, then -- when
@@ -256,7 +281,8 @@
   flex-direction: column;
   border: 1px solid var(--border-color-primary);
   border-radius: var(--radius-sm, 6px);
-  background: var(--input-background-fill);
+  background: var(--lb-card);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
   overflow: hidden;
 }
 .__NS__ .lb-row-top {
@@ -319,7 +345,7 @@
   margin-top: -10px;
   border-radius: 999px;
   border: 1px solid var(--border-color-primary);
-  background: var(--background-fill-primary);
+  background: var(--lb-raised);
   box-sizing: border-box;
   transition: background 0.15s, border-color 0.15s;
 }
@@ -339,11 +365,23 @@
   background: var(--color-accent, #2563eb);
   border-color: var(--color-accent, #2563eb);
 }
-.__NS__ button.lb-switch.lb-on::after { transform: translateX(16px); background: #fff; }
+/* The knob is the card colour punched through the accent: a white knob on a
+   theme whose accent is white (WanGP's dark theme) was not there at all. */
+.__NS__ button.lb-switch.lb-on::after {
+  transform: translateX(16px);
+  background: var(--lb-card);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--lb-card) 40%, transparent);
+}
 .__NS__ button.lb-switch:focus-visible { outline: 2px solid var(--color-accent, Highlight); outline-offset: 1px; }
 
-/* Switched off: still listed with everything it keeps, visibly not applied. */
-.__NS__ .lb-row.lb-row-off { background: transparent; border-style: dashed; }
+/* Switched off: still listed with everything it keeps, visibly not applied --
+   still a card, so it stays as distinct from its neighbours as one that is on,
+   but a step toward the tray and dashed. */
+.__NS__ .lb-row.lb-row-off {
+  background: color-mix(in srgb, var(--lb-card) 72%, var(--lb-tray));
+  border-style: dashed;
+  box-shadow: none;
+}
 .__NS__ .lb-row.lb-row-off .lb-row-name { opacity: 0.6; font-weight: 500; }
 .__NS__ .lb-off-summary {
   display: flex;
@@ -398,7 +436,7 @@
   padding: 4px 11px;
   border: 1px solid var(--border-color-primary);
   border-radius: 999px;
-  background: var(--background-fill-primary);
+  background: var(--lb-raised);
   color: var(--body-text-color);
   font-size: var(--text-xs, 12px);
   cursor: pointer;
@@ -423,7 +461,7 @@
   padding: 4px 10px;
   border: 1px dashed var(--border-color-primary);
   border-radius: var(--radius-sm, 6px);
-  background: var(--background-fill-primary);
+  background: var(--lb-raised);
   color: var(--body-text-color);
   font: inherit;
   text-align: left;
@@ -722,6 +760,95 @@
   outline: none;
 }
 .lb-menu-portal hr { border: 0; border-top: 1px solid var(--border-color-primary); margin: 2px 0; }
+
+/* ------------------------------------------------------- paste a stack */
+
+/* A popover under its button, appended to the page like the menu so no
+   ancestor can clip it. It carries the panel's own class, so the tokens and
+   the button styles above apply inside it. */
+.__NS__.lb-paste {
+  position: fixed;
+  z-index: 9999;
+  box-sizing: border-box;
+  gap: 8px;
+  padding: 10px 12px 12px;
+  background: var(--background-fill-primary, var(--input-background-fill));
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+}
+.__NS__ .lb-paste-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.__NS__ .lb-paste-title { font-weight: 600; }
+.__NS__ textarea.lb-paste-text {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 8.5em;
+  max-height: 50vh;
+  resize: vertical;
+  margin: 0;
+  padding: 8px 10px;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre;
+  overflow: auto;
+  color: var(--input-text-color, var(--body-text-color));
+  background: var(--input-background-fill);
+  border: 1px solid var(--input-border-color, var(--border-color-primary));
+  border-radius: var(--radius-sm, 6px);
+  color-scheme: light dark;
+}
+.__NS__ textarea.lb-paste-text:focus {
+  outline: none;
+  border-color: var(--input-border-color-focus, var(--color-accent, currentColor));
+}
+.__NS__ textarea.lb-paste-text::placeholder {
+  color: var(--body-text-color-subdued, inherit);
+  opacity: 0.7;
+}
+.__NS__ .lb-paste-hint,
+.__NS__ .lb-paste-report {
+  font-size: var(--text-xs, 12px);
+  line-height: 1.45;
+  color: var(--body-text-color-subdued, var(--body-text-color));
+}
+.__NS__ .lb-paste-hint code,
+.__NS__ .lb-paste-hint kbd {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  padding: 0 4px;
+  border-radius: var(--radius-xs, 4px);
+  border: 1px solid var(--border-color-primary);
+  background: var(--input-background-fill);
+  color: var(--body-text-color);
+}
+.__NS__ .lb-paste-report:empty { display: none; }
+.__NS__ .lb-paste-report.lb-warn { color: var(--body-text-color); }
+.__NS__ .lb-paste-summary { font-weight: 600; color: var(--body-text-color); }
+.__NS__ .lb-paste-report ul { margin: 4px 0 0; padding-left: 18px; }
+.__NS__ .lb-paste-report li { margin: 2px 0; word-break: break-word; }
+.__NS__ .lb-paste-report li.lb-paste-note { color: var(--body-text-color-subdued, inherit); }
+.__NS__ .lb-paste-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+/* The one thing the box is for. */
+.__NS__ button.lb-btn.lb-primary {
+  min-width: 6.5em;
+  font-weight: 600;
+  background: var(--button-primary-background-fill, var(--color-accent));
+  color: var(--button-primary-text-color, var(--lb-card));
+  border-color: var(--button-primary-border-color, transparent);
+}
+.__NS__ button.lb-btn.lb-primary:hover:not(:disabled) {
+  background: var(--button-primary-background-fill-hover, var(--button-primary-background-fill, var(--color-accent)));
+}
 
 /* -------------------------------------------------------------- status */
 

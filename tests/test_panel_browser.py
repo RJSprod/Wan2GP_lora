@@ -1163,3 +1163,232 @@ class TestSwitchingOffInTheBrowser:
         assert page.locator(".lb-row.lb-row-off").count() == 0
         assert page.locator('[data-lb="enable-all"]').is_disabled()
         assert problems == []
+
+
+#: Three LoRAs as text, as two-phase LTX takes them: one scheduled in stage 1,
+#: one in stage 2, one plain.
+PASTED = "lora_05: x0,0,0,0,0.325,0.325,0,0;0\nlora_06: x0.8;0.375,0.25,0.25\nlora_07: x1;0.25"
+
+
+@pytest.fixture(scope="module")
+def paste_panel(chromium, tmp_path_factory):
+    """LTX-2.3 Distilled in Two Phases, one LoRA on and one switched off."""
+    host = _Host(tmp_path_factory.mktemp("browser-paste"))
+    host.plugin.get_model_def = lambda model_type: LTX_MODEL_DEF
+    host.steps, host.guidance = 8, 2
+    host.selected = ["lora_01.safetensors"]
+    host.multipliers = "1;0\n#lora_off 1 0.45;0.25 lora_02.safetensors"
+    with _open_panel(chromium, host) as opened:
+        yield opened
+
+
+def open_paste(page):
+    """The paste box, open, and its field."""
+    if page.locator(".lb-paste").count() == 0:
+        page.locator('[data-lb="paste"]').click()
+        settle(page, 200)
+    return page.locator(".lb-paste textarea")
+
+
+def close_paste(page):
+    if page.locator(".lb-paste").count():
+        page.keyboard.press("Escape")
+        settle(page, 200)
+
+
+def row_ids(page):
+    return page.evaluate("() => [...document.querySelectorAll('.lb-row')].map(r => r.dataset.id)")
+
+
+class TestPastingInTheBrowser:
+    """Open the box, paste a stack, press Enter: it is the stack."""
+
+    def test_the_box_opens_ready_to_paste_into_and_enter_loads_it(self, paste_panel):
+        page, _, problems = paste_panel
+        open_paste(page)
+        assert page.evaluate("document.activeElement.matches('.lb-paste textarea')")
+        assert page.locator('[data-lb="paste"]').get_attribute("aria-expanded") == "true"
+        page.keyboard.insert_text(PASTED)
+        page.keyboard.press("Enter")
+        settle(page, 1500)
+
+        assert page.locator(".lb-paste").count() == 0
+        assert native(page) == "0,0,0,0,0.325,0.325,0,0;0 0.8;0.375,0.25,0.25 1;0.25"
+        # The LoRA that was on and the one that was off are both replaced.
+        assert row_ids(page) == ["lora_05.safetensors", "lora_06.safetensors", "lora_07.safetensors"]
+        assert page.locator('[data-lb="status"]').inner_text() == "Loaded 3 LoRAs from text."
+        # Back to the button that opened it, with nothing left to type over.
+        assert page.evaluate("document.activeElement.dataset.lb") == "paste"
+        assert open_paste(page).input_value() == ""
+        close_paste(page)
+        assert problems == []
+
+    def test_shift_enter_starts_a_line_and_escape_keeps_the_draft(self, paste_panel):
+        page, _, _ = paste_panel
+        before = native(page)
+        field = open_paste(page)
+        field.fill("lora_01: x1")
+        page.keyboard.press("Shift+Enter")
+        page.keyboard.insert_text("lora_02: x0.5")
+        settle(page, 300)
+        assert field.input_value() == "lora_01: x1\nlora_02: x0.5"
+        assert native(page) == before
+
+        page.keyboard.press("Escape")
+        settle(page, 200)
+        assert page.locator(".lb-paste").count() == 0
+        assert native(page) == before
+        # Selected when the box opens again, so a paste replaces it.
+        field = open_paste(page)
+        assert field.input_value() == "lora_01: x1\nlora_02: x0.5"
+        assert page.evaluate(
+            "() => { const f = document.activeElement; return f.selectionEnd - f.selectionStart; }"
+        ) == len("lora_01: x1\nlora_02: x0.5")
+        field.fill("")
+        close_paste(page)
+
+    def test_a_line_that_cannot_load_keeps_the_box_open_and_says_why(self, paste_panel):
+        page, _, _ = paste_panel
+        field = open_paste(page)
+        field.fill("lora_08: x0.5\nnot_a_lora: x1")
+        page.keyboard.press("Enter")
+        settle(page, 1500)
+
+        assert page.locator(".lb-paste").count() == 1
+        report = page.locator(".lb-paste-report").inner_text()
+        assert "Loaded 1 of 2 LoRAs." in report
+        assert "Line 2" in report and "no LoRA named 'not_a_lora'" in report
+        # The text stays to be fixed; what could load, did.
+        assert field.input_value() == "lora_08: x0.5\nnot_a_lora: x1"
+        assert native(page) == "0.5;0.5"
+        field.fill("")
+        close_paste(page)
+
+    def test_load_with_nothing_pasted_says_so(self, paste_panel):
+        page, _, _ = paste_panel
+        before = native(page)
+        open_paste(page).fill("   ")
+        page.locator('[data-lb="paste-load"]').click()
+        settle(page, 400)
+        assert "Paste a stack first" in page.locator(".lb-paste-report").inner_text()
+        assert native(page) == before
+        close_paste(page)
+
+    def test_a_click_elsewhere_closes_it(self, paste_panel):
+        page, _, _ = paste_panel
+        open_paste(page)
+        page.locator('[data-lb="active-title"]').click()
+        settle(page, 200)
+        assert page.locator(".lb-paste").count() == 0
+        assert page.locator('[data-lb="paste"]').get_attribute("aria-expanded") == "false"
+
+    def test_the_current_stack_copies_as_text_that_pastes_back(self, paste_panel):
+        page, _, problems = paste_panel
+        page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+        open_paste(page).fill(PASTED)
+        page.keyboard.press("Enter")
+        settle(page, 1500)
+
+        open_paste(page)
+        page.locator('[data-lb="paste-copy"]').click()
+        settle(page, 400)
+        assert page.evaluate("navigator.clipboard.readText()") == PASTED
+        assert page.locator('[data-lb="status"]').inner_text() == "Copied the current stack (3 LoRAs)"
+        close_paste(page)
+        assert problems == []
+
+
+#: WanGP's dark theme, read off a screenshot of it: panel, fields and rows all
+#: one colour, and a white accent.
+WANGP_DARK = {
+    "--background-fill-primary": "#171717", "--background-fill-secondary": "#282828",
+    "--input-background-fill": "#282828", "--border-color-primary": "#424242",
+    "--color-accent": "#ffffff", "--border-color-accent": "#ffffff",
+    "--body-text-color": "#e6e6e6", "--button-secondary-background-fill": "#282828",
+}
+
+
+def contrast(first, second):
+    """WCAG contrast ratio between two sRGB colours."""
+    def luminance(rgb):
+        channels = [value / 255 for value in rgb]
+        linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+    high, low = sorted((luminance(first), luminance(second)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+
+def colour(page, selector, prop="backgroundColor", pseudo=None):
+    """A computed colour as [r, g, b], whatever syntax the browser reports it
+    in -- color-mix() comes back as color(srgb ...)."""
+    return page.evaluate(
+        """(args) => {
+          const node = document.querySelector(args.selector);
+          const value = getComputedStyle(node, args.pseudo)[args.prop];
+          const context = document.createElement('canvas').getContext('2d');
+          context.fillStyle = value;
+          context.fillRect(0, 0, 1, 1);
+          return Array.from(context.getImageData(0, 0, 1, 1).data.slice(0, 3));
+        }""",
+        {"selector": selector, "prop": prop, "pseudo": pseudo},
+    )
+
+
+class TestRowsStandApart:
+    """In a theme where the panel, its fields and its rows are one colour, a
+    row was told apart from the next by a 1px line. Each is now a card on a
+    tray of a different colour, with a band of it between every two."""
+
+    @pytest.fixture
+    def themed(self, off_panel):
+        page, _, _ = off_panel
+        page.evaluate(
+            "(vars) => { for (const [k, v] of Object.entries(vars)) document.body.style.setProperty(k, v); }",
+            WANGP_DARK,
+        )
+        settle(page, 100)
+        yield page
+        page.evaluate(
+            "(vars) => { for (const k of Object.keys(vars)) document.body.style.removeProperty(k); }",
+            WANGP_DARK,
+        )
+
+    def test_every_row_is_a_card_on_a_tray(self, themed):
+        page = themed
+        tray = colour(page, ".lb-rows")
+        card = colour(page, ".lb-row")
+        assert card != colour(page, "#lb_root_b")
+        assert contrast(card, tray) >= 1.4
+
+        boxes = page.evaluate(
+            "() => [...document.querySelectorAll('.lb-row')].map(r => r.getBoundingClientRect().toJSON())"
+        )
+        assert len(boxes) == 3
+        for upper, lower in zip(boxes, boxes[1:]):
+            assert lower["top"] - upper["bottom"] >= 6
+        rows = page.locator(".lb-rows").bounding_box()
+        assert boxes[0]["top"] - rows["y"] >= 6
+        assert boxes[0]["left"] - rows["x"] >= 6
+
+    def test_a_switched_off_row_is_a_card_too(self, themed):
+        page = themed
+        page.locator('.lb-row[data-id="lora_02.safetensors"] button.lb-switch').click()
+        settle(page, 1200)
+        try:
+            off = colour(page, '.lb-row[data-id="lora_02.safetensors"]')
+            assert contrast(off, colour(page, ".lb-rows")) >= 1.3
+        finally:
+            page.locator('.lb-row[data-id="lora_02.safetensors"] button.lb-switch').click()
+            settle(page, 1200)
+        assert page.locator(".lb-row.lb-row-off").count() == 0
+
+    def test_a_white_accent_hides_neither_the_switch_knob_nor_the_tile_tick(self, themed):
+        page = themed
+        switch = '.lb-row[data-id="lora_01.safetensors"] button.lb-switch'
+        assert "lb-on" in page.locator(switch).get_attribute("class")
+        knob = colour(page, switch, pseudo="::after")
+        track = colour(page, switch, pseudo="::before")
+        assert contrast(knob, track) >= 3
+
+        tick = '.lb-tile[data-id="lora_01.safetensors"] .lb-check'
+        assert contrast(colour(page, tick, "color"), colour(page, tick)) >= 3

@@ -33,6 +33,10 @@ thumbnail browser and a real-time strength editor.
 - **Switch a LoRA off without losing it.** Every row has an on/off switch: off
   keeps the strength, the schedule and the LoRA's place in the list, and WanGP
   neither loads nor applies it. See [Switching a LoRA off](#switching-a-lora-off).
+- **Paste a whole stack as text.** *Paste stack* opens a box: paste one
+  `name: x multiplier` line per LoRA, press Enter, and that is the stack —
+  schedules and all. *Copy current stack* writes the same format back out. See
+  [Pasting a stack as text](#pasting-a-stack-as-text).
 - **Image previews first, video previews as a still.** A LoRA with only a video
   preview gets its *first frame* decoded server-side and cached; the video itself
   is never loaded in the browser.
@@ -321,6 +325,53 @@ own picker — turns it back on.
 all back. WanGP-managed accelerator LoRAs have no switch and are left out of
 both. Stack profiles remember which LoRAs were off.
 
+### Pasting a stack as text
+
+**Paste stack**, above the active rows, opens a box with the cursor already in
+it. Paste a stack — one LoRA per line — and press **Enter**:
+
+```
+Vocal_Enhance_1: x0,0,0,0,0.325,0.325,0,0;0
+Vocal_Percussion_1: x0.8;0.375,0.25,0.25
+Body_Structure_1: x1;0.25
+Camera_Movement_1: x1,1,0.875,0.875,0.875,0.875,0.25,0.25;0
+```
+
+Each line is `name: x<multiplier>`, and the multiplier is a WanGP token exactly
+as `loras_multipliers` takes it: `;` between phases, `,` between steps, `:`
+between branches. So the lines above, on LTX-2 in Two Phases, are four LoRAs:
+the first scheduled over stage 1's eight steps and off in stage 2, the second
+at 0.8 in stage 1 and scheduled over the refinement's three steps. They arrive
+exactly as written and open on the timeline like any other schedule.
+
+- The `x` is optional, and so are spaces around the numbers. A name on its own
+  loads at 1. Blank lines, `#` and `//` comments, list bullets and code fences
+  are skipped. **Shift+Enter** starts a new line; **Escape** closes the box and
+  keeps what you typed for next time.
+- **The pasted stack replaces the current one** — switched-off LoRAs included —
+  the way recalling a profile does. WanGP-managed accelerator LoRAs stay.
+- **Names are matched against what WanGP offers the current model**, most exact
+  first: the LoRA's path (`styles/detail.safetensors`, with or without the
+  extension), its filename with or without the extension, its Civitai name, and
+  last any of those with case, spaces and punctuation ignored — so
+  `vocal enhance 1` finds `Vocal_Enhance_1.safetensors`. A name two LoRAs answer
+  to is refused rather than guessed at; give its folder to settle it.
+- **A line that cannot load is listed, not guessed at:** an unknown or
+  ambiguous name, a multiplier WanGP could not read, a LoRA already on an
+  earlier line, or one WanGP manages. Everything else loads, and the box stays
+  open with the text and the reasons, so you can fix a line and press Enter
+  again. When nothing can load, nothing changes.
+- **The phase mode is applied at once.** A line naming more phases than the
+  mode runs is cut the way a preset's would be, and the box says so — in One
+  Phase on LTX-2, switch to Two Phases and paste again to keep stage 2 as
+  written. A stage-1 list with no `;` in Two Phases gets a stage 2 that carries
+  on from stage 1, as described in [Step schedules](#step-schedules).
+
+**Copy current stack**, in the same box, copies the LoRAs that are on in this
+format, each named by the shortest name that reads back to it — so a stack
+copied here and pasted later, or on another machine with the same files, comes
+back as it was.
+
 ### Phases
 
 Phase behaviour is resolved from live WanGP data (`guidance_phases`,
@@ -487,6 +538,7 @@ lora_browser/
   multiplier_codec.py      parse/serialise loras_multipliers
   schedule.py              region model: compile, reconstruct, place, collide
   ui_payloads.py           state model, phase resolution, action application
+  stack_text.py            a stack as "name: x multiplier" text, both ways
   inventory.py             native LoRA list -> displayable entries
   thumbnails.py            preview matching, first-frame decode, cache
   catalogue.py             read the Civitai sidecar folder

@@ -112,7 +112,14 @@
     playingTile: null,
     searchTerms: [],
     modal: null,
-    pendingValues: {}
+    pendingValues: {},
+    //: The LoRAs that run, as text the paste box reads back.
+    stackText: "",
+    //: The paste box, while it is open, and what was typed into it -- kept
+    //  when it closes so a click elsewhere does not cost the text.
+    paste: null,
+    pasteDraft: "",
+    pasteSeq: 0
   };
 
   var el = {};
@@ -300,6 +307,8 @@
       '<div class="lb-grid-wrap" data-lb="grid-wrap"><div class="lb-grid" data-lb="grid" role="listbox" aria-multiselectable="true"></div></div>' +
       '<div class="lb-active-head"><span data-lb="active-title">Active LoRAs (0)</span>' +
         '<span class="lb-actions">' +
+          '<button type="button" class="lb-btn" data-lb="paste" aria-haspopup="dialog" aria-expanded="false" ' +
+            'title="Load a LoRA stack from text - one name: x multiplier per line">Paste stack</button>' +
           '<button type="button" class="lb-btn" data-lb="disable-all" ' +
             'title="Switch every LoRA off - each keeps its strength and schedule">Disable all</button>' +
           '<button type="button" class="lb-btn" data-lb="enable-all" disabled ' +
@@ -321,7 +330,7 @@
       search: pick("search"), zoom: pick("zoom"), zoomValue: pick("zoom-value"),
       zoomIn: pick("zoom-in"), zoomOut: pick("zoom-out"),
       gridWrap: pick("grid-wrap"), grid: pick("grid"),
-      activeTitle: pick("active-title"), disableAll: pick("disable-all"),
+      activeTitle: pick("active-title"), paste: pick("paste"), disableAll: pick("disable-all"),
       enableAll: pick("enable-all"), rows: pick("rows"), status: pick("status"),
       nativeToggle: pick("native")
     };
@@ -445,6 +454,7 @@
       openMenu(event.clientX, event.clientY, profileMenuItems());
     });
 
+    el.paste.addEventListener("click", togglePaste);
     el.disableAll.addEventListener("click", function () { send({ type: "disable_all" }); });
     el.enableAll.addEventListener("click", function () { send({ type: "enable_all" }); });
 
@@ -637,18 +647,26 @@
     ];
   }
 
-  function copyText(value) {
+  /* ``label`` names what was copied in the status line, for text too long to
+     repeat there. */
+  function copyText(value, label) {
     // Only the basename is ever copied; absolute paths stay on the Python side.
+    var done = function () { setStatus("Copied " + (label || value)); };
+    var fallback = function () {
+      var field = document.createElement("textarea");
+      field.value = value;
+      document.body.appendChild(field);
+      field.select();
+      try { document.execCommand("copy"); done(); } catch (error) { /* ignore */ }
+      document.body.removeChild(field);
+    };
+    // Plain http on a LAN address has no async clipboard, and a refusal is
+    // still worth one more try the old way.
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(value).then(function () { setStatus("Copied " + value); });
+      navigator.clipboard.writeText(value).then(done, fallback);
       return;
     }
-    var field = document.createElement("textarea");
-    field.value = value;
-    document.body.appendChild(field);
-    field.select();
-    try { document.execCommand("copy"); setStatus("Copied " + value); } catch (error) { /* ignore */ }
-    document.body.removeChild(field);
+    fallback();
   }
 
   /* Civitai names are usually more coherent than the downloaded filename, so
@@ -2438,6 +2456,228 @@
     menu = null;
   }
 
+  /* ---------------------------------------------------- paste a stack */
+
+  /* A whole stack as text, one "name: x<multiplier>" line per LoRA, loaded in
+     place of the user's LoRAs the way recalling a profile is. Python reads the
+     names and the multipliers; this box only collects the text and says what
+     came of it. Enter loads, Shift+Enter starts a new line, Escape closes. */
+  var PASTE_EXAMPLE = "Detail_Tweaker: x0.8;0.5\nCamera_Pan: x1,1,0.875,0.875,0.25,0.25;0";
+
+  function togglePaste() {
+    if (S.paste) { closePaste(true); return; }
+    openPaste();
+  }
+
+  function openPaste() {
+    closeMenu();
+    var pop = document.createElement("div");
+    pop.className = "lb-paste " + NS;
+    pop.setAttribute("role", "dialog");
+    pop.setAttribute("aria-label", "Paste a LoRA stack");
+    pop.innerHTML =
+      '<div class="lb-paste-head">' +
+        '<span class="lb-paste-title">Paste a LoRA stack</span>' +
+        '<button type="button" class="lb-btn lb-icon" data-lb="paste-close" aria-label="Close">\u00D7</button>' +
+      '</div>' +
+      '<textarea class="lb-paste-text" data-lb="paste-text" rows="6" wrap="off" spellcheck="false" ' +
+        'autocomplete="off" aria-label="LoRA stack, one name: x multiplier per line"></textarea>' +
+      '<div class="lb-paste-hint">One LoRA per line, as <code>name: x multiplier</code>. ' +
+        '<kbd>Enter</kbd> loads it in place of the current stack; ' +
+        '<kbd>Shift</kbd>+<kbd>Enter</kbd> starts a new line.</div>' +
+      '<div class="lb-paste-report" data-lb="paste-report" aria-live="polite"></div>' +
+      '<div class="lb-paste-actions">' +
+        '<button type="button" class="lb-btn" data-lb="paste-copy">Copy current stack</button>' +
+        '<button type="button" class="lb-btn lb-primary" data-lb="paste-load">Load</button>' +
+      '</div>';
+    document.body.appendChild(pop);
+
+    var pick = function (name) { return pop.querySelector('[data-lb="' + name + '"]'); };
+    var paste = {
+      node: pop, text: pick("paste-text"), report: pick("paste-report"),
+      copy: pick("paste-copy"), load: pick("paste-load"), busy: false, seq: 0, timer: null
+    };
+    S.paste = paste;
+
+    paste.text.placeholder = PASTE_EXAMPLE;
+    paste.text.value = S.pasteDraft;
+    paste.text.addEventListener("input", function () { S.pasteDraft = paste.text.value; });
+    paste.text.addEventListener("keydown", function (event) {
+      if (event.key !== "Enter" || event.shiftKey || event.altKey) { return; }
+      if (event.isComposing || event.keyCode === 229) { return; }   // an IME is choosing
+      event.preventDefault();
+      event.stopPropagation();
+      submitPaste();
+    });
+    pop.addEventListener("keydown", function (event) {
+      if (event.key !== "Escape") { return; }
+      event.preventDefault();
+      event.stopPropagation();
+      closePaste(true);
+    });
+    pick("paste-close").addEventListener("click", function () { closePaste(true); });
+    paste.load.addEventListener("click", submitPaste);
+    paste.copy.addEventListener("click", function () {
+      if (!S.stackText) { return; }
+      var count = S.stackText.split("\n").length;
+      copyText(S.stackText, "the current stack (" + count + (count === 1 ? " LoRA)" : " LoRAs)"));
+    });
+
+    document.addEventListener("pointerdown", onPastePointer, true);
+    window.addEventListener("resize", positionPaste);
+    window.addEventListener("scroll", positionPaste, true);
+    paintPaste();
+    positionPaste();
+    // Anything already there is selected, so a paste replaces it.
+    paste.text.focus();
+    paste.text.select();
+  }
+
+  function closePaste(restoreFocus) {
+    var paste = S.paste;
+    if (!paste) { return; }
+    clearTimeout(paste.timer);
+    document.removeEventListener("pointerdown", onPastePointer, true);
+    window.removeEventListener("resize", positionPaste);
+    window.removeEventListener("scroll", positionPaste, true);
+    paste.node.remove();
+    S.paste = null;
+    paintPaste();
+    if (restoreFocus && el.paste && document.body.contains(el.paste)) { el.paste.focus(); }
+  }
+
+  /* A press anywhere else closes the box; what was typed waits for it. The
+     button that opened it toggles it itself. */
+  function onPastePointer(event) {
+    var paste = S.paste;
+    if (!paste || paste.node.contains(event.target)) { return; }
+    if (el.paste && el.paste.contains(event.target)) { return; }
+    closePaste(false);
+  }
+
+  /* Under the button that opened it, kept on screen: above the button when
+     there is no room below, and inside the window either way. */
+  function positionPaste() {
+    var paste = S.paste;
+    if (!paste) { return; }
+    var pop = paste.node;
+    var width = Math.min(560, window.innerWidth - 16);
+    pop.style.width = width + "px";
+    var height = pop.getBoundingClientRect().height;
+    var anchor = el.paste && document.body.contains(el.paste) ? el.paste.getBoundingClientRect() : null;
+    var left = (window.innerWidth - width) / 2;
+    var top = 80;
+    if (anchor && anchor.width) {
+      left = anchor.right - width;
+      top = anchor.bottom + 6;
+      if (top + height > window.innerHeight - 8 && anchor.top - height - 6 >= 8) {
+        top = anchor.top - height - 6;
+      }
+    }
+    left = Math.max(8, Math.min(left, window.innerWidth - width - 8));
+    top = Math.max(8, Math.min(top, window.innerHeight - height - 8));
+    pop.style.left = Math.round(left) + "px";
+    pop.style.top = Math.round(top) + "px";
+  }
+
+  /* What the button and the box show, from the latest payload. */
+  function paintPaste() {
+    if (el.paste) {
+      el.paste.setAttribute("aria-expanded", S.paste ? "true" : "false");
+      el.paste.classList.toggle("lb-on", !!S.paste);
+    }
+    var paste = S.paste;
+    if (!paste) { return; }
+    paste.copy.disabled = !S.stackText;
+    paste.copy.title = S.stackText
+      ? "Copy the LoRAs that are on, in this format"
+      : "No LoRAs are on";
+    paste.load.disabled = paste.busy;
+    paste.load.textContent = paste.busy ? "Loading..." : "Load";
+  }
+
+  function submitPaste() {
+    var paste = S.paste;
+    if (!paste || paste.busy) { return; }
+    var text = paste.text.value;
+    if (!text.trim()) {
+      showPasteReport(null, "Paste a stack first: one name: x multiplier per line.");
+      return;
+    }
+    // Edits not yet sent were made to the stack this replaces; landing after
+    // it, they would change the LoRAs just pasted.
+    clearTimeout(S.syncTimer);
+    S.pendingValues = {};
+    S.pasteSeq += 1;
+    paste.seq = S.pasteSeq;
+    paste.busy = true;
+    showPasteReport(null, "");
+    paintPaste();
+    send({ type: "stack_paste", text: text, seq: paste.seq });
+    clearTimeout(paste.timer);
+    paste.timer = setTimeout(function () {
+      if (S.paste !== paste || !paste.busy) { return; }
+      paste.busy = false;
+      paintPaste();
+      showPasteReport(null, "WanGP did not answer. Try again.", true);
+    }, 15000);
+  }
+
+  /* The answer to a paste: a clean load closes the box, anything to say keeps
+     it open with the text, so a line can be fixed and loaded again. */
+  function onPasteReport(report) {
+    var paste = S.paste;
+    if (!paste || !report || report.seq !== paste.seq) { return; }
+    clearTimeout(paste.timer);
+    paste.busy = false;
+    paintPaste();
+    if (report.ok && !(report.notes || []).length) {
+      S.pasteDraft = "";
+      closePaste(true);
+      return;
+    }
+    if (report.ok) { S.pasteDraft = ""; }
+    showPasteReport(report);
+  }
+
+  function showPasteReport(report, message, warn) {
+    var paste = S.paste;
+    if (!paste) { return; }
+    var box = paste.report;
+    box.innerHTML = "";
+    box.classList.toggle("lb-warn", !!warn || !!(report && !report.ok));
+    if (!report) {
+      box.textContent = message || "";
+      return;
+    }
+    var summary = document.createElement("div");
+    summary.className = "lb-paste-summary";
+    summary.textContent = report.loaded
+      ? "Loaded " + report.loaded + " of " + report.lines + (report.lines === 1 ? " LoRA." : " LoRAs.")
+      : "Nothing was loaded.";
+    box.appendChild(summary);
+
+    // textContent throughout: every name here came from the clipboard.
+    var list = document.createElement("ul");
+    (report.problems || []).forEach(function (problem) {
+      var item = document.createElement("li");
+      var where = document.createElement("strong");
+      where.textContent = "Line " + problem.line;
+      item.appendChild(where);
+      item.appendChild(document.createTextNode(" \u2014 " + problem.reason));
+      item.title = problem.text;
+      list.appendChild(item);
+    });
+    (report.notes || []).forEach(function (note) {
+      var item = document.createElement("li");
+      item.className = "lb-paste-note";
+      item.textContent = note;
+      list.appendChild(item);
+    });
+    if (list.childNodes.length) { box.appendChild(list); }
+    positionPaste();
+  }
+
   /* --------------------------------------------------------- inspect */
 
   /* A near-full-screen view of the Civitai catalogue the enrichment script
@@ -2789,6 +3029,9 @@
       return;
     }
     if (!mount()) { return; }
+    // The answer to a paste is about the paste, even when a newer payload
+    // overtook the one carrying it.
+    if (payload.paste_report) { onPasteReport(payload.paste_report); }
     // Ignore a stale async response that lost the race with a newer sync.
     if (payload.revision !== undefined && payload.revision < S.revision) { return; }
 
@@ -2804,6 +3047,7 @@
     S.activeProfile = payload.active_profile || "";
     S.canDisableAll = !!payload.can_disable_all;
     S.canEnableAll = !!payload.can_enable_all;
+    S.stackText = payload.stack_text || "";
     S.signature = payload.signature || "";
     S.sliderMin = payload.slider_min !== undefined ? payload.slider_min : 0;
     S.sliderMax = payload.slider_max !== undefined ? payload.slider_max : 1;
@@ -2888,6 +3132,7 @@
     el.activeTitle.textContent = "Active LoRAs (" + activeCount + ")" + (offCount ? " \u00B7 " + offCount + " off" : "");
     el.disableAll.disabled = !S.canDisableAll;
     el.enableAll.disabled = !S.canEnableAll;
+    paintPaste();
 
     el.sort.value = S.sortMode;
     el.naming.setAttribute("aria-pressed", S.nameMode === "civitai" ? "true" : "false");
