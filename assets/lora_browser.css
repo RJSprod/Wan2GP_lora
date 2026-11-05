@@ -25,6 +25,12 @@
   --lb-tray: color-mix(in srgb, var(--border-color-primary) 62%, var(--background-fill-secondary));
   /* Controls that sit on a card: lighter than it, so they read as controls. */
   --lb-raised: var(--input-background-fill);
+  /* "Scheduled": the theme's text colour as a fill, with the card colour on
+     it. As far from a card, and from a plain pill, as the theme's own text is
+     from its background -- whatever the accent, which in WanGP's dark theme is
+     the same white as the text. */
+  --lb-sched-bg: var(--body-text-color);
+  --lb-sched-fg: var(--lb-card);
 }
 
 /* WanGP groups the LoRA inputs into a Gradio form and the panel is injected
@@ -278,12 +284,63 @@
    control. Everything the finger aims at is at least 34px, most 40px. */
 .__NS__ .lb-row {
   display: flex;
-  flex-direction: column;
   border: 1px solid var(--border-color-primary);
   border-radius: var(--radius-sm, 6px);
   background: var(--lb-card);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
   overflow: hidden;
+}
+.__NS__ .lb-row-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The LoRA's picture down the left of its row. The same width on every row
+   (the script sets it to the height of a row at rest, so that row shows a
+   square) and the full height of its own row, cropped to fit -- so the rest of
+   every row starts in the same place. */
+.__NS__ .lb-row-thumb {
+  position: relative;
+  flex: 0 0 var(--lb-thumb, 96px);
+  width: var(--lb-thumb, 96px);
+  min-height: 56px;
+  background: var(--lb-raised);
+  border-right: 1px solid var(--border-color-primary);
+  overflow: hidden;
+}
+.__NS__ button.lb-row-thumb-open {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: zoom-in;
+}
+.__NS__ button.lb-row-thumb-open:focus-visible {
+  outline: 2px solid var(--color-accent, Highlight);
+  outline-offset: -3px;
+}
+.__NS__ .lb-row-thumb .lb-thumb {
+  width: 100%;
+  height: 100%;
+  aspect-ratio: auto;
+  object-fit: cover;
+  border-radius: 0;
+}
+.__NS__ .lb-row-thumb .lb-thumb.lb-placeholder { font-size: 22px; }
+.__NS__ .lb-row-thumb .lb-play { right: 6px; bottom: 6px; z-index: 1; }
+.__NS__ .lb-row-thumb.lb-playing .lb-play { opacity: 1; }
+.__NS__ .lb-row-thumb.lb-loading .lb-play { opacity: 0.5; cursor: progress; }
+/* Off, its picture steps back with the rest of the row. */
+.__NS__ .lb-row.lb-row-off .lb-row-thumb .lb-thumb:not(.lb-placeholder) {
+  opacity: 0.45;
+  filter: grayscale(0.7);
 }
 .__NS__ .lb-row-top {
   display: flex;
@@ -320,9 +377,16 @@
   gap: 5px;
 }
 .__NS__ .lb-sched-mark { opacity: 0.55; }
-/* Some phase of this LoRA is scheduled, open or not. */
-.__NS__ button.lb-schedule-toggle.lb-scheduled { color: var(--color-accent, currentColor); }
-.__NS__ button.lb-schedule-toggle.lb-scheduled .lb-sched-mark { opacity: 1; }
+/* Some phase of this LoRA is scheduled, open or not: its wave is the badge
+   the phase chips wear. */
+.__NS__ button.lb-schedule-toggle.lb-scheduled .lb-sched-mark {
+  opacity: 1;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--lb-sched-bg);
+  color: var(--lb-sched-fg);
+  font-weight: 700;
+}
 
 /* On/off. A real switch, so it reads as a state rather than an action. */
 .__NS__ button.lb-switch {
@@ -448,7 +512,27 @@
 }
 .__NS__ .lb-chip.lb-chip-static { cursor: default; opacity: 0.85; }
 .__NS__ .lb-chip strong { font-variant-numeric: tabular-nums; }
-.__NS__ .lb-chip-mark { color: var(--color-accent, currentColor); }
+/* A scheduled phase: a badge where a plain one shows its number, on a pill a
+   step lighter than a plain one. Selection keeps the border and tint above,
+   so "selected" and "scheduled" never share a cue. */
+.__NS__ .lb-chip.lb-chip-sched:not(.lb-on) {
+  background: color-mix(in srgb, var(--body-text-color) 10%, var(--lb-raised));
+}
+.__NS__ .lb-sched-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px 1px 6px;
+  border-radius: 999px;
+  background: var(--lb-sched-bg);
+  color: var(--lb-sched-fg);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 18px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.__NS__ .lb-sched-badge .lb-wave { font-size: 14px; line-height: 1; }
 
 /* A scheduled phase, collapsed: a readout and a way in, never a scrubber. */
 .__NS__ .lb-sched-summary {
@@ -497,7 +581,7 @@
 .__NS__ .lb-schedule .lb-weight { padding: 8px 0 0; }
 /* Scheduler mode owns the row, so its panel sits flush rather than as a
    footnote under a control that is no longer there. */
-.__NS__ .lb-row > .lb-schedule { margin-top: 0; }
+.__NS__ .lb-row-main > .lb-schedule { margin-top: 0; }
 .__NS__ .lb-weight input[type="range"] {
   width: 100%;
   min-height: 40px;
