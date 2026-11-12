@@ -119,7 +119,22 @@
     //  when it closes so a click elsewhere does not cost the text.
     paste: null,
     pasteDraft: "",
-    pasteSeq: 0
+    pasteSeq: 0,
+    //: The active LoRAs as a read-only list ("list") or as every row's
+    //  editor ("cards"); in the list, at most one row is open.
+    view: "list",
+    openRow: "",
+    //: Select mode: rows picked for a bulk change, by row key.
+    selecting: false,
+    selected: {},
+    //: LTX-2: LoRAs have a picture side and a sound side to choose between.
+    avSupported: false,
+    //: What is building for this stack, from the payload and the poll.
+    builds: null,
+    buildTimer: null,
+    built: { count: 0, bytes: 0 },
+    dialog: null,
+    dialogReturn: null
   };
 
   var el = {};
@@ -307,6 +322,14 @@
       '<div class="lb-grid-wrap" data-lb="grid-wrap"><div class="lb-grid" data-lb="grid" role="listbox" aria-multiselectable="true"></div></div>' +
       '<div class="lb-active-head"><span data-lb="active-title">Active LoRAs (0)</span>' +
         '<span class="lb-actions">' +
+          '<span class="lb-viewsw" data-lb="viewsw" role="radiogroup" aria-label="Show the active LoRAs as">' +
+            '<button type="button" role="radio" data-view="list" title="One row per LoRA; open one to edit it">List</button>' +
+            '<button type="button" role="radio" data-view="cards" title="Every LoRA\'s editor, open">Cards</button>' +
+          '</span>' +
+          '<button type="button" class="lb-btn" data-lb="select" aria-pressed="false" ' +
+            'title="Pick several LoRAs to change or group together">Select</button>' +
+          '<button type="button" class="lb-btn" data-lb="av" aria-haspopup="menu" hidden ' +
+            'title="Make every LoRA visual only, audio only, or normal again">Audio / visual \u25BE</button>' +
           '<button type="button" class="lb-btn" data-lb="collapse-all" disabled ' +
             'title="Close every open schedule - nothing in them changes">Collapse all</button>' +
           '<button type="button" class="lb-btn" data-lb="paste" aria-haspopup="dialog" aria-expanded="false" ' +
@@ -317,9 +340,13 @@
             'title="Switch every LoRA back on">Enable all</button>' +
         '</span>' +
       '</div>' +
+      '<div class="lb-buildbar" data-lb="buildbar" role="status" hidden></div>' +
+      '<div class="lb-bulk" data-lb="bulk" hidden></div>' +
       '<div class="lb-rows" data-lb="rows"></div>' +
       '<div class="lb-statusbar">' +
         '<span class="lb-status" data-lb="status"></span>' +
+        '<button type="button" class="lb-built-link" data-lb="built" hidden ' +
+          'title="The visual-only and audio-only copies and the baked groups this folder holds">Built files</button>' +
         '<button type="button" class="lb-native-toggle" data-lb="native" ' +
           'title="Show or hide WanGP\'s built-in LoRA controls">native controls</button>' +
       '</div>';
@@ -335,7 +362,9 @@
       activeTitle: pick("active-title"), collapseAll: pick("collapse-all"),
       paste: pick("paste"), disableAll: pick("disable-all"),
       enableAll: pick("enable-all"), rows: pick("rows"), status: pick("status"),
-      nativeToggle: pick("native")
+      nativeToggle: pick("native"),
+      viewSwitch: pick("viewsw"), select: pick("select"), av: pick("av"),
+      buildBar: pick("buildbar"), bulk: pick("bulk"), built: pick("built")
     };
 
     var sharedForm = root.parentElement && root.closest(".form");
@@ -461,6 +490,16 @@
     el.paste.addEventListener("click", togglePaste);
     el.disableAll.addEventListener("click", function () { send({ type: "disable_all" }); });
     el.enableAll.addEventListener("click", function () { send({ type: "enable_all" }); });
+
+    el.viewSwitch.querySelectorAll("button").forEach(function (button) {
+      button.addEventListener("click", function () { setView(button.dataset.view, true); });
+    });
+    el.select.addEventListener("click", function () { setSelecting(!S.selecting); });
+    el.av.addEventListener("click", function (event) {
+      var rect = el.av.getBoundingClientRect();
+      openMenu(rect.left, rect.bottom + 4, avMenuItems());
+    });
+    el.built.addEventListener("click", openBuiltDialog);
 
     // Last-resort escape hatch. Automatic fail-open covers the failures we can
     // detect; this covers the ones we cannot.
@@ -1078,13 +1117,18 @@
     Object.keys(map).forEach(function (id) {
       if (!map[id]) { return; }
       var key = cssEscape(id);
-      [el.grid.querySelector('.lb-tile[data-id="' + key + '"]'),
-       el.rows && el.rows.querySelector('.lb-row[data-id="' + key + '"] .lb-row-thumb')]
-        .forEach(function (holder) {
-          var placeholder = holder && holder.querySelector(".lb-thumb");
-          if (!placeholder || placeholder.tagName !== "DIV") { return; }
-          placeholder.replaceWith(thumbMedia(id));
-        });
+      var holders = [el.grid.querySelector('.lb-tile[data-id="' + key + '"]')];
+      if (el.rows) {
+        el.rows.querySelectorAll('[data-thumb="' + key + '"]').forEach(function (node) { holders.push(node); });
+      }
+      if (S.dialog) {
+        S.dialog.querySelectorAll('[data-thumb="' + key + '"]').forEach(function (node) { holders.push(node); });
+      }
+      holders.forEach(function (holder) {
+        var placeholder = holder && holder.querySelector(".lb-thumb");
+        if (!placeholder || placeholder.tagName !== "DIV") { return; }
+        placeholder.replaceWith(thumbMedia(id));
+      });
     });
     if (S.pendingThumbs.length) { flushThumbnails(); }
   }
@@ -1092,10 +1136,15 @@
   /* A row shows its LoRA's picture too, and a row's tile can be scrolled out
      of view or filtered away -- so the rows ask for theirs themselves. */
   function requestRowThumbs() {
+    var ids = [];
     S.rows.forEach(function (row) {
-      if (!S.byId[row.id] || S.thumbs[row.id] || S.requested[row.id]) { return; }
-      S.requested[row.id] = true;
-      S.pendingThumbs.push(row.id);
+      ids.push(sourceId(row));
+      (row.members || []).forEach(function (member) { ids.push(sourceId(member)); });
+    });
+    ids.forEach(function (id) {
+      if (!S.byId[id] || S.thumbs[id] || S.requested[id]) { return; }
+      S.requested[id] = true;
+      S.pendingThumbs.push(id);
     });
     flushThumbnails();
   }
@@ -1206,10 +1255,21 @@
         isOn(row) ? "on" : "off:" + (row.summary || ""),
         phase, S.scheduleOpenById[row.id] ? "open" : "shut", shape,
         row.schedule_shared ? "shared" : "own", scheduled,
-        fill ? (fill.empty ? "fill-none" : "fill-" + fill.values.join(",")) : ""
+        fill ? (fill.empty ? "fill-none" : "fill-" + fill.values.join(",")) : "",
+        // What a list cell is, though not the values it shows.
+        (row.phase_summary || []).map(function (cell) {
+          return cell.kind === "steps" ? "s" + cell.steps : cell.kind;
+        }).join(","),
+        row.kind || "", row.mode || "", buildState(row.build), row.skipped ? "sk" : "", row.empty ? "e" : "",
+        (row.members || []).map(function (member) {
+          return [member.id, member.mode, buildState(member.build), member.enabled === false ? 0 : 1, rowName(member)].join("/");
+        }).join(","),
+        row.bake ? [buildState(row.bake), row.bake.rank, row.bake.kept, row.bake.default_rank].join("/") : ""
       ].join(":");
     }).join("|") + "#" + S.phases.effective + "#" + S.nameMode + "#" + S.steps
-      + "#" + S.phaseSteps.join(",") + "#" + (S.schedulingEnabled ? "sched" : "nosched");
+      + "#" + S.phaseSteps.join(",") + "#" + (S.schedulingEnabled ? "sched" : "nosched")
+      + "#" + S.view + "#" + S.openRow + "#" + (S.avSupported ? "av" : "")
+      + "#" + (S.selecting ? "sel:" + Object.keys(S.selected).sort().join(",") : "");
   }
 
   function renderRows(force) {
@@ -1225,7 +1285,12 @@
     S.rowsKey = key;
 
     var fragment = document.createDocumentFragment();
-    S.rows.forEach(function (row) { fragment.appendChild(buildRow(row)); });
+    if (S.view === "list" && S.rows.length) {
+      fragment.appendChild(buildList());
+    } else {
+      S.rows.forEach(function (row) { fragment.appendChild(buildRow(row)); });
+    }
+    el.rows.classList.toggle("lb-rows-list", S.view === "list");
     el.rows.innerHTML = "";
     if (!S.rows.length) {
       var empty = document.createElement("div");
@@ -1252,6 +1317,7 @@
      Schedule button is: every schedule stays exactly as it is. */
   function collapseAll() {
     S.scheduleOpenById = {};
+    S.openRow = "";
     closeScheduleModal();
     renderRows(true);
   }
@@ -1259,10 +1325,11 @@
   function paintCollapseAll() {
     if (!el.collapseAll) { return; }
     var count = openScheduleCount();
-    el.collapseAll.disabled = !count;
+    var open = S.view === "list" && !!S.openRow;
+    el.collapseAll.disabled = !count && !open;
     el.collapseAll.title = count
       ? "Close the " + (count === 1 ? "open schedule" : count + " open schedules") + " - nothing in them changes"
-      : "No schedule is open";
+      : open ? "Close the open LoRA - nothing in it changes" : "No schedule is open";
   }
 
   /* The picture column is as wide as a row at rest is tall -- a row showing
@@ -1278,7 +1345,9 @@
     var rest = 0;
     el.rows.querySelectorAll(".lb-row").forEach(function (node) {
       if (node.querySelector(".lb-weight-main, .lb-sched-summary")) {
-        rest = Math.max(rest, node.clientHeight);
+        var height = node.clientHeight;
+        node.querySelectorAll(".lb-row-extra, .lb-members").forEach(function (part) { height -= part.offsetHeight; });
+        rest = Math.max(rest, height);
       }
     });
     if (!rest) { return; }                   // nothing at rest: keep the last size
@@ -1292,14 +1361,16 @@
   function updateRowValues() {
     S.rows.forEach(function (row) {
       var node = el.rows.querySelector('.lb-row[data-id="' + cssEscape(row.id) + '"]');
-      if (!node || !node.__lbPaint) { return; }
-      node.__lbPaint(row);
+      if (node && node.__lbPaint) { node.__lbPaint(row); }
+      var item = el.rows.querySelector('.lb-li[data-id="' + cssEscape(row.id) + '"]');
+      if (item && item.__lbPaint) { item.__lbPaint(row); }
     });
   }
 
   function buildRow(row) {
     var node = document.createElement("div");
-    node.className = "lb-row" + (row.missing ? " lb-missing" : "") + (isOn(row) ? "" : " lb-row-off");
+    node.className = "lb-row" + (row.missing ? " lb-missing" : "") + (isOn(row) ? "" : " lb-row-off") +
+      (row.kind === "group" ? " lb-row-group" : "");
     node.dataset.id = row.id;
 
     var phase = phaseOf(row);
@@ -1314,18 +1385,22 @@
     node.appendChild(main);
 
     main.appendChild(buildRowTop(row, open, editable));
+    if (row.kind === "group") { main.appendChild(buildMembers(row)); }
 
     if (!isOn(row)) {
       main.appendChild(buildOffSummary(row));
+      appendExtras(node, row);
       return node;
     }
     if (row.multiplier_kind === "advanced") {
       main.appendChild(buildPreserved(row));
+      appendExtras(node, row);
       return node;
     }
     if (!editable) {
       // A schedule this guidance mode cannot show: kept as it is, read-only.
       main.appendChild(buildKeptSchedule(row));
+      appendExtras(node, row);
       return node;
     }
 
@@ -1360,6 +1435,7 @@
       });
     }
 
+    appendExtras(node, row);
     node.__lbPaint = function (next) {
       painters.forEach(function (paint) { paint(next); });
     };
@@ -1393,6 +1469,21 @@
     cell.className = "lb-row-thumb";
     cell.dataset.id = row.id;
 
+    if (row.kind === "group") {
+      // A group shows its members' pictures, one above the other.
+      cell.classList.add("lb-row-thumb-group");
+      (row.members || []).slice(0, 3).forEach(function (member) {
+        var part = document.createElement("div");
+        part.className = "lb-thumb-part";
+        part.dataset.thumb = sourceId(member);
+        part.appendChild(thumbMedia(sourceId(member)));
+        cell.appendChild(part);
+      });
+      return cell;
+    }
+
+    var source = sourceId(row);
+    cell.dataset.thumb = source;
     var label = (row.has_catalogue ? "Inspect " : "Inspect / fetch info for ")
       + (row.civitai_name || row.name);
     var open = document.createElement("button");
@@ -1400,12 +1491,12 @@
     open.className = "lb-row-thumb-open";
     open.title = label;
     open.setAttribute("aria-label", label);
-    open.appendChild(thumbMedia(row.id));
-    open.addEventListener("click", function () { openInspect(row.id); });
+    open.appendChild(thumbMedia(source));
+    open.addEventListener("click", function () { openInspect(source); });
     cell.appendChild(open);
 
-    var item = S.byId[row.id];
-    if (item && item.has_video) { cell.appendChild(playButton(row.id, cell, rowName(row))); }
+    var item = S.byId[source];
+    if (item && item.has_video) { cell.appendChild(playButton(source, cell, rowName(row))); }
     return cell;
   }
 
@@ -1424,6 +1515,10 @@
     name.className = "lb-row-name";
     name.textContent = rowName(row);
     name.title = [row.civitai_name, row.name].filter(Boolean).join("\n");
+    if (row.kind === "group") {
+      name.title = "Group " + row.group + ": " + (row.members || []).map(rowName).join(", ");
+      name.appendChild(note((row.members || []).length + " LoRAs move as one"));
+    }
     if (row.system_managed) { name.appendChild(note("WanGP-managed")); }
     if (row.missing) { name.appendChild(note("Missing locally")); }
     top.appendChild(name);
@@ -1464,26 +1559,48 @@
       top.appendChild(toggle);
     }
 
-    // One tap from every row to the full record.
-    var inspect = document.createElement("button");
-    inspect.type = "button";
-    inspect.className = "lb-btn lb-icon lb-inspect";
-    inspect.textContent = "i";
-    inspect.title = (row.has_catalogue ? "Inspect " : "Inspect / fetch info for ")
-      + (row.civitai_name || row.name);
-    inspect.setAttribute("aria-label", inspect.title);
-    inspect.addEventListener("click", function () { openInspect(row.id); });
-    top.appendChild(inspect);
+    if (row.kind === "group") {
+      var ungroup = document.createElement("button");
+      ungroup.type = "button";
+      ungroup.className = "lb-btn";
+      ungroup.textContent = "Ungroup";
+      ungroup.title = "Make these separate LoRAs again; each keeps the group's strength and schedule";
+      ungroup.addEventListener("click", function () { send({ type: "ungroup", group: row.group }); });
+      top.appendChild(ungroup);
+    } else {
+      // One tap from every row to the full record.
+      var inspect = document.createElement("button");
+      inspect.type = "button";
+      inspect.className = "lb-btn lb-icon lb-inspect";
+      inspect.textContent = "i";
+      inspect.title = (row.has_catalogue ? "Inspect " : "Inspect / fetch info for ")
+        + (row.civitai_name || row.name);
+      inspect.setAttribute("aria-label", inspect.title);
+      inspect.addEventListener("click", function () { openInspect(sourceId(row)); });
+      top.appendChild(inspect);
+    }
 
     // Remove stays isolated at the far edge so it is never hit by accident.
     var remove = document.createElement("button");
     remove.type = "button";
     remove.className = "lb-btn lb-icon lb-remove";
     remove.textContent = "×";
-    remove.title = "Remove " + row.name + (isOn(row) ? "" : " - and forget its settings");
-    remove.setAttribute("aria-label", "Remove " + row.name);
-    remove.addEventListener("click", function () { send({ type: "remove", id: row.id }); });
+    remove.title = "Remove " + rowName(row) + (isOn(row) ? "" : " - and forget its settings");
+    remove.setAttribute("aria-label", "Remove " + rowName(row));
+    remove.addEventListener("click", function () {
+      send(row.kind === "group" ? { type: "remove", id: row.id, group: row.group } : { type: "remove", id: row.id });
+    });
     top.appendChild(remove);
+
+    if (S.view === "list") {
+      var done = document.createElement("button");
+      done.type = "button";
+      done.className = "lb-btn lb-done";
+      done.textContent = "Done \u25B4";
+      done.title = "Back to the list";
+      done.addEventListener("click", function () { S.openRow = ""; renderRows(true); });
+      top.appendChild(done);
+    }
     return top;
   }
 
@@ -1499,9 +1616,15 @@
     power.setAttribute("aria-label", "Apply " + rowName(row));
     power.title = on
       ? "Applied - switch off to skip it and keep its settings"
-      : "Switched off - kept, not applied. Switch on to apply it again";
-    power.addEventListener("click", function () {
-      send({ type: "set_enabled", id: row.id, value: !on });
+      : row.skipped && row.empty
+        ? "Switched off: " + (MODE_LABEL[row.mode] || "this mode").toLowerCase() +
+          " leaves it nothing to apply. Switch on to apply it as normal"
+        : "Switched off - kept, not applied. Switch on to apply it again";
+    power.addEventListener("click", function (event) {
+      event.stopPropagation();
+      send(row.kind === "group"
+        ? { type: "set_enabled", id: row.id, value: !on, group: row.group }
+        : { type: "set_enabled", id: row.id, value: !on });
     });
     return power;
   }
@@ -2552,6 +2675,1237 @@
   }
 
 
+  /* ------------------------------------------- list view, modes, groups */
+
+  /* A mode change or a bake renames the file a row loads, not the row: what
+     the row had open or chosen comes along to its new id. */
+  function carryRowState(before, after) {
+    var oldIds = {};
+    before.forEach(function (row) { oldIds[rowKey(row)] = row.id; });
+    after.forEach(function (row) {
+      var was = oldIds[rowKey(row)];
+      if (!was || was === row.id) { return; }
+      [S.scheduleOpenById, S.selectedPhaseById, S.linked].forEach(function (map) {
+        if (map[was] !== undefined && map[row.id] === undefined) { map[row.id] = map[was]; }
+        delete map[was];
+      });
+      Object.keys(S.selectedRegionByKey).forEach(function (key) {
+        if (key.indexOf(was + ":") !== 0) { return; }
+        S.selectedRegionByKey[row.id + key.slice(was.length)] = S.selectedRegionByKey[key];
+        delete S.selectedRegionByKey[key];
+      });
+    });
+  }
+
+  var MODE_LABEL = { normal: "Normal", visual: "Visual only", audio: "Audio only" };
+  var MODE_SHORT = { normal: "Normal", visual: "Visual", audio: "Audio" };
+  var MODE_HINT = {
+    normal: "Apply everything this LoRA changes",
+    visual: "Apply only what this LoRA changes in the picture",
+    audio: "Apply only what this LoRA changes in the sound"
+  };
+  var GENERATE_WARNING = "If you generate before this finishes, you may get an unexpected result: " +
+    "WanGP reports any file not built yet as missing.";
+  var ICONS = {
+    picture: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2.8" width="13" height="10.4" rx="1.6" ' +
+      'fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3.4 11.2l3-3.3 2.3 2.2 1.6-1.6 2.4 2.7" ' +
+      'fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/></svg>',
+    sound: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.3 6h2.6l3.6-3v10l-3.6-3H2.3z" fill="currentColor"/>' +
+      '<path d="M11 5.6a3.4 3.4 0 0 1 0 4.8M12.9 3.7a6 6 0 0 1 0 8.6" fill="none" stroke="currentColor" ' +
+      'stroke-width="1.4" stroke-linecap="round"/></svg>',
+    link: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6.6 9.4l2.8-2.8M5.4 7.1L3.8 8.7a2.6 2.6 0 0 0 3.6 ' +
+      '3.6L9 10.7M10.6 8.9l1.6-1.6a2.6 2.6 0 0 0-3.6-3.6L7 5.3" fill="none" stroke="currentColor" ' +
+      'stroke-width="1.6" stroke-linecap="round"/></svg>'
+  };
+
+  function icon(name) {
+    var holder = document.createElement("span");
+    holder.className = "lb-ic";
+    holder.setAttribute("aria-hidden", "true");
+    holder.innerHTML = ICONS[name] || "";
+    return holder;
+  }
+
+  /* The LoRA a row stands for. A visual-only copy is still its original's
+     row: its name, its picture, its catalogue. */
+  function sourceId(row) { return row.source_id || row.id; }
+
+  /* What identifies a row from one payload to the next, whatever file it
+     loads: a mode change or a bake renames the file, not the row. */
+  function rowKey(row) { return row.kind === "group" ? "g:" + row.group : sourceId(row); }
+
+  function buildState(build) { return build ? text(build.state) : ""; }
+
+  function plural(count, one, many) { return count + " " + (count === 1 ? one : many); }
+
+  function megabytes(bytes) {
+    var value = Number(bytes) || 0;
+    var mb = value / 1048576;
+    if (mb >= 1024) { return (mb / 1024).toFixed(2) + " GB"; }
+    if (mb < 1) { return Math.max(1, Math.round(value / 1024)) + " KB"; }
+    return (mb >= 100 ? String(Math.round(mb)) : mb >= 10 ? mb.toFixed(1) : mb.toFixed(2)) + " MB";
+  }
+
+  function listJoin(names) {
+    if (names.length < 2) { return names.join(""); }
+    return names.slice(0, -1).join(", ") + " and " + names[names.length - 1];
+  }
+
+  function span(className, value) {
+    var node = document.createElement("span");
+    if (className) { node.className = className; }
+    if (value !== undefined) { node.textContent = value; }
+    return node;
+  }
+
+  function codeText(value) {
+    var node = document.createElement("code");
+    node.textContent = value;
+    return node;
+  }
+
+  function paragraph(value, className) {
+    var node = document.createElement("p");
+    if (className) { node.className = className; }
+    if (value) { node.textContent = value; }
+    return node;
+  }
+
+  function makeButton(label, className, onClick, title) {
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = className || "lb-btn";
+    button.textContent = label;
+    if (title) { button.title = title; }
+    if (onClick) { button.addEventListener("click", onClick); }
+    return button;
+  }
+
+  function setView(view, persist) {
+    view = view === "cards" ? "cards" : "list";
+    if (view === S.view) { return; }
+    S.view = view;
+    S.openRow = "";
+    if (view !== "list") { S.selecting = false; S.selected = {}; }
+    if (persist) { send({ type: "view", value: view }); }
+    renderHeader();
+    renderRows(true);
+    paintBulk();
+  }
+
+  /* Picking rows for one change: the list's own mode, so Cards gives way. */
+  function setSelecting(on) {
+    S.selecting = !!on;
+    S.selected = {};
+    if (S.selecting) {
+      S.openRow = "";
+      if (S.view !== "list") { setView("list", true); return; }
+    }
+    renderHeader();
+    renderRows(true);
+    paintBulk();
+  }
+
+  function avMenuItems() {
+    var every = function (mode) { return function () { send({ type: "set_mode_all", mode: mode }); }; };
+    return [
+      { label: "Make every LoRA visual only", run: every("visual") },
+      { label: "Make every LoRA audio only", run: every("audio") },
+      { label: "Make every LoRA normal", run: every("normal") },
+      { separator: true },
+      { label: "Select which LoRAs…", run: function () { setSelecting(true); } }
+    ];
+  }
+
+  /* --------------------------------------------------------- the list */
+
+  /* The active LoRAs one line each: picture, name, what each phase applies,
+     and the switch. Nothing here edits a strength: a click opens that LoRA's
+     editor under its line, and opening one closes the one open before. */
+  function buildList() {
+    var phases = listPhaseCount();
+    var list = document.createElement("div");
+    list.className = "lb-list" + (S.selecting ? " lb-list-selecting" : "");
+    list.style.setProperty("--lb-list-cols", listColumns(phases, false));
+    list.style.setProperty("--lb-list-cols-narrow", listColumns(phases, true));
+    list.appendChild(buildListHead(phases));
+    S.rows.forEach(function (row) {
+      var open = !S.selecting && S.openRow === rowKey(row);
+      var holder = list;
+      if (row.kind === "group") {
+        holder = document.createElement("div");
+        holder.className = "lb-li-group" + (open ? " lb-li-group-open" : "");
+        list.appendChild(holder);
+      }
+      holder.appendChild(buildListItem(row, open));
+      if (open) {
+        var editor = document.createElement("div");
+        editor.className = "lb-li-editor";
+        editor.appendChild(buildRow(row));
+        holder.appendChild(editor);
+      } else if (row.kind === "group") {
+        var members = row.members || [];
+        members.forEach(function (member, index) {
+          holder.appendChild(buildMemberItem(row, member, index === members.length - 1));
+        });
+      }
+    });
+    return list;
+  }
+
+  function listPhaseCount() {
+    return Math.max(1, (S.phases && S.phases.effective) || 1);
+  }
+
+  function listColumns(phases, narrow) {
+    var pick = S.selecting ? "30px " : "";
+    if (narrow) { return pick + "44px 40px minmax(0, 1fr) 18px"; }
+    var cells = [];
+    for (var i = 0; i < phases; i += 1) { cells.push("minmax(0, 1fr)"); }
+    return pick + "44px 40px minmax(0, 1.7fr) " + cells.join(" ") + " 18px";
+  }
+
+  function phaseName(index) {
+    return S.phaseLabels[index] || ("Phase " + (index + 1));
+  }
+
+  function buildListHead(phases) {
+    var head = document.createElement("div");
+    head.className = "lb-li-head";
+    head.setAttribute("aria-hidden", "true");
+    if (S.selecting) { head.appendChild(span("")); }
+    head.appendChild(span("", "On"));
+    head.appendChild(span(""));
+    head.appendChild(span("", "LoRA"));
+    for (var i = 0; i < phases; i += 1) {
+      var steps = S.phaseSteps[i];
+      head.appendChild(span("", phaseName(i) + (steps ? " · " + plural(steps, "step", "steps") : "")));
+    }
+    head.appendChild(span(""));
+    return head;
+  }
+
+  function buildListItem(row, open) {
+    var key = rowKey(row);
+    var group = row.kind === "group";
+    var picked = !!S.selected[key];
+    var item = document.createElement("div");
+    item.className = "lb-li" + (group ? " lb-li-ghead" : "") + (isOn(row) ? "" : " lb-li-off") +
+      (open ? " lb-li-open" : "") + (picked ? " lb-li-picked" : "") + (row.missing ? " lb-li-missing" : "");
+    item.dataset.id = row.id;
+    item.dataset.key = key;
+
+    if (S.selecting) { item.appendChild(pickBox(row, key, picked)); }
+    item.appendChild(powerSwitch(row));
+
+    var thumb = document.createElement("div");
+    thumb.className = "lb-li-thumb";
+    if (group) {
+      thumb.classList.add("lb-li-badge");
+      thumb.appendChild(icon("link"));
+      thumb.appendChild(span("lb-li-letter", row.group));
+    } else {
+      thumb.dataset.thumb = sourceId(row);
+      thumb.appendChild(thumbMedia(sourceId(row)));
+    }
+    item.appendChild(thumb);
+
+    var main = document.createElement("div");
+    main.className = "lb-li-main";
+    var name = document.createElement("button");
+    name.type = "button";
+    name.className = "lb-li-name";
+    if (S.selecting) {
+      name.title = "Select " + rowName(row);
+    } else {
+      name.setAttribute("aria-expanded", open ? "true" : "false");
+      name.title = (open ? "Close " : "Edit ") + rowName(row);
+    }
+    name.appendChild(span("lb-li-label", rowName(row)));
+    if (group) {
+      name.appendChild(span("lb-li-sub", plural((row.members || []).length, "LoRA", "LoRAs") + ", one strength"));
+      var bake = bakePill(row);
+      if (bake) { name.appendChild(bake); }
+    } else {
+      modePills(row).forEach(function (node) { name.appendChild(node); });
+      if (row.missing) { name.appendChild(note("Missing locally")); }
+      if (row.system_managed) { name.appendChild(note("WanGP-managed")); }
+    }
+    main.appendChild(name);
+    var cells = document.createElement("div");
+    cells.className = "lb-li-phs";
+    main.appendChild(cells);
+    item.appendChild(main);
+
+    var chevron = span("lb-li-chev", S.selecting ? "" : open ? "▴" : "▾");
+    chevron.setAttribute("aria-hidden", "true");
+    item.appendChild(chevron);
+
+    item.addEventListener("click", function () {
+      if (S.selecting) { togglePicked(key); return; }
+      toggleOpenRow(key);
+    });
+    item.__lbPaint = function (next) { paintPhaseCells(cells, next); };
+    item.__lbPaint(row);
+    return item;
+  }
+
+  /* A member of a closed group: listed under it, with no settings of its own
+     to show -- it applies the group's. */
+  function buildMemberItem(group, member, last) {
+    var item = document.createElement("div");
+    item.className = "lb-li lb-li-member" + (isOn(group) ? "" : " lb-li-dim");
+    item.dataset.member = member.id;
+    if (S.selecting) { item.appendChild(span("")); }
+    var tree = span("lb-li-tree" + (last ? "" : " lb-li-tree-next"));
+    tree.setAttribute("aria-hidden", "true");
+    item.appendChild(tree);
+    var thumb = document.createElement("div");
+    thumb.className = "lb-li-thumb";
+    thumb.dataset.thumb = sourceId(member);
+    thumb.appendChild(thumbMedia(sourceId(member)));
+    item.appendChild(thumb);
+    var main = document.createElement("div");
+    main.className = "lb-li-main";
+    var name = document.createElement("button");
+    name.type = "button";
+    name.className = "lb-li-name";
+    name.title = "Edit Group " + group.group;
+    name.setAttribute("aria-label", rowName(member) + ", in Group " + group.group + ". Open the group");
+    name.appendChild(span("lb-li-label", rowName(member)));
+    modePills(member).forEach(function (node) { name.appendChild(node); });
+    if (member.missing) { name.appendChild(note("Missing locally")); }
+    main.appendChild(name);
+    var shared = span("lb-li-shared", "moves with Group " + group.group);
+    shared.style.gridColumn = "span " + listPhaseCount();
+    main.appendChild(shared);
+    item.appendChild(main);
+    item.appendChild(span(""));
+    item.addEventListener("click", function () {
+      if (S.selecting) { togglePicked(rowKey(group)); return; }
+      toggleOpenRow(rowKey(group));
+    });
+    return item;
+  }
+
+  function toggleOpenRow(key) {
+    var closing = S.openRow === key;
+    S.openRow = closing ? "" : key;
+    renderRows(true);
+    var item = el.rows.querySelector('.lb-li[data-key="' + cssEscape(key) + '"]');
+    if (!item) { return; }
+    if (closing) {
+      var name = item.querySelector(".lb-li-name");
+      if (name) { name.focus(); }
+      return;
+    }
+    var editor = item.parentNode.querySelector(".lb-li-editor");
+    if (editor && editor.scrollIntoView) { editor.scrollIntoView({ block: "nearest" }); }
+  }
+
+  /* What each phase applies: its value, or for a scheduled phase how many
+     steps it runs on -- never each step's strength. Those are in the editor. */
+  function paintPhaseCells(cells, row) {
+    cells.innerHTML = "";
+    var summary = row.phase_summary || [];
+    var count = listPhaseCount();
+    if (summary.length === 1 && summary[0].kind === "raw") {
+      var raw = document.createElement("div");
+      raw.className = "lb-li-ph lb-li-raw";
+      raw.style.gridColumn = "span " + count;
+      raw.title = "Kept exactly as written: " + summary[0].text;
+      raw.appendChild(codeText(summary[0].text));
+      cells.appendChild(raw);
+      return;
+    }
+    for (var i = 0; i < count; i += 1) {
+      cells.appendChild(phaseCell(summary[i] || { kind: "value", value: 0 }, i, count));
+    }
+  }
+
+  function phaseCell(cell, index, count) {
+    var node = document.createElement("div");
+    node.className = "lb-li-ph";
+    if (count > 1) { node.dataset.short = "P" + (index + 1); }
+    if (cell.kind === "steps") {
+      node.classList.add("lb-li-sched");
+      var wave = span("lb-li-wave", "∿");
+      wave.setAttribute("aria-hidden", "true");
+      node.appendChild(wave);
+      node.appendChild(codeText(plural(cell.steps, "step", "steps")));
+      node.title = phaseName(index) + ": scheduled on " + spansText(cell.spans) + " of " + cell.of +
+        ". Open the row to see the strengths.";
+      return node;
+    }
+    if (Number(cell.value) === 0) { node.classList.add("lb-li-zero"); }
+    node.appendChild(codeText(fmt(cell.value)));
+    node.title = phaseName(index) + ": x" + fmt(cell.value);
+    return node;
+  }
+
+  function spansText(spans) {
+    return (spans || []).map(function (pair) {
+      return pair[0] === pair[1] ? "step " + pair[0] : "steps " + pair[0] + "–" + pair[1];
+    }).join(", ") || "no steps";
+  }
+
+  /* Visual only / Audio only, and where its copy is. */
+  function modePills(row) {
+    var mode = row.mode || "normal";
+    if (mode === "normal") { return []; }
+    var node = span("lb-mode-pill lb-mode-" + mode);
+    node.appendChild(icon(mode === "visual" ? "picture" : "sound"));
+    node.appendChild(document.createTextNode(MODE_LABEL[mode]));
+    var state = buildState(row.build);
+    if (row.empty) {
+      node.appendChild(document.createTextNode(" · nothing to apply"));
+      node.title = MODE_LABEL[mode] + " leaves this LoRA nothing to apply, so it is switched off.";
+    } else if (state === "building") {
+      node.appendChild(document.createTextNode(" · building "));
+      var pct = span("", (row.build.pct || 0) + "%");
+      pct.dataset.buildPct = row.id;
+      node.appendChild(pct);
+    } else if (state === "queued") {
+      node.appendChild(document.createTextNode(" · queued"));
+    } else if (state === "failed") {
+      node.appendChild(document.createTextNode(" · build failed"));
+      node.classList.add("lb-pill-warn");
+      node.title = row.build.error || "";
+    } else if (state === "pending" || state === "missing" || state === "unavailable") {
+      node.appendChild(document.createTextNode(" · not built"));
+      node.classList.add("lb-pill-warn");
+    }
+    return [node];
+  }
+
+  function bakePill(row) {
+    if (!row.baked || !row.bake) { return null; }
+    var bake = row.bake;
+    var state = buildState(bake);
+    var node = span("lb-mode-pill lb-bake-pill");
+    if (state === "built") {
+      node.textContent = "Baked r" + bake.rank + (bake.bytes ? " · " + megabytes(bake.bytes) : "");
+    } else if (state === "building") {
+      node.textContent = "Baking ";
+      var pct = span("", (bake.pct || 0) + "%");
+      pct.dataset.buildPct = row.bake_id;
+      node.appendChild(pct);
+    } else if (state === "queued") {
+      node.textContent = "Bake queued";
+    } else if (state === "failed") {
+      node.textContent = "Bake failed";
+      node.classList.add("lb-pill-warn");
+      node.title = bake.error || "";
+    } else {
+      node.textContent = "Bake not built";
+      node.classList.add("lb-pill-warn");
+    }
+    return node;
+  }
+
+  function pickBox(row, key, picked) {
+    var box = document.createElement("button");
+    box.type = "button";
+    box.className = "lb-pick";
+    box.setAttribute("role", "checkbox");
+    box.setAttribute("aria-checked", picked ? "true" : "false");
+    box.setAttribute("aria-label", "Select " + rowName(row));
+    box.textContent = "✓";
+    box.addEventListener("click", function (event) {
+      event.stopPropagation();
+      togglePicked(key);
+    });
+    return box;
+  }
+
+  function togglePicked(key) {
+    if (S.selected[key]) { delete S.selected[key]; } else { S.selected[key] = true; }
+    renderRows(true);
+    paintBulk();
+  }
+
+  function pickedRows() {
+    return S.rows.filter(function (row) { return !!S.selected[rowKey(row)]; });
+  }
+
+  /* The bar under the header while rows are being picked. */
+  function paintBulk() {
+    var bar = el.bulk;
+    if (!bar) { return; }
+    if (!S.selecting) {
+      bar.hidden = true;
+      bar.innerHTML = "";
+      return;
+    }
+    // A row that left the stack is no longer picked.
+    var present = {};
+    S.rows.forEach(function (row) { present[rowKey(row)] = true; });
+    Object.keys(S.selected).forEach(function (key) { if (!present[key]) { delete S.selected[key]; } });
+
+    var rows = pickedRows();
+    bar.hidden = false;
+    bar.innerHTML = "";
+    bar.appendChild(span("lb-bulk-count",
+      rows.length ? plural(rows.length, "row", "rows") + " selected" : "Tap rows to select them"));
+    if (S.avSupported) {
+      var set = span("lb-bulk-set");
+      set.appendChild(span("lb-muted", "Make"));
+      ["visual", "audio", "normal"].forEach(function (mode) {
+        var button = makeButton(MODE_LABEL[mode], "lb-btn", function () {
+          send({ type: "set_mode_all", mode: mode, ids: pickedRows().map(function (row) { return row.id; }) });
+        }, MODE_HINT[mode]);
+        button.disabled = !rows.length;
+        set.appendChild(button);
+      });
+      bar.appendChild(set);
+    }
+    var loose = rows.filter(function (row) { return row.kind !== "group" && !row.system_managed; });
+    var canGroup = loose.length >= 2 && loose.length === rows.length;
+    var group = makeButton("Group", "lb-btn", function () { requestGroup(loose); },
+      canGroup ? "Make these move together with one strength and schedule"
+        : "Select two or more LoRAs that are not in a group yet");
+    group.disabled = !canGroup;
+    bar.appendChild(group);
+    bar.appendChild(span("lb-grow"));
+    bar.appendChild(makeButton("Select all", "lb-btn", function () {
+      S.rows.forEach(function (row) { S.selected[rowKey(row)] = true; });
+      renderRows(true);
+      paintBulk();
+    }));
+    bar.appendChild(makeButton("Done", "lb-btn", function () { setSelecting(false); }));
+  }
+
+  /* -------------------------------------------------- editor sections */
+
+  /* What an editor adds under a LoRA's strengths: which side it applies and
+     what WanGP loads for it, and grouping. A group's editor has its members
+     at the top and its bake at the bottom. It is a band across the whole
+     card, under the picture: the picture stays beside the strengths. */
+  function appendExtras(card, row) {
+    if (row.system_managed) { return; }
+    var box = document.createElement("div");
+    box.className = "lb-row-extra";
+    if (row.kind === "group") {
+      box.appendChild(bakeBlock(row));
+      card.appendChild(box);
+      return;
+    }
+    var mode = row.mode || "normal";
+    var line = document.createElement("div");
+    line.className = "lb-extra-line";
+    box.appendChild(line);
+    if (S.avSupported) {
+      line.appendChild(span("lb-extra-label", "Applies to"));
+      line.appendChild(modeSeg(row, false));
+      line.appendChild(span("lb-grow"));
+    } else {
+      line.appendChild(span("lb-extra-label", "Group"));
+      line.appendChild(span("lb-muted", "Not in a group."));
+    }
+    var picker = groupPicker(row);
+    if (picker) { line.appendChild(picker); }
+    if (S.avSupported && S.view === "list" && row.streams) { box.appendChild(streamView(row)); }
+    if (mode !== "normal") {
+      var load = loadLine(row);
+      if (load) { box.appendChild(load); }
+    }
+    card.appendChild(box);
+  }
+
+  function modeSeg(row, small) {
+    var current = row.mode || "normal";
+    var seg = document.createElement("div");
+    seg.className = "lb-seg" + (small ? " lb-seg-sm" : "");
+    seg.setAttribute("role", "radiogroup");
+    seg.setAttribute("aria-label", rowName(row) + " applies to");
+    ["normal", "visual", "audio"].forEach(function (mode) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute("role", "radio");
+      button.className = "lb-seg-" + mode;
+      button.setAttribute("aria-checked", current === mode ? "true" : "false");
+      if (mode !== "normal") { button.appendChild(icon(mode === "visual" ? "picture" : "sound")); }
+      button.appendChild(document.createTextNode(small ? MODE_SHORT[mode] : MODE_LABEL[mode]));
+      button.title = MODE_HINT[mode];
+      button.addEventListener("click", function (event) {
+        event.stopPropagation();
+        if (current !== mode) { send({ type: "set_mode", id: row.id, mode: mode }); }
+      });
+      seg.appendChild(button);
+    });
+    return seg;
+  }
+
+  /* How much of the LoRA changes the picture and how much the sound. */
+  function streamView(row) {
+    var streams = row.streams || {};
+    var mode = row.mode || "normal";
+    var parts = [
+      ["picture", "Picture", streams.picture || {}, mode === "audio"],
+      ["shared", "Both", streams.shared || {}, false],
+      ["sound", "Sound", streams.sound || {}, mode === "visual"]
+    ];
+    var total = parts.reduce(function (sum, part) { return sum + (part[2].bytes || 0); }, 0);
+    var wrap = document.createElement("div");
+    wrap.className = "lb-streams";
+    var bar = document.createElement("div");
+    bar.className = "lb-sbar";
+    bar.setAttribute("aria-hidden", "true");
+    var legend = document.createElement("div");
+    legend.className = "lb-slegend";
+    parts.forEach(function (part) {
+      var info = part[2];
+      if (total && info.bytes) {
+        var piece = document.createElement("i");
+        piece.className = "lb-s-" + part[0] + (part[3] ? " lb-s-out" : "");
+        piece.style.width = (info.bytes / total * 100).toFixed(1) + "%";
+        bar.appendChild(piece);
+      }
+      if (part[0] === "shared" && !info.tensors) { return; }
+      var item = span("");
+      var swatch = document.createElement("i");
+      swatch.className = "lb-sw lb-s-" + part[0];
+      item.appendChild(swatch);
+      item.appendChild(span("lb-s-name", part[1]));
+      item.appendChild(document.createTextNode(info.tensors
+        ? " " + plural(info.tensors, "tensor", "tensors") + " · " + megabytes(info.bytes) +
+          (part[3] ? " · left out" : part[0] === "shared" ? " · kept either way" : "")
+        : " none"));
+      legend.appendChild(item);
+    });
+    wrap.appendChild(bar);
+    wrap.appendChild(legend);
+    return wrap;
+  }
+
+  function progressBar(key, pct) {
+    var bar = document.createElement("div");
+    bar.className = "lb-prog";
+    var fill = document.createElement("i");
+    fill.dataset.buildBar = key;
+    fill.style.width = (pct || 0) + "%";
+    bar.appendChild(fill);
+    return bar;
+  }
+
+  /* What WanGP loads for a LoRA in Visual only or Audio only, and how far
+     along its copy is. */
+  function loadLine(row) {
+    var mode = row.mode || "normal";
+    var build = row.build || {};
+    var state = build.state || "";
+    var side = mode === "visual" ? "picture" : "sound";
+    var other = mode === "visual" ? "sound" : "picture";
+    var box = document.createElement("div");
+    box.className = "lb-load";
+    var line = document.createElement("div");
+    box.appendChild(line);
+    var add = function (value) { line.appendChild(typeof value === "string" ? document.createTextNode(value) : value); };
+
+    if (row.empty) {
+      add(rowName(row) + " only changes the " + other + ", so " + MODE_LABEL[mode].toLowerCase() +
+        " leaves it nothing to apply and it is switched off. Normal or " +
+        (mode === "visual" ? "Audio" : "Visual") + " only switches it back on.");
+      return box;
+    }
+    if (state === "built") {
+      add("WanGP loads ");
+      add(codeText(row.id));
+      add((build.bytes ? " · " + megabytes(build.bytes) : "") + ", an exact copy of its " + side + " tensors.");
+    } else if (state === "building") {
+      add("Building ");
+      add(codeText(row.id));
+      add(" · ");
+      var pct = span("", (build.pct || 0) + "%");
+      pct.dataset.buildPct = row.id;
+      add(pct);
+      add(". If you generate before it is ready, WanGP reports it as missing.");
+      box.appendChild(progressBar(row.id, build.pct));
+    } else if (state === "queued") {
+      add("Waiting to build ");
+      add(codeText(row.id));
+      add(", after the files ahead of it. If you generate before it is ready, WanGP reports it as missing.");
+    } else if (state === "failed") {
+      box.classList.add("lb-load-warn");
+      add("Could not build ");
+      add(codeText(row.id));
+      add(": " + (build.error || "unknown error") + ".");
+      var retry = document.createElement("div");
+      retry.appendChild(makeButton("Retry", "lb-btn", function () { send({ type: "build_retry", id: row.id }); }));
+      box.appendChild(retry);
+    } else if (state === "missing") {
+      box.classList.add("lb-load-warn");
+      add("The original file is not here, so its " + side + " copy cannot be built.");
+    } else if (state === "unavailable") {
+      box.classList.add("lb-load-warn");
+      add("This model has no LoRA folder to build copies in.");
+    } else if (state === "pending") {
+      add("Not built yet: ");
+      add(codeText(row.id));
+      add(".");
+    } else {
+      return null;
+    }
+    return box;
+  }
+
+  /* "Group with..." -- another LoRA, or a group to join. */
+  function groupPicker(row) {
+    var others = S.rows.filter(function (other) { return other !== row && !other.system_managed; });
+    if (!others.length) { return null; }
+    var select = document.createElement("select");
+    select.className = "lb-select";
+    select.setAttribute("aria-label", "Group " + rowName(row) + " with another LoRA");
+    select.appendChild(new Option("Group with…", ""));
+    others.forEach(function (other) {
+      if (other.kind === "group") {
+        select.appendChild(new Option("Add to Group " + other.group, "g:" + other.group));
+        return;
+      }
+      var same = (other.multiplier_raw || "") === (row.multiplier_raw || "");
+      select.appendChild(new Option(rowName(other) + (same ? " · same settings" : ""), "r:" + rowKey(other)));
+    });
+    select.addEventListener("click", function (event) { event.stopPropagation(); });
+    select.addEventListener("change", function () {
+      var value = select.value;
+      select.value = "";
+      if (!value) { return; }
+      if (value.slice(0, 2) === "g:") {
+        send({ type: "group_add", group: value.slice(2), id: row.id });
+        return;
+      }
+      var other = S.rows.filter(function (candidate) { return rowKey(candidate) === value.slice(2); })[0];
+      if (other) { requestGroup([row, other]); }
+    });
+    return select;
+  }
+
+  /* Grouping LoRAs that disagree asks whose strength and schedule the group
+     keeps; LoRAs that already agree are grouped at once. */
+  function requestGroup(rows) {
+    if (rows.length < 2) { return; }
+    var first = rows[0].multiplier_raw || "";
+    var same = rows.every(function (row) { return (row.multiplier_raw || "") === first; });
+    if (same) {
+      createGroup(rows, rows[0].id);
+      return;
+    }
+    var pick = rows[0].id;
+    var body = document.createElement("div");
+    body.appendChild(paragraph("These LoRAs have different strengths or schedules. A group shares one, " +
+      "so pick whose the group keeps. You can change it afterwards."));
+    var options = document.createElement("div");
+    options.className = "lb-opts";
+    options.setAttribute("role", "radiogroup");
+    options.setAttribute("aria-label", "Settings the group keeps");
+    rows.forEach(function (row, index) {
+      options.appendChild(optionRow("lb-group-pick", row.id, index === 0, rowName(row),
+        MODE_LABEL[row.mode || "normal"], ["x" + (row.multiplier_raw || "1")], function () { pick = row.id; }));
+    });
+    body.appendChild(options);
+    if (S.avSupported) {
+      body.appendChild(paragraph("Each member keeps its own Normal, Visual only or Audio only setting.", "lb-fine"));
+    }
+    openDialog("Group " + plural(rows.length, "LoRA", "LoRAs"), body, [
+      { label: "Cancel" },
+      { label: "Group them", primary: true, run: function () { createGroup(rows, pick); } }
+    ]);
+  }
+
+  function createGroup(rows, lead) {
+    send({ type: "group_create", ids: rows.map(function (row) { return row.id; }), lead: lead });
+    if (S.selecting) { setSelecting(false); }
+  }
+
+  function optionRow(name, value, checked, title, sub, side, onPick) {
+    var label = document.createElement("label");
+    label.className = "lb-opt";
+    var input = document.createElement("input");
+    input.type = "radio";
+    input.name = name;
+    input.value = value;
+    input.checked = !!checked;
+    input.addEventListener("change", function () { if (input.checked) { onPick(); } });
+    label.appendChild(input);
+    var main = span("lb-opt-main");
+    main.appendChild(span("lb-opt-title", title));
+    if (sub) { main.appendChild(span("lb-opt-sub", sub)); }
+    label.appendChild(main);
+    var aside = span("lb-opt-side");
+    (side || []).forEach(function (value, index) { aside.appendChild(span(index ? "" : "lb-opt-big", value)); });
+    label.appendChild(aside);
+    return label;
+  }
+
+  /* A group's members, each with its own side and a way out of the group. */
+  function buildMembers(row) {
+    var list = document.createElement("div");
+    list.className = "lb-members";
+    (row.members || []).forEach(function (member) {
+      var item = document.createElement("div");
+      item.className = "lb-member" + (S.avSupported ? "" : " lb-member-noseg");
+      var thumb = document.createElement("div");
+      thumb.className = "lb-member-thumb";
+      thumb.dataset.thumb = sourceId(member);
+      thumb.appendChild(thumbMedia(sourceId(member)));
+      item.appendChild(thumb);
+      var name = document.createElement("div");
+      name.className = "lb-member-name";
+      name.title = [member.civitai_name, member.name].filter(Boolean).join("\n");
+      name.appendChild(span("lb-li-label", rowName(member)));
+      var detail = memberNote(member, row);
+      if (detail) { name.appendChild(span("lb-member-note", detail)); }
+      item.appendChild(name);
+      if (S.avSupported) { item.appendChild(modeSeg(member, true)); }
+      var leave = makeButton("×", "lb-btn lb-icon", function () {
+        send({ type: "group_leave", group: row.group, id: member.id });
+      }, "Take " + rowName(member) + " out of Group " + row.group);
+      leave.setAttribute("aria-label", leave.title);
+      item.appendChild(leave);
+      list.appendChild(item);
+    });
+    return list;
+  }
+
+  function memberNote(member, group) {
+    var parts = [];
+    var streams = member.streams;
+    if (streams && streams.rank) { parts.push("Rank " + streams.rank); }
+    var mode = member.mode || "normal";
+    if (member.empty) {
+      parts.push("skipped: nothing to apply in " + MODE_LABEL[mode].toLowerCase());
+    } else if (group.baked) {
+      parts.push(buildState(group.bake) === "built" ? "inside the group's baked file"
+        : "goes into the group's bake once it is built");
+    } else if (mode !== "normal") {
+      var state = buildState(member.build);
+      parts.push(state === "built" ? "exact " + mode + "-only copy"
+        : state === "building" ? "building its copy"
+        : state === "failed" ? "its copy could not be built"
+        : "waiting to build its copy");
+    } else if (streams) {
+      var picture = streams.picture && streams.picture.tensors;
+      var sound = streams.sound && streams.sound.tensors;
+      parts.push(picture && sound ? "changes picture and sound"
+        : picture ? "changes the picture only" : sound ? "changes the sound only" : "");
+    }
+    return parts.filter(Boolean).join(" · ");
+  }
+
+  function keptText(bake) {
+    if (bake.exact) { return "all"; }
+    if (bake.kept === undefined || bake.kept === null) { return "most"; }
+    var pct = Number(bake.kept) * 100;
+    return (pct >= 99.95 ? "over 99.9" : pct.toFixed(1)) + "%";
+  }
+
+  /* A group's memory: its members loaded side by side, or one baked file. */
+  function bakeBlock(row) {
+    var box = document.createElement("div");
+    box.className = "lb-extra-block";
+    var head = document.createElement("div");
+    head.className = "lb-extra-line";
+    head.appendChild(span("lb-extra-label", "Memory"));
+    box.appendChild(head);
+    var load = document.createElement("div");
+    load.className = "lb-load";
+    var line = document.createElement("div");
+    load.appendChild(line);
+    box.appendChild(load);
+
+    var bake = row.bake || {};
+    var count = (row.members || []).length;
+    var unbake = function () {
+      return makeButton("Unbake", "lb-btn", function () { send({ type: "unbake", group: row.group }); },
+        "Load the members separately again");
+    };
+    if (!row.baked) {
+      head.appendChild(span("lb-muted", "Not baked"));
+      head.appendChild(span("lb-grow"));
+      head.appendChild(makeButton("Bake to save memory…", "lb-btn", function () { openBakeDialog(row); }));
+      line.textContent = "WanGP loads " + plural(count, "file", "files") + " for this group. Baking re-fits " +
+        "them into one file at the rank you choose; the originals stay, and Unbake goes back to them.";
+      return box;
+    }
+    var state = buildState(bake);
+    if (state === "built") {
+      head.appendChild(span("lb-mode-pill lb-bake-pill", "Baked r" + bake.rank));
+      head.appendChild(span("lb-grow"));
+      head.appendChild(makeButton("Change size…", "lb-btn", function () { openBakeDialog(row); }));
+      head.appendChild(unbake());
+      line.textContent = "WanGP loads one file" + (bake.bytes ? " of " + megabytes(bake.bytes) : "") +
+        " instead of " + count + ". It keeps " + keptText(bake) + " of their combined change. " +
+        "Strength and schedule still apply live.";
+    } else if (state === "building" || state === "queued") {
+      head.appendChild(span("", (state === "building" ? "Baking" : "Bake queued") + " at rank " + bake.rank));
+      head.appendChild(span("lb-grow"));
+      head.appendChild(unbake());
+      if (state === "building") {
+        line.appendChild(document.createTextNode("Building one file from the members' current settings · "));
+        var pct = span("", (bake.pct || 0) + "%");
+        pct.dataset.buildPct = row.bake_id;
+        line.appendChild(pct);
+        line.appendChild(document.createTextNode(". If you generate before it is ready, WanGP reports it as missing."));
+        load.appendChild(progressBar(row.bake_id, bake.pct));
+      } else {
+        line.textContent = "Waiting for the files ahead of it. If you generate before it is ready, " +
+          "WanGP reports it as missing.";
+      }
+    } else if (state === "failed") {
+      head.appendChild(span("lb-mode-pill lb-bake-pill lb-pill-warn", "Bake failed"));
+      head.appendChild(span("lb-grow"));
+      head.appendChild(makeButton("Retry", "lb-btn", function () { send({ type: "build_retry", id: row.bake_id }); }));
+      head.appendChild(unbake());
+      load.classList.add("lb-load-warn");
+      line.textContent = (bake.error || "The bake did not finish") + ". Unbake to load the members separately.";
+    } else {
+      head.appendChild(span("lb-mode-pill lb-bake-pill lb-pill-warn", "Not built"));
+      head.appendChild(span("lb-grow"));
+      head.appendChild(unbake());
+      load.classList.add("lb-load-warn");
+      line.textContent = state === "unavailable" ? "This model has no LoRA folder to build the baked file in."
+        : "The baked file is not built yet. If you generate now, WanGP reports it as missing.";
+    }
+    return box;
+  }
+
+  /* ------------------------------------------------------------ dialogs */
+
+  function openDialog(title, body, actions) {
+    closeMenu();
+    closeDialog();
+    var overlay = document.createElement("div");
+    overlay.className = "lb-modal-overlay " + NS;
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", title);
+    var box = document.createElement("div");
+    box.className = "lb-modal lb-dialog";
+    var head = document.createElement("div");
+    head.className = "lb-modal-head";
+    head.appendChild(span("lb-modal-title", title));
+    var close = makeButton("×", "lb-btn lb-icon", closeDialog);
+    close.setAttribute("aria-label", "Close");
+    head.appendChild(close);
+    box.appendChild(head);
+    body.classList.add("lb-dialog-body");
+    box.appendChild(body);
+    var foot = document.createElement("div");
+    foot.className = "lb-dialog-foot";
+    box.appendChild(foot);
+    overlay.appendChild(box);
+
+    var dialog = {
+      overlay: overlay,
+      body: body,
+      setActions: function (list) {
+        foot.innerHTML = "";
+        list.forEach(function (action) {
+          var button = makeButton(action.label,
+            "lb-btn" + (action.primary ? " lb-primary" : "") + (action.left ? " lb-left" : ""));
+          button.disabled = !!action.disabled;
+          button.addEventListener("click", function () {
+            if (action.run) { action.run(button); }
+            if (!action.keepOpen) { closeDialog(); }
+          });
+          foot.appendChild(button);
+        });
+      }
+    };
+    dialog.setActions(actions);
+    S.dialogReturn = document.activeElement;
+    document.body.appendChild(overlay);
+    S.dialog = overlay;
+    overlay.addEventListener("click", function (event) {
+      if (event.target === overlay) { closeDialog(); }
+    });
+    document.addEventListener("keydown", onDialogKey);
+    var first = box.querySelector(".lb-dialog-body input:checked, .lb-dialog-foot .lb-primary") || close;
+    first.focus();
+    return dialog;
+  }
+
+  function onDialogKey(event) {
+    if (event.key === "Escape") { closeDialog(); }
+  }
+
+  function closeDialog() {
+    if (!S.dialog) { return; }
+    document.removeEventListener("keydown", onDialogKey);
+    S.dialog.remove();
+    S.dialog = null;
+    var back = S.dialogReturn;
+    S.dialogReturn = null;
+    if (back && back.focus && document.body.contains(back)) { back.focus(); }
+  }
+
+  function openBakeDialog(row) {
+    var body = document.createElement("div");
+    body.appendChild(paragraph("Reading the LoRAs…", "lb-muted"));
+    var dialog = openDialog((row.baked ? "Change the size of " : "Bake ") + "Group " + row.group, body,
+      [{ label: "Cancel" }]);
+    var members = (row.members || []).map(function (member) { return member.id; });
+    requestMedia({ kind: "bake_plan", members: members, group: row.group }, function (plan) {
+      if (S.dialog !== dialog.overlay) { return; }
+      renderBakePlan(dialog, row, plan);
+    });
+  }
+
+  function renderBakePlan(dialog, row, plan) {
+    var body = dialog.body;
+    body.innerHTML = "";
+    if (!plan || plan.error || !plan.options) {
+      body.appendChild(paragraph(plan && plan.error ? plan.error : "Could not read the LoRAs in this group."));
+      dialog.setActions([{ label: "Close", primary: true }]);
+      return;
+    }
+    var names = (row.members || []).map(rowName);
+    var ranks = plan.options.map(function (option) { return option.rank; });
+    var current = row.baked && row.bake ? row.bake.rank : 0;
+    var pick = ranks.indexOf(current) >= 0 ? current : plan.default_rank;
+    body.appendChild(paragraph("Builds one LoRA from " + listJoin(names) + ". It starts at the rank of the " +
+      "highest-rank LoRA in the group; pick another size if you want one. The originals are not touched, and " +
+      "Unbake goes back to them."));
+    body.appendChild(paragraph("Now: WanGP loads " + plural(names.length, "file", "files") + ", " +
+      megabytes(plan.current_bytes) + " in all, rank " + plan.combined_rank + " combined.", "lb-muted"));
+    var options = document.createElement("div");
+    options.className = "lb-opts";
+    options.setAttribute("role", "radiogroup");
+    options.setAttribute("aria-label", "Baked size");
+    plan.options.forEach(function (option) {
+      var saves = plan.current_bytes - option.bytes;
+      var title = (option.exact ? "Exact, rank " : "Rank ") + option.rank +
+        (option.rank === plan.default_rank ? " · default" : "") +
+        (option.rank === current ? " · now" : "");
+      var sub = option.exact
+        ? "Same memory as now: WanGP already runs the group this way. Only worth it to hand someone one file."
+        : (option.rank === plan.default_rank ? "Matches the highest rank in the group. " : "") +
+          (saves > 0 ? "Saves " + megabytes(saves) + "." : "");
+      options.appendChild(optionRow("lb-bake-pick", String(option.rank), option.rank === pick, title, sub,
+        [megabytes(option.bytes), option.exact ? "exact" : "re-fit"], function () { pick = option.rank; }));
+    });
+    body.appendChild(options);
+    body.appendChild(paragraph("A smaller file keeps the strongest directions of the group's combined change. " +
+      "How much it keeps is measured while it is built, and shown on the group afterwards.", "lb-fine"));
+    dialog.setActions([
+      { label: "Cancel" },
+      { label: row.baked ? "Rebuild" : "Bake", primary: true, run: function () {
+        send({ type: "bake", group: row.group, rank: pick });
+      } }
+    ]);
+    var checked = body.querySelector("input:checked");
+    if (checked) { checked.focus(); }
+  }
+
+  /* Every built file this stack uses, by the id the stack holds it by. */
+  function stackFileIds() {
+    var ids = [];
+    S.rows.forEach(function (row) {
+      ids.push(row.id);
+      if (row.bake_id) { ids.push(row.bake_id); }
+      (row.members || []).forEach(function (member) { ids.push(member.id); });
+    });
+    return ids;
+  }
+
+  function openBuiltDialog() {
+    var body = document.createElement("div");
+    body.appendChild(paragraph("Reading the built files…", "lb-muted"));
+    var dialog = openDialog("Built files", body, [{ label: "Close", primary: true }]);
+    loadBuilt(dialog, "");
+  }
+
+  function loadBuilt(dialog, action) {
+    var request = { kind: "built", in_use: stackFileIds() };
+    if (action) { request.action = action; }
+    requestMedia(request, function (reply) {
+      if (action) { send({ type: "ready" }); }          // the status bar's count
+      if (S.dialog !== dialog.overlay) { return; }
+      renderBuilt(dialog, reply);
+    });
+  }
+
+  function renderBuilt(dialog, reply) {
+    var body = dialog.body;
+    body.innerHTML = "";
+    if (!reply || reply.error) {
+      body.appendChild(paragraph(reply && reply.error ? reply.error : "Could not read the built files."));
+      dialog.setActions([{ label: "Close", primary: true }]);
+      return;
+    }
+    var intro = paragraph("");
+    intro.appendChild(document.createTextNode("Stored in "));
+    intro.appendChild(codeText(reply.folder + "/"));
+    intro.appendChild(document.createTextNode(reply.linked
+      ? " and linked into this model's LoRA folder as "
+      : " and kept in this model's LoRA folder as "));
+    intro.appendChild(codeText(reply.link));
+    intro.appendChild(document.createTextNode(", so WanGP loads them like any other LoRA."));
+    body.appendChild(intro);
+
+    var files = reply.files || [];
+    if (!files.length) {
+      body.appendChild(paragraph("Nothing is built for this model yet.", "lb-muted"));
+    } else {
+      var wrap = document.createElement("div");
+      wrap.className = "lb-table-wrap";
+      var table = document.createElement("table");
+      table.className = "lb-table";
+      var headRow = table.createTHead().insertRow();
+      ["File", "Built from", "Size", "Used by"].forEach(function (label) {
+        var cell = document.createElement("th");
+        cell.scope = "col";
+        cell.textContent = label;
+        headRow.appendChild(cell);
+      });
+      var tbody = table.createTBody();
+      files.forEach(function (file) {
+        var line = tbody.insertRow();
+        var name = line.insertCell();
+        name.className = "lb-t-file";
+        name.appendChild(codeText(text(file.id).split("/").pop()));
+        name.title = file.id;
+        var from = line.insertCell();
+        from.textContent = file.kind === "bake"
+          ? "Group bake, rank " + file.rank + ": " + listJoin(file.members || []) +
+            (file.kept !== null && file.kept !== undefined ? " · keeps " + keptText(file) : "")
+          : (file.label || "") + " · " + (MODE_LABEL[file.mode] || file.mode || "");
+        var size = line.insertCell();
+        size.className = "lb-t-num";
+        size.textContent = megabytes(file.bytes);
+        var used = line.insertCell();
+        if ((file.used_by || []).length) {
+          used.textContent = file.used_by.join(", ");
+        } else {
+          used.appendChild(span("lb-muted", "nothing"));
+        }
+      });
+      wrap.appendChild(table);
+      body.appendChild(wrap);
+    }
+    body.appendChild(paragraph("Delete unused removes only files that neither this stack nor a saved profile " +
+      "uses. Anything deleted is built again from its originals if it is ever used again.", "lb-fine"));
+    var unused = reply.unused || 0;
+    dialog.setActions([
+      { label: "Delete unused (" + unused + ")", left: true, disabled: !unused, keepOpen: true,
+        run: function (button) { button.disabled = true; loadBuilt(dialog, "delete_unused"); } },
+      { label: "Close", primary: true }
+    ]);
+  }
+
+  function paintBuiltLink() {
+    if (!el.built) { return; }
+    var built = S.built || {};
+    el.built.hidden = !built.count;
+    el.built.textContent = "Built files: " + (built.count || 0) + " · " + megabytes(built.bytes);
+  }
+
+  /* ------------------------------------------------------------- builds */
+
+  /* While this stack waits for files, a bar above the rows says so and
+     warns -- the panel never blocks Generate. */
+  function paintBuildBar(live) {
+    var bar = el.buildBar;
+    if (!bar) { return; }
+    var builds = S.builds || {};
+    if (!builds.waiting) {
+      bar.hidden = true;
+      bar.innerHTML = "";
+      return;
+    }
+    var status = live || builds;
+    var failed = Object.keys(builds.failed || {});
+    bar.hidden = false;
+    bar.innerHTML = "";
+    bar.className = "lb-buildbar" + (status.running ? " lb-buildbar-running" : " lb-buildbar-stuck");
+    var line = document.createElement("div");
+    line.className = "lb-buildbar-row";
+    var mark = span("lb-warn-ic", "!");
+    mark.setAttribute("aria-hidden", "true");
+    line.appendChild(mark);
+    var words = span("lb-buildbar-text");
+    var strong = document.createElement("b");
+    words.appendChild(strong);
+    line.appendChild(words);
+    bar.appendChild(line);
+
+    if (status.running) {
+      var queued = Array.isArray(status.queued) ? status.queued.length : (status.queued || 0);
+      var done = status.finished || 0;
+      var current = status.current;
+      if (current) {
+        strong.textContent = "Building " + (done + 1) + " of " + (done + 1 + queued);
+        words.appendChild(document.createTextNode(" · " + current.label + " · " + (current.pct || 0) + "%"));
+      } else {
+        strong.textContent = "Waiting to build " + plural(builds.waiting, "file", "files");
+      }
+      words.appendChild(document.createElement("br"));
+      words.appendChild(document.createTextNode(GENERATE_WARNING));
+      if (current) { bar.appendChild(progressBar("", current.pct)); }
+      return;
+    }
+    if (failed.length) {
+      strong.textContent = "Could not build " + plural(failed.length, "file", "files");
+      words.appendChild(document.createTextNode(": " + builds.failed[failed[0]]));
+      words.appendChild(document.createElement("br"));
+      words.appendChild(document.createTextNode("If you generate now, WanGP reports " +
+        (failed.length === 1 ? "it" : "them") + " as missing."));
+      line.appendChild(makeButton("Retry", "lb-btn", function () {
+        send({ type: "batch", actions: failed.map(function (key) { return { type: "build_retry", id: key }; }) });
+      }));
+      return;
+    }
+    strong.textContent = plural(builds.waiting, "file is", "files are") + " not built yet";
+    words.appendChild(document.createElement("br"));
+    words.appendChild(document.createTextNode("If you generate now, WanGP reports " +
+      (builds.waiting === 1 ? "it" : "them") + " as missing."));
+  }
+
+  function buildSignature(status) {
+    var failures = status.failures !== undefined ? status.failures : Object.keys(status.failed || {}).length;
+    return [status.generation, failures, status.current ? status.current.key : ""].join("|");
+  }
+
+  function pollBuildsSoon(delay) {
+    clearTimeout(S.buildTimer);
+    S.buildTimer = null;
+    var builds = S.builds;
+    if (!builds || !builds.running || !builds.waiting) { return; }
+    S.buildTimer = setTimeout(pollBuilds, delay || 900);
+  }
+
+  /* Progress is read on the media channel; only a change in what is built
+     asks for a payload, which is what redraws the rows. */
+  function pollBuilds() {
+    S.buildTimer = null;
+    if (!S.ready || !el.rows || !document.body.contains(el.rows)) { return; }
+    requestMedia({ kind: "builds" }, function (reply) {
+      if (!S.builds) { return; }
+      if (!reply || reply.kind !== "builds" || reply.error) { pollBuildsSoon(3000); return; }
+      if (!reply.running || buildSignature(reply) !== buildSignature(S.builds)) {
+        // A sync in flight brings a fresh payload of its own.
+        if (!S.inFlight) { send({ type: "ready" }); }
+        pollBuildsSoon(3000);                        // in case no payload comes
+        return;
+      }
+      paintBuildProgress(reply);
+      pollBuildsSoon();
+    }, 5000);
+  }
+
+  function paintBuildProgress(live) {
+    paintBuildBar(live);
+    var current = live.current;
+    if (!current || !el.rows) { return; }
+    var pct = (current.pct || 0) + "%";
+    el.rows.querySelectorAll('[data-build-pct="' + cssEscape(current.key) + '"]').forEach(function (node) {
+      node.textContent = pct;
+    });
+    el.rows.querySelectorAll('[data-build-bar="' + cssEscape(current.key) + '"]').forEach(function (node) {
+      node.style.width = pct;
+    });
+  }
+
   /* ------------------------------------------------------ context menu */
 
   function openMenu(x, y, items) {
@@ -3182,7 +4536,9 @@
     S.phases = payload.phases || { capacity: 1, effective: 1 };
     S.phaseLabels = payload.phase_labels || ["Strength"];
     S.items = payload.items || [];
+    var previousRows = S.rows || [];
     S.rows = payload.active || [];
+    carryRowState(previousRows, S.rows);
     S.profiles = payload.profiles || [];
     S.profilesIncomplete = payload.profiles_incomplete || [];
     S.activeProfile = payload.active_profile || "";
@@ -3207,6 +4563,12 @@
     S.civitaiKeySet = !!payload.civitai_key_set;
     if (payload.sort_mode) { S.sortMode = payload.sort_mode; }
     if (payload.name_mode) { S.nameMode = payload.name_mode; }
+    // The view is the panel's own from here on: a payload overtaken by a click
+    // on List or Cards must not flip it back.
+    if (!S.ready && payload.stack_view) { S.view = payload.stack_view === "cards" ? "cards" : "list"; }
+    S.avSupported = !!payload.av_supported;
+    S.builds = payload.builds || null;
+    S.built = payload.built || { count: 0, bytes: 0 };
 
     if (previousModel && previousModel !== S.modelKey) {
       // The model changed: previews and per-LoRA UI state no longer apply.
@@ -3218,8 +4580,11 @@
       S.scheduleOpenById = {};
       S.selectedRegionByKey = {};
       S.playingTile = null;
+      S.openRow = "";
+      S.selected = {};
       closeInspect();
       closeScheduleModal();
+      closeDialog();
     }
 
     S.byId = {};
@@ -3251,6 +4616,10 @@
     // value-only payload would take focus out of a field being typed into.
     renderRows();
     paintScheduleModal();
+    paintBulk();
+    paintBuildBar();
+    paintBuiltLink();
+    pollBuildsSoon();
     setStatus(payload.status || "Synced to WanGP state", !!payload.status_warn);
     maybeApplyDefaultProfile();
 
@@ -3265,14 +4634,26 @@
   }
 
   function renderHeader() {
-    // A switched-off LoRA is listed but not applied, so it is not "active".
-    var activeCount = S.rows.filter(isOn).length;
-    var offCount = S.rows.length - activeCount;
+    // A switched-off LoRA is listed but not applied, so it is not "active";
+    // a group's row counts each LoRA in it.
+    var loras = function (row) { return row.kind === "group" ? (row.members || []).length || 1 : 1; };
+    var activeCount = 0;
+    var offCount = 0;
+    S.rows.forEach(function (row) {
+      if (isOn(row)) { activeCount += loras(row); } else { offCount += loras(row); }
+    });
     el.count.textContent = activeCount === 1 ? "1 active" : activeCount + " active";
     el.phase.textContent = S.phases.effective > 1 ? S.phases.effective + " phases" : "One phase";
     el.activeTitle.textContent = "Active LoRAs (" + activeCount + ")" + (offCount ? " \u00B7 " + offCount + " off" : "");
     el.disableAll.disabled = !S.canDisableAll;
     el.enableAll.disabled = !S.canEnableAll;
+    el.viewSwitch.querySelectorAll("button").forEach(function (button) {
+      button.setAttribute("aria-checked", button.dataset.view === S.view ? "true" : "false");
+    });
+    el.select.setAttribute("aria-pressed", S.selecting ? "true" : "false");
+    el.select.classList.toggle("lb-on", S.selecting);
+    el.select.disabled = !S.rows.length && !S.selecting;
+    el.av.hidden = !S.avSupported;
     paintCollapseAll();
     paintPaste();
 

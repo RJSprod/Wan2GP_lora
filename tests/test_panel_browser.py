@@ -131,9 +131,13 @@ def _asset(name):
 
 
 class _Host:
-    """The plugin plus the native state a browser session mutates."""
+    """The plugin plus the native state a browser session mutates.
 
-    def __init__(self, tmp_path):
+    The active LoRAs start in Cards, where every row's editor is open, which
+    is what most of these tests drive; the list view's tests ask for "list".
+    """
+
+    def __init__(self, tmp_path, view="cards", state=None):
         module = bridge._load_plugin_module()
         self.plugin = module.LoraBrowserPlugin()
         self.plugin.server_config_filename = str(tmp_path / "wgp_config.json")
@@ -141,6 +145,8 @@ class _Host:
         self.plugin.get_model_def = lambda model_type: MODEL_DEF
         self.plugin.get_lora_dir = lambda model_type: str(tmp_path / "loras")
         self.plugin._init_stores()
+        self.plugin._metadata.set_stack_view(view)
+        self.state = state or STATE
         self.selected = list(START["selected"])
         self.multipliers = START["multipliers"]
         self.steps = STEPS
@@ -151,13 +157,13 @@ class _Host:
 
     def payload(self):
         return self.plugin._build_payload(
-            self.plugin._instance(INSTANCE), STATE, self.selected, self.multipliers,
+            self.plugin._instance(INSTANCE), self.state, self.selected, self.multipliers,
             self.guidance, self.steps,
         )
 
     def act(self, action_json):
         choices, mults, text = self.plugin._apply_action(
-            self.plugin._instance(INSTANCE), action_json, STATE, self.selected,
+            self.plugin._instance(INSTANCE), action_json, self.state, self.selected,
             self.multipliers, self.guidance, self.steps,
         )
         if isinstance(choices, dict) and "value" in choices:
@@ -167,7 +173,7 @@ class _Host:
         return text
 
     def media(self, request_json):
-        return self.plugin._serve_media(self.plugin._instance(INSTANCE), request_json, STATE)
+        return self.plugin._serve_media(self.plugin._instance(INSTANCE), request_json, self.state)
 
 
 def _serve(host):
@@ -269,7 +275,7 @@ def _open_panel(browser, host):
     page.on("dialog", lambda dialog: dialog.accept())
     try:
         page.goto(url)
-        page.wait_for_selector(".lb-row", timeout=15000)
+        page.wait_for_selector(".lb-row, .lb-li", timeout=15000)
         page.wait_for_timeout(400)
         yield page, host, problems
     finally:
@@ -1420,14 +1426,17 @@ def pictures_panel(chromium, tmp_path_factory):
 
 
 def row_cells(page):
-    """Each row's picture cell and where the rest of the row starts."""
+    """Each row's picture cell and where the rest of the row starts. ``inner``
+    is the row's height above the band its editor adds under the picture."""
     return {cell["id"]: cell for cell in page.evaluate("""() =>
         [...document.querySelectorAll('.lb-row')].map(row => {
           const cell = row.firstElementChild;
           const box = cell.getBoundingClientRect();
+          const band = row.querySelector(':scope > .lb-row-extra');
           return {
             id: row.dataset.id, first: cell.className, width: box.width, height: box.height,
-            inner: row.clientHeight, main: row.querySelector('.lb-row-main').getBoundingClientRect().left,
+            inner: row.clientHeight - (band ? band.offsetHeight : 0),
+            main: row.querySelector('.lb-row-main').getBoundingClientRect().left,
             image: !!cell.querySelector('img.lb-thumb'),
             placeholder: !!cell.querySelector('.lb-placeholder'),
             play: !!cell.querySelector('.lb-play'),
@@ -1542,3 +1551,269 @@ class TestRowPictures:
         settle(page, 300)
         assert cell.locator("video").count() == 0
         assert cell.locator(".lb-placeholder").count() == 1
+
+
+# ------------------------------------------- list view, modes, groups, bakes
+
+from . import test_av_bridge as av  # noqa: E402
+
+#: Real (tiny) LTX-2 LoRAs: one changes picture and sound, one only the
+#: picture, one only the sound, and one runs a schedule in phase 1.
+AV_LORAS = {
+    "both.safetensors": (["attn1.to_q", "audio_attn1.to_q", "video_to_audio_attn.to_k"], 4),
+    "picture.safetensors": (["attn1.to_q", "ff.net.2"], 8),
+    "sound.safetensors": (["audio_attn1.to_q"], 2),
+    "sched.safetensors": (["attn1.to_q", "audio_ff.net.2"], 4),
+}
+AV_SELECTED = list(AV_LORAS)
+AV_MULTIPLIERS = "0.8;0.5 0.6;0.6 0.7;0.7 1,1,0.875,0.875,0.25,0.25,0,0;0"
+
+
+@pytest.fixture(scope="module")
+def av_panel(chromium, tmp_path_factory):
+    """LTX-2.3 Distilled in Two Phases, in the list view, on real LoRA files.
+    Builds wait in the queue until a test runs them."""
+    root = tmp_path_factory.mktemp("browser-av")
+    loras = root / "loras"
+    loras.mkdir()
+    for seed, (name, (modules, rank)) in enumerate(AV_LORAS.items(), 1):
+        av._write(loras / name, modules, rank, seed)
+    with pytest.MonkeyPatch.context() as patch:
+        # Built files go under the plugin's folder: a temporary one here.
+        patch.setattr(bridge.plugin_module, "PLUGIN_DIR", str(root / "plugin"))
+        state = {"model_type": "ltx2_22B_distilled", "loras": list(AV_LORAS)}
+        host = _Host(root, view="list", state=state)
+        host.plugin.get_model_def = lambda model_type: LTX_MODEL_DEF
+        host.plugin._builder = av.SyncBuilder()
+        host.steps, host.guidance = 8, 2
+        host.selected = list(AV_SELECTED)
+        host.multipliers = AV_MULTIPLIERS
+        with _open_panel(chromium, host) as opened:
+            yield opened
+
+
+def reset_av(page, host, multipliers=AV_MULTIPLIERS):
+    """Each test starts from the same stack, in the list, nothing open."""
+    host.plugin._builder.run_pending()
+    host.plugin._metadata.set_stack_view("list")
+    host.selected = list(AV_SELECTED)
+    host.multipliers = multipliers
+    page.reload()
+    page.wait_for_selector(".lb-li", timeout=15000)
+    settle(page, 400)
+
+
+def line(page, lora):
+    return page.locator(f'.lb-li[data-key="{lora}"]')
+
+
+def tokens_by_lora(host):
+    return dict(zip(host.selected, host.multipliers.split("\n")[0].split()))
+
+
+def wait_until_built(page, host):
+    host.plugin._builder.run_pending()
+    page.wait_for_selector(".lb-buildbar[hidden]", state="attached", timeout=8000)
+    settle(page, 300)
+
+
+class TestListView:
+    """The active LoRAs one line each; a line opens the full editor."""
+
+    def test_a_line_shows_each_phase_and_counts_scheduled_steps(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host)
+        assert page.locator(".lb-li").count() == 4
+        assert page.locator(".lb-row").count() == 0
+        assert "Phase 1 · 8 steps" in page.locator(".lb-li-head").inner_text()
+        assert line(page, "both.safetensors").locator(".lb-li-ph code").all_inner_texts() == ["0.8", "0.5"]
+
+        scheduled = line(page, "sched.safetensors")
+        assert scheduled.locator(".lb-li-ph code").all_inner_texts() == ["6 steps", "0"]
+        assert "steps 1–6 of 8" in scheduled.locator(".lb-li-ph").first.get_attribute("title")
+        # How many steps, never each step's strength.
+        assert "0.875" not in scheduled.inner_text() and "0.25" not in scheduled.inner_text()
+        assert problems == []
+
+    def test_only_one_line_is_open_at_a_time(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host)
+        line(page, "both.safetensors").locator(".lb-li-name").click()
+        settle(page, 300)
+        assert page.locator(".lb-li-editor .lb-row").count() == 1
+        assert page.locator('.lb-li-editor .lb-row[data-id="both.safetensors"]').count() == 1
+        assert line(page, "both.safetensors").locator(".lb-li-name").get_attribute("aria-expanded") == "true"
+
+        line(page, "picture.safetensors").locator(".lb-li-name").click()
+        settle(page, 300)
+        assert page.locator(".lb-li-editor .lb-row").count() == 1
+        assert page.locator('.lb-li-editor .lb-row[data-id="picture.safetensors"]').count() == 1
+
+        page.locator(".lb-li-editor button.lb-done").click()
+        settle(page, 300)
+        assert page.locator(".lb-li-editor").count() == 0
+        assert problems == []
+
+    def test_the_switch_on_a_line_does_not_open_it(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host)
+        line(page, "picture.safetensors").locator("button.lb-switch").click()
+        settle(page, 700)
+        assert "#lora_off" in host.multipliers and "picture.safetensors" in host.multipliers
+        assert page.locator(".lb-li-editor").count() == 0
+        assert "lb-li-off" in line(page, "picture.safetensors").get_attribute("class")
+        assert problems == []
+
+    def test_visual_only_builds_a_copy_and_warns_until_it_is_ready(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host)
+        line(page, "both.safetensors").locator(".lb-li-name").click()
+        settle(page, 300)
+        page.locator(".lb-li-editor .lb-seg-visual").click()
+        page.wait_for_selector(".lb-buildbar:not([hidden])", timeout=5000)
+        bar = page.locator(".lb-buildbar").inner_text()
+        assert "unexpected result" in bar and "missing" in bar
+        assert host.selected[0] == "_lora_browser/both.visual.safetensors"
+        assert "queued" in line(page, "both.safetensors").locator(".lb-mode-pill").inner_text()
+        # The same LoRA's editor stays open through the rename.
+        assert page.locator('.lb-li-editor .lb-seg-visual[aria-checked="true"]').count() == 1
+
+        wait_until_built(page, host)
+        assert line(page, "both.safetensors").locator(".lb-mode-pill").inner_text().strip() == "Visual only"
+        assert "exact copy of its picture tensors" in page.locator(".lb-li-editor .lb-load").inner_text()
+        assert problems == []
+
+    def test_every_lora_audio_only_switches_off_those_with_no_sound(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host)
+        page.locator('[data-lb="av"]').click()
+        page.locator(".lb-menu-portal button", has_text="audio only").click()
+        settle(page, 800)
+        assert "#lora_skip" in host.multipliers and "picture.audio.safetensors" in host.multipliers
+        picture = line(page, "picture.safetensors")
+        assert "lb-li-off" in picture.get_attribute("class")
+        assert "nothing to apply" in picture.locator(".lb-mode-pill").inner_text()
+
+        page.locator('[data-lb="av"]').click()
+        page.locator(".lb-menu-portal button", has_text="normal").click()
+        settle(page, 800)
+        assert host.selected == AV_SELECTED and host.multipliers == AV_MULTIPLIERS
+        assert page.locator(".lb-li.lb-li-off").count() == 0
+        assert problems == []
+
+    def test_grouping_lines_that_differ_asks_whose_settings_to_keep(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host)
+        page.locator('[data-lb="select"]').click()
+        line(page, "picture.safetensors").click()
+        line(page, "sound.safetensors").click()
+        assert "2 rows selected" in page.locator(".lb-bulk").inner_text()
+        page.locator(".lb-bulk button", has_text="Group").click()
+        page.wait_for_selector(".lb-dialog .lb-opt")
+        page.locator(".lb-dialog .lb-opt").nth(1).click()          # sound's 0.7;0.7
+        page.locator(".lb-dialog button.lb-primary").click()
+        settle(page, 800)
+
+        assert "#lora_group A picture.safetensors" in host.multipliers
+        assert "#lora_group A sound.safetensors" in host.multipliers
+        tokens = tokens_by_lora(host)
+        assert tokens["picture.safetensors"] == tokens["sound.safetensors"] == "0.7;0.7"
+        group = page.locator(".lb-li-group")
+        assert group.count() == 1 and group.locator(".lb-li-member").count() == 2
+        assert page.locator(".lb-li").count() == 5             # 3 lines + 2 members
+        assert problems == []
+
+    def test_a_group_bakes_at_its_highest_members_rank_and_unbakes(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host, "0.8;0.5 0.6;0.6 0.6;0.6 1,1,0.875,0.875,0.25,0.25,0,0;0"
+                             "\n#lora_group A picture.safetensors\n#lora_group A sound.safetensors")
+        page.locator(".lb-li-ghead .lb-li-name").click()
+        settle(page, 300)
+        page.locator(".lb-li-editor button", has_text="Bake to save memory").click()
+        page.wait_for_selector(".lb-dialog .lb-opt")
+        chosen = page.locator(".lb-dialog .lb-opt:has(input:checked)").inner_text()
+        # Picture's rank, not sound's 2 -- and exact here: they share no layer.
+        assert "rank 8" in chosen.lower() and "default" in chosen
+        page.locator(".lb-dialog button.lb-primary").click()
+        settle(page, 800)
+        assert any(value.startswith("_lora_browser/_bakes/") and value.endswith(".r8.safetensors")
+                   for value in host.selected)
+        assert "picture.safetensors" not in host.selected
+
+        wait_until_built(page, host)
+        assert page.locator(".lb-li-ghead .lb-bake-pill").inner_text().startswith("Baked r8")
+
+        page.locator(".lb-li-editor button", has_text="Unbake").click()
+        settle(page, 800)
+        assert "picture.safetensors" in host.selected and "sound.safetensors" in host.selected
+        assert page.locator(".lb-li-ghead .lb-bake-pill").count() == 0
+        assert problems == []
+
+    def test_built_files_lists_them_and_deletes_what_nothing_uses(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host)
+        line(page, "both.safetensors").locator(".lb-li-name").click()
+        page.locator(".lb-li-editor .lb-seg-visual").click()
+        settle(page, 600)
+        wait_until_built(page, host)
+        page.locator(".lb-li-editor .lb-seg-normal").click()
+        settle(page, 800)
+
+        link = page.locator('[data-lb="built"]')
+        assert link.is_visible() and link.inner_text().startswith("Built files:")
+        link.click()
+        page.wait_for_selector(".lb-dialog .lb-table")
+        table = page.locator(".lb-dialog .lb-table").inner_text()
+        assert "both.visual.safetensors" in table and "nothing" in table
+        page.locator(".lb-dialog button.lb-left").click()
+        page.wait_for_selector(".lb-dialog :text('Nothing is built')", timeout=5000)
+        page.locator(".lb-dialog button.lb-primary").click()
+        assert page.locator(".lb-dialog").count() == 0
+        settle(page, 800)
+        assert not page.locator('[data-lb="built"]').is_visible()
+        assert problems == []
+
+    def test_the_view_is_remembered(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host)
+        page.locator('[data-lb="viewsw"] button[data-view="cards"]').click()
+        settle(page, 700)
+        assert page.locator(".lb-row").count() == 4 and page.locator(".lb-li").count() == 0
+        assert host.plugin._metadata.stack_view == "cards"
+        page.reload()
+        page.wait_for_selector(".lb-row", timeout=15000)
+        settle(page, 300)
+        assert page.locator('[data-lb="viewsw"] button[data-view="cards"]').get_attribute("aria-checked") == "true"
+        assert problems == []
+
+    def test_the_list_fits_a_phone(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host)
+        page.set_viewport_size({"width": 390, "height": 900})
+        try:
+            settle(page, 400)
+            assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth + 1")
+            assert not page.locator(".lb-li-head").is_visible()
+            # Each phase carries its own label once the columns are gone.
+            label = page.evaluate("""() => getComputedStyle(
+                document.querySelector('.lb-li[data-key="both.safetensors"] .lb-li-ph'), '::before').content""")
+            assert "P1" in label
+        finally:
+            page.set_viewport_size({"width": 1100, "height": 1000})
+            settle(page, 300)
+        assert problems == []
+
+    def test_changing_side_keeps_the_editor_as_it_was(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host)
+        line(page, "sched.safetensors").locator(".lb-li-name").click()
+        settle(page, 300)
+        page.locator(".lb-li-editor button.lb-schedule-toggle").click()
+        settle(page, 700)
+        assert page.locator(".lb-li-editor .lb-timeline").count() == 1
+        # The file it loads is renamed; the row, and its open timeline, are not.
+        page.locator(".lb-li-editor .lb-seg-visual").click()
+        settle(page, 900)
+        assert host.selected[3] == "_lora_browser/sched.visual.safetensors"
+        assert page.locator(".lb-li-editor .lb-timeline").count() == 1
+        assert problems == []

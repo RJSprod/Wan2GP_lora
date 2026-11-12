@@ -409,12 +409,15 @@ class Stack:
     ``ids``/``tokens`` are what WanGP applies.  ``disabled`` are LoRAs switched
     off in the panel: kept with their multipliers, as comment lines in the
     multiplier text (``codec.DISABLED_MARK``), and applied by nothing.
+    ``groups`` are the LoRAs that move together, by letter, as the multiplier
+    text's ``#lora_group`` lines declare them (see ``stack_modes``).
     """
 
     ids: list[str] = field(default_factory=list)
     tokens: list[str] = field(default_factory=list)
     separator_index: int = -1
     disabled: list[codec.DisabledLora] = field(default_factory=list)
+    groups: dict[str, list[str]] = field(default_factory=dict)
 
     @classmethod
     def from_native(cls, selected, multipliers: str) -> "Stack":
@@ -432,7 +435,13 @@ class Stack:
             # selection is what runs, so it wins over the switched-off copy.
             if lora_id and lora_id not in seen:
                 seen.add(lora_id)
-                stack.disabled.append(codec.DisabledLora(id=lora_id, token=entry.token, at=entry.at))
+                stack.disabled.append(
+                    codec.DisabledLora(id=lora_id, token=entry.token, at=entry.at, skip=entry.skip)
+                )
+        stack.groups = {
+            letter: [normalize_id(value) for value in members if normalize_id(value)]
+            for letter, members in codec.parse_groups(multipliers).items()
+        }
         return stack
 
     def index_of(self, lora_id: str) -> int:
@@ -480,6 +489,9 @@ class Stack:
         if len(kept) == len(entries):
             return False
         self.set_user_entries(kept)
+        for members in self.groups.values():
+            if target in members:
+                members.remove(target)
         return True
 
     def disabled_entry(self, lora_id: str) -> codec.DisabledLora | None:
@@ -497,16 +509,33 @@ class Stack:
             entries.insert(max(0, min(int(entry.at), len(entries))), (entry.id, False, entry.token))
         return entries
 
-    def set_user_entries(self, entries: list[tuple[str, bool, str]]) -> None:
+    def set_user_entries(
+        self, entries: list[tuple[str, bool, str]], skipped: set[str] | None = None
+    ) -> None:
         """Write the user's side back: on ones into the selection, in order,
-        off ones as comment lines that remember their place."""
+        off ones as comment lines that remember their place.
+
+        ``skipped`` names the off ones switched off for having nothing to apply
+        in their mode; left out, an off LoRA keeps whichever it was.
+        """
+        if skipped is None:
+            skipped = self.skipped()
         keep = self.separator_index if self.separator_index >= 0 else 0
         self.ids = self.ids[:keep] + [lora_id for lora_id, on, _ in entries if on]
         self.tokens = self.tokens[:keep] + [token for _, on, token in entries if on]
         self.disabled = [
-            codec.DisabledLora(id=lora_id, token=token, at=index)
+            codec.DisabledLora(id=lora_id, token=token, at=index, skip=lora_id in skipped)
             for index, (lora_id, on, token) in enumerate(entries) if not on
         ]
+
+    def skipped(self) -> set[str]:
+        """Off because their mode leaves them nothing to apply."""
+        return {entry.id for entry in self.disabled if entry.skip}
+
+    def has_entry(self, lora_id: str) -> bool:
+        """Selected, or kept switched off."""
+        target = normalize_id(lora_id)
+        return self.index_of(target) >= 0 or self.disabled_entry(target) is not None
 
     def set_enabled(self, lora_id: str, on: bool) -> bool:
         """Switch one of the user's LoRAs on or off, keeping its multiplier and
@@ -557,7 +586,29 @@ class Stack:
         for lora_id in self.ids:
             entry = inventory.get(lora_id) if inventory else None
             values.append(entry.native_value if entry else lora_id)
-        return values, codec.serialize(self.tokens, self.separator_index, self.disabled)
+        return values, codec.serialize(
+            self.tokens, self.separator_index, self.disabled, self.live_groups()
+        )
+
+    def live_groups(self) -> dict[str, list[str]]:
+        """The groups worth writing: those with two LoRAs still in the stack,
+        or a baked file in it.  A group a preset or a hand edit took apart
+        simply stops being written."""
+        from . import derived  # noqa: PLC0415 - pure module, avoids a cycle at import
+
+        live: dict[str, list[str]] = {}
+        for letter, members in self.groups.items():
+            bakes = [value for value in members if (derived.parse(value) or derived.Derived("", "")).kind == "bake"]
+            present_bake = [value for value in bakes if self.has_entry(value)]
+            if present_bake:
+                others = [value for value in members if value not in bakes]
+                if len(others) >= 2:
+                    live[letter] = others + present_bake[:1]
+                continue
+            present = [value for value in members if value not in bakes and self.has_entry(value)]
+            if len(present) >= 2:
+                live[letter] = present
+        return live
 
 
 def build_items(
@@ -568,28 +619,38 @@ def build_items(
     model_key: str = "",
     memory: dict[str, list[float]] | None = None,
     catalogue: dict[str, Any] | None = None,
+    aliases: dict[str, tuple[str, bool]] | None = None,
 ) -> list[dict[str, Any]]:
     """Browser tiles for everything WanGP can activate for this model.
 
     ``catalogue`` maps LoRA id -> CatalogueIndex, supplying the Civitai name and
     trigger words. Those travel with the payload so naming, search and sort all
     happen client-side with no round trip.
+
+    ``aliases`` maps an original's id to the id the stack holds it by and
+    whether it is on -- its visual-only copy, say, or the group bake it went
+    into -- so its tile still shows it in use.  The built files themselves,
+    under ``_lora_browser/``, are not tiles of their own.
     """
     memory = memory or {}
     catalogue = catalogue or {}
+    aliases = aliases or {}
     items = []
     off = {lora.id for lora in stack.disabled}
     for entry in inventory.entries:
-        position = stack.index_of(entry.id)
+        if entry.id.startswith("_lora_browser/"):
+            continue
+        native, alias_on = aliases.get(entry.id, (entry.id, None))
+        position = stack.index_of(native)
         index = catalogue.get(entry.id)
         item: dict[str, Any] = {
             "id": entry.id,
             "name": entry.name,
             "label": entry.label,
             "parent": entry.parent,
-            "active": position >= 0,
+            "active": bool(alias_on) if alias_on is not None else position >= 0,
             # In the stack, switched off: a tile click switches it back on.
-            "disabled": entry.id in off,
+            "disabled": (alias_on is False) if alias_on is not None else entry.id in off,
             "favorite": bool(metadata.is_favorite(model_key, entry.id)) if metadata else False,
             "tag": metadata.tag(model_key, entry.id) if metadata else "",
             "system_managed": stack.is_system(position),
@@ -659,6 +720,51 @@ def build_active_rows(
             row["summary"] = describe_token(token, phases)
         rows.append(row)
     return rows
+
+
+def phase_summary(raw: str, phases: PhaseConfig) -> list[dict[str, Any]]:
+    """What the list view shows per phase: a phase's value, or -- for a
+    scheduled phase -- how many steps it runs on, never every step's strength.
+
+    ``{"kind": "value", "value": v}`` / ``{"kind": "steps", "steps": n, "of":
+    m, "spans": [[first, last], ...], "shared": bool}`` per visible phase, or a
+    single ``{"kind": "raw"}`` for a multiplier the editor preserves as it is.
+    """
+    info = codec.classify(raw, phases.capacity)
+    if info.kind == codec.ADVANCED:
+        return [{"kind": "raw", "text": info.raw}]
+    if info.kind == codec.SIMPLE:
+        return [{"kind": "value", "value": round(value, VALUE_DECIMALS)} for value in info.values[: phases.effective]]
+    schedule = info.schedule
+    summary = []
+    for phase in range(max(1, phases.effective)):
+        values = schedule.values_for(phase) if schedule else []
+        if not values:
+            summary.append({"kind": "value", "value": 0})
+        elif all(value == values[0] for value in values):
+            summary.append({"kind": "value", "value": round(values[0], VALUE_DECIMALS)})
+        else:
+            summary.append({
+                "kind": "steps",
+                "steps": sum(1 for value in values if value != 0),
+                "of": len(values),
+                "spans": _active_spans(values),
+                "shared": bool(schedule.shared),
+            })
+    return summary
+
+
+def _active_spans(values: list[float]) -> list[list[int]]:
+    """The runs of steps a schedule is not zero on, 1-based and inclusive."""
+    spans: list[list[int]] = []
+    for index, value in enumerate(values, 1):
+        if value == 0:
+            continue
+        if spans and spans[-1][1] == index - 1:
+            spans[-1][1] = index
+        else:
+            spans.append([index, index])
+    return spans
 
 
 def multiplier_fields(
@@ -2228,5 +2334,5 @@ def stack_signature(selected, multipliers: str) -> str:
     ids = [normalize_id(value) for value in (selected or [])]
     tokens = codec.align_tokens(codec.parse_multipliers(multipliers).tokens, len(ids))
     return _SIGNATURE_SEP.join(ids) + _SIGNATURE_SEP + codec.serialize(
-        tokens, stack.separator_index, stack.disabled
+        tokens, stack.separator_index, stack.disabled, stack.groups
     )

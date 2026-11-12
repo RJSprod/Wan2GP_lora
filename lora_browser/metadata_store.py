@@ -41,6 +41,11 @@ DEFAULT_SORT = "name"
 NAME_MODES = ("civitai", "file")
 DEFAULT_NAME_MODE = "civitai"
 
+#: How the active LoRAs are shown: a read-only list, one row per LoRA, that
+#: opens one editor at a time, or every LoRA's editor open as cards.
+STACK_VIEWS = ("list", "cards")
+DEFAULT_STACK_VIEW = "list"
+
 
 def default_document() -> dict[str, Any]:
     return {
@@ -48,6 +53,7 @@ def default_document() -> dict[str, Any]:
         "zoom_px": DEFAULT_ZOOM_PX,
         "sort_mode": DEFAULT_SORT,
         "name_mode": DEFAULT_NAME_MODE,
+        "stack_view": DEFAULT_STACK_VIEW,
         "favorites": {},
         "tags": {},
         "profiles": {},
@@ -112,6 +118,9 @@ class MetadataStore:
         )
         document["name_mode"] = self.sanitize_choice(
             payload.get("name_mode"), NAME_MODES, DEFAULT_NAME_MODE
+        )
+        document["stack_view"] = self.sanitize_choice(
+            payload.get("stack_view"), STACK_VIEWS, DEFAULT_STACK_VIEW
         )
         document["civitai_api_key"] = str(payload.get("civitai_api_key", "") or "").strip()
         document["schema_version"] = SCHEMA_VERSION
@@ -187,6 +196,17 @@ class MetadataStore:
             self.data["name_mode"] = mode
             self.save()
         return mode
+
+    @property
+    def stack_view(self) -> str:
+        return self.sanitize_choice(self.data.get("stack_view"), STACK_VIEWS, DEFAULT_STACK_VIEW)
+
+    def set_stack_view(self, value: Any) -> str:
+        view = self.sanitize_choice(value, STACK_VIEWS, DEFAULT_STACK_VIEW)
+        if view != self.data.get("stack_view"):
+            self.data["stack_view"] = view
+            self.save()
+        return view
 
     @property
     def civitai_api_key(self) -> str:

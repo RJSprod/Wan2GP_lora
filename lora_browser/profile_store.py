@@ -11,6 +11,11 @@ only rule: a profile applies as far as the LoRAs in it are visible to the
 current model.  ``model_key`` is kept purely as provenance.
 
 Profiles never carry accelerator/system LoRAs, which WanGP manages on its own.
+
+Each LoRA is stored by its original's id, with the mode it runs in (normal,
+visual only, audio only) and the group it moves with; a profile names the
+groups that are baked, and at which rank.  Recalling it rebuilds whatever
+copy or bake the current folder lacks, from the originals.
 """
 
 from __future__ import annotations
@@ -31,6 +36,9 @@ MAX_NAME_LENGTH = 64
 _UNSAFE_NAME = re.compile(r"[\\/:*?\"<>|\x00-\x1f]")
 
 
+MODES = ("normal", "visual", "audio")
+
+
 @dataclass
 class ProfileEntry:
     id: str
@@ -38,14 +46,29 @@ class ProfileEntry:
     linked: bool = False
     #: False for a LoRA switched off in the panel: recalled in the stack, off.
     enabled: bool = True
+    #: ``normal``, ``visual`` or ``audio`` (LTX-2's visual-only/audio-only copies).
+    mode: str = "normal"
+    #: The letter of the group it moves with, or "".
+    group: str = ""
+    #: Off because its mode leaves it nothing to apply, rather than by hand.
+    skipped: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "id": self.id,
             "multiplier": self.multiplier,
             "linked": bool(self.linked),
             "enabled": bool(self.enabled),
         }
+        # Only what differs from a plain LoRA is written, so a profile saved
+        # without these features reads the same as it always did.
+        if self.mode != "normal":
+            payload["mode"] = self.mode
+        if self.group:
+            payload["group"] = self.group
+        if self.skipped:
+            payload["skipped"] = True
+        return payload
 
 
 @dataclass
@@ -54,13 +77,18 @@ class Profile:
     model_key: str = ""
     loras: list[ProfileEntry] = field(default_factory=list)
     note: str = ""
+    #: Group letter -> the rank it is baked at.
+    bakes: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "model_key": self.model_key,
             "loras": [entry.to_dict() for entry in self.loras],
             "note": self.note,
         }
+        if self.bakes:
+            payload["bakes"] = dict(self.bakes)
+        return payload
 
     @classmethod
     def from_dict(cls, name: str, payload: dict[str, Any]) -> "Profile":
@@ -79,14 +107,30 @@ class Profile:
                     # Profiles saved before LoRAs could be switched off had
                     # every one on.
                     enabled=bool(item.get("enabled", True)),
+                    mode=str(item.get("mode", "normal")) if item.get("mode") in MODES else "normal",
+                    group=_letter(item.get("group")),
+                    skipped=bool(item.get("skipped", False)),
                 )
             )
+        bakes = {}
+        for letter, rank in (payload.get("bakes") or {}).items() if isinstance(payload.get("bakes"), dict) else []:
+            try:
+                if _letter(letter) and int(rank) > 0:
+                    bakes[_letter(letter)] = int(rank)
+            except (TypeError, ValueError):
+                continue
         return cls(
             name=name,
             model_key=str(payload.get("model_key", "") or ""),
             loras=entries,
             note=str(payload.get("note", "") or ""),
+            bakes=bakes,
         )
+
+
+def _letter(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    return text if len(text) == 1 and "A" <= text <= "Z" else ""
 
 
 class ProfileError(Exception):
@@ -149,11 +193,14 @@ class ProfileStore:
     def exists(self, name: str) -> bool:
         return str(name or "") in self._profiles
 
-    def save(self, name: str, model_key: str, entries: list[ProfileEntry], overwrite: bool = False) -> Profile:
+    def save(
+        self, name: str, model_key: str, entries: list[ProfileEntry], overwrite: bool = False,
+        bakes: dict[str, int] | None = None,
+    ) -> Profile:
         clean = sanitize_name(name)
         if self.exists(clean) and not overwrite:
             raise ProfileError(f"A profile named '{clean}' already exists.")
-        profile = Profile(name=clean, model_key=model_key or "", loras=list(entries))
+        profile = Profile(name=clean, model_key=model_key or "", loras=list(entries), bakes=dict(bakes or {}))
         self._profiles[clean] = profile.to_dict()
         self.metadata.save()
         return profile
@@ -174,7 +221,7 @@ class ProfileStore:
         self._profiles.pop(str(name))
         self.metadata.save()
 
-    def match(self, entries: list[ProfileEntry]) -> str:
+    def match(self, entries: list[ProfileEntry], bakes: dict[str, int] | None = None) -> str:
         """Name of the profile that exactly equals the current stack, else "".
 
         Used so the dropdown never claims profile "X" is active once external
@@ -182,18 +229,19 @@ class ProfileStore:
         stack that is on screen is by definition available, so the model a
         matching profile was saved under is irrelevant here too.
         """
-        signature = _signature(entries)
+        signature = _signature(entries, bakes)
         for name in self._profiles:
             profile = self.get(name)
             if profile is None:
                 continue
-            if _signature(profile.loras) == signature:
+            if _signature(profile.loras, profile.bakes) == signature:
                 return name
         return ""
 
 
-def _signature(entries: list[ProfileEntry]) -> tuple:
+def _signature(entries: list[ProfileEntry], bakes: dict[str, int] | None = None) -> tuple:
     """Order matters: WanGP multiplier tokens are positional."""
     return tuple(
-        (entry.id, str(entry.multiplier).strip(), bool(entry.enabled)) for entry in entries
-    )
+        (entry.id, str(entry.multiplier).strip(), bool(entry.enabled), entry.mode, entry.group, entry.skipped)
+        for entry in entries
+    ) + (tuple(sorted((bakes or {}).items())),)

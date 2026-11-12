@@ -25,11 +25,16 @@ import gradio as gr
 
 from shared.utils.plugins import WAN2GPPlugin
 
+from .lora_browser import builder as bd
 from .lora_browser import catalogue as cat
 from .lora_browser import civitai
+from .lora_browser import derived as dv
+from .lora_browser import lora_files as lf
 from .lora_browser import schedule as sch
+from .lora_browser import stack_modes as sm
 from .lora_browser import stack_text
 from .lora_browser import ui_payloads as up
+from .lora_browser.stack_files import StackFiles
 from .lora_browser.inventory import build_inventory, diff_ids
 from .lora_browser.metadata_store import MetadataStore, resolve_store_path
 from .lora_browser.profile_store import ProfileEntry, ProfileError, ProfileStore
@@ -39,7 +44,7 @@ from .lora_browser.thumbnails import (
     ThumbnailCache,
     find_preview,
 )
-from .lora_browser.utils import is_within, normalize_id
+from .lora_browser.utils import display_name, is_within, normalize_id
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(PLUGIN_DIR, "assets")
@@ -146,6 +151,8 @@ class InstanceState:
         #: What the last pasted stack did, line by line, for the paste box --
         #: carried by the next payload only, the one answering the paste.
         self.paste_report: dict | None = None
+        #: LTX-2: the model's LoRAs have a picture side and a sound side.
+        self.sided = False
 
     def next_revision(self) -> int:
         self.revision += 1
@@ -179,6 +186,12 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         self._metadata: MetadataStore | None = None
         self._profiles: ProfileStore | None = None
         self._thumbnails: ThumbnailCache | None = None
+        #: One queue builds visual-only/audio-only copies and bakes for every
+        #: tab, one file at a time.
+        self._builder = bd.Builder()
+        #: LoRA folder -> its store of built files.
+        self._stores: dict[str, dv.Store] = {}
+        self._summaries = lf.SummaryCache()
 
     # ------------------------------------------------------------- setup
 
@@ -255,6 +268,16 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         if key not in self._instances:
             self._instances[key] = InstanceState()
         return self._instances[key]
+
+    def _store(self, lora_dir: str) -> dv.Store | None:
+        if not lora_dir:
+            return None
+        if lora_dir not in self._stores:
+            self._stores[lora_dir] = dv.Store(PLUGIN_DIR, lora_dir)
+        return self._stores[lora_dir]
+
+    def _stack_files(self, instance: InstanceState, inventory) -> StackFiles:
+        return StackFiles(self._store(instance.lora_dir), self._builder, self._summaries, inventory, instance.sided)
 
     # -------------------------------------------------- WanGP accessors
 
@@ -516,6 +539,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         instance.model_key = model_type
         instance.lora_dir = lora_dir
         instance.inventory_ids = inventory.ids
+        instance.sided = up.is_ltx2(model_def)
         up.remember_hidden_phases(stack, phases, instance.phase_memory)
         up.forget_superseded_phases(stack, instance.hidden_phases)
         # Bring the region editor back in line with the native tokens before
@@ -533,7 +557,12 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             )
             status, warn = instance.take_status()
 
-            entries = self._user_entries(stack, phases)
+            # Build whatever the stack selects and does not have yet: a copy
+            # starts the moment a setting needs it, however the setting came.
+            files = self._stack_files(instance, inventory)
+            files.ensure(stack)
+
+            entries, bakes = self._profile_entries(stack, files)
             signature = up.stack_signature(selected, multipliers)
 
             catalogue = self._catalogue_index(instance, inventory)
@@ -542,6 +571,10 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 inventory, stack, phases, instance.phase_memory, catalogue,
                 instance.schedules, context,
             )
+            rows = sm.fold_rows(rows, stack, lambda lora_id: files.describe(lora_id, catalogue))
+            rows = files.decorate(rows, stack, catalogue)
+            for row in rows:
+                row["phase_summary"] = up.phase_summary(row.get("multiplier_raw", "1"), phases)
             missing = [row for row in rows if row["missing"]]
             if missing and not status:
                 names = ", ".join(row["name"] for row in missing[:3])
@@ -558,19 +591,26 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 "phase_labels": up.phase_labels(phases.effective),
                 "items": up.build_items(
                     inventory, stack, phases, self._metadata, model_type,
-                    instance.phase_memory, catalogue,
+                    instance.phase_memory, catalogue, files.aliases(stack),
                 ),
                 "active": rows,
                 "profiles": complete + incomplete,
                 # Named so the dropdown can flag a profile this model can only
                 # apply in part -- it is still selectable.
                 "profiles_incomplete": incomplete,
-                "active_profile": self._profiles.match(entries) if self._profiles else "",
+                "active_profile": self._profiles.match(entries, bakes) if self._profiles else "",
                 "default_profile": self._metadata.default_profile(model_type) if self._metadata else "",
                 "civitai_key_set": bool(self._civitai_key()),
                 "zoom_px": self._metadata.zoom_px if self._metadata else 104,
                 "sort_mode": self._metadata.sort_mode if self._metadata else "name",
                 "name_mode": self._metadata.name_mode if self._metadata else "civitai",
+                "stack_view": self._metadata.stack_view if self._metadata else "list",
+                # Visual only / audio only: LTX-2 LoRAs have a picture side
+                # and a sound side, and a copy of one can be built.
+                "av_supported": files.sided and files.store is not None,
+                # What is building for this stack right now, if anything.
+                "builds": self._build_summary(files, stack),
+                "built": self._built_summary(files),
                 "slider_min": up.SLIDER_MIN,
                 "slider_max": up.SLIDER_MAX,
                 "slider_step": up.SLIDER_STEP,
@@ -603,7 +643,11 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 "can_enable_all": bool(stack.disabled),
                 # The LoRAs that run, as text the paste box reads back.
                 "stack_text": stack_text.format_stack(
-                    [(lora_id, token) for lora_id, on, token in stack.user_entries() if on], name_index
+                    [
+                        (entry.id, entry.multiplier, entry.mode, entry.group, bakes.get(entry.group, 0))
+                        for entry in entries if entry.enabled
+                    ],
+                    name_index,
                 ),
                 # Set only on the payload answering a pasted stack.
                 "paste_report": instance.take_paste_report(),
@@ -617,13 +661,78 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             # The frontend shows the native controls again when it sees this.
             return json.dumps({"error": f"LoRA Browser could not render: {error}"})
 
-    def _user_entries(self, stack: up.Stack, phases: up.PhaseConfig) -> list[ProfileEntry]:
+    def _profile_entries(self, stack: up.Stack, files: StackFiles) -> tuple[list[ProfileEntry], dict[str, int]]:
         """User-editable part of the stack, switched-off LoRAs included where
-        they sit -- accelerator LoRAs are excluded."""
-        return [
-            ProfileEntry(id=lora_id, multiplier=token, enabled=on)
-            for lora_id, on, token in stack.user_entries()
-        ]
+        they sit -- accelerator LoRAs are excluded -- each by its original's id
+        with its mode and group, and the rank each baked group is baked at.
+        A baked group is listed as its members, where the group sits."""
+        found = sm.groups(stack)
+        member_of = {member: group.letter for group in found.values() for member in group.members}
+        baked = {group.bake: group for group in found.values() if group.baked}
+        skipped = stack.skipped()
+        entries: list[ProfileEntry] = []
+        bakes: dict[str, int] = {}
+        for lora_id, on, token in stack.user_entries():
+            group = baked.get(lora_id)
+            members = group.members if group else [lora_id]
+            if group:
+                bakes[group.letter] = dv.parse(group.bake).rank
+            for member in members:
+                source, mode = files.source(member)
+                entries.append(ProfileEntry(
+                    id=source, multiplier=token, enabled=on, mode=mode,
+                    group=group.letter if group else member_of.get(member, ""),
+                    skipped=(not on) and lora_id in skipped,
+                ))
+        return entries, bakes
+
+    def _apply_entries(self, stack: up.Stack, files: StackFiles, entries: list[ProfileEntry],
+                       bakes: dict[str, int]) -> None:
+        """Rebuild the user side of the stack from profile-style entries:
+        modes as built copies, groups as group lines, bakes as baked files.
+        Anything not on disk yet is built by the next payload."""
+        native, skipped, groups = [], set(), {}
+        for entry in entries:
+            lora_id = dv.split_id(entry.id, entry.mode) if files.sided else entry.id
+            native.append((lora_id, entry.enabled, entry.multiplier))
+            if entry.skipped and not entry.enabled:
+                skipped.add(lora_id)
+            if entry.group:
+                groups.setdefault(entry.group, []).append(lora_id)
+        stack.set_user_entries(native, skipped)
+        stack.groups = {letter: members for letter, members in groups.items() if len(members) >= 2}
+        for letter, rank in bakes.items():
+            group = sm.groups(stack).get(letter)
+            if group is not None and not group.baked:
+                sm.bake(stack, letter, files.bake_id(group, rank))
+        sm.sync_tokens(stack)
+        sm.settle(stack, files.empty)
+
+    def _build_summary(self, files: StackFiles, stack: up.Stack) -> dict:
+        status = self._builder.status()
+        waiting = files.waiting(stack)
+        failed = {key: message for key, message in status["failed"].items() if key in waiting}
+        return {
+            "running": status["running"],
+            "current": status["current"],
+            "queued": len(status["queued"]),
+            "finished": status["finished"],
+            "waiting": len(waiting),
+            "failed": failed,
+            # Every failure, not only this stack's: the poll compares against it.
+            "failures": len(status["failed"]),
+            "generation": status["generation"],
+        }
+
+    def _built_summary(self, files: StackFiles) -> dict:
+        store = files.store
+        if store is None or not (os.path.isdir(store.root) or os.path.isdir(store.link)):
+            return {"count": 0, "bytes": 0}
+        try:
+            listed = store.files()
+        except OSError:
+            return {"count": 0, "bytes": 0}
+        return {"count": len(listed), "bytes": sum(item.get("bytes", 0) for item in listed)}
 
     # ----------------------------------------------------------- actions
 
@@ -643,6 +752,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 instance, state_value, selected, multipliers, *native
             )
             changed = self._dispatch(instance, action, stack, inventory, phases, model_type, context)
+            # Every member of a group carries its lead's multiplier.
+            changed = sm.sync_tokens(stack) or changed
 
             if not changed:
                 payload = self._build_payload(instance, state_value, selected, multipliers, *native)
@@ -677,6 +788,14 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
         if kind == "toggle":
             lora_id = normalize_id(action.get("id"))
+            # A LoRA in a mode, or baked into a group, is still its tile.
+            files = self._stack_files(instance, inventory)
+            alias = files.aliases(stack).get(lora_id)
+            if alias is not None and alias[0] != lora_id:
+                native, on = alias
+                if action.get("enabled"):
+                    return False if on else self._enable(instance, stack, files, native, True)
+                return self._remove(instance, stack, files, native)
             # Only LoRAs WanGP actually offers may be activated.
             if action.get("enabled"):
                 if stack.disabled_entry(lora_id) is not None:
@@ -689,12 +808,32 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             return stack.remove(lora_id)
 
         if kind == "remove":
-            return stack.remove(normalize_id(action.get("id")))
+            files = self._stack_files(instance, inventory)
+            letter = str(action.get("group", "") or "")
+            if letter:
+                return sm.remove_group(stack, letter)
+            return self._remove(instance, stack, files, normalize_id(action.get("id")))
 
         if kind == "set_enabled":
             # Off keeps the multiplier -- schedule and all -- where WanGP keeps
             # the rest of the stack, and applies none of it.
-            return stack.set_enabled(normalize_id(action.get("id")), bool(action.get("value")))
+            return self._enable(
+                instance, stack, self._stack_files(instance, inventory),
+                normalize_id(action.get("id")), bool(action.get("value")), str(action.get("group", "") or ""),
+            )
+
+        if kind in ("set_mode", "set_mode_all", "group_create", "group_add", "group_leave",
+                    "ungroup", "bake", "unbake"):
+            return self._mode_action(instance, action, stack, self._stack_files(instance, inventory))
+
+        if kind == "build_retry":
+            self._builder.retry(normalize_id(action.get("id")))
+            return False
+
+        if kind == "view":
+            if self._metadata:
+                self._metadata.set_stack_view(action.get("value"))
+            return False
 
         if kind == "set_strength":
             # Routes itself: a scheduled phase moves its schedule base, an
@@ -756,7 +895,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             return self._set_all_enabled(instance, stack, False)
 
         if kind == "enable_all":
-            return self._set_all_enabled(instance, stack, True)
+            return self._set_all_enabled(instance, stack, True, self._stack_files(instance, inventory))
 
         if kind == "stack_paste":
             return self._paste_stack(instance, action, stack, inventory, phases, context)
@@ -861,15 +1000,224 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
         return False
 
-    def _set_all_enabled(self, instance, stack, on: bool) -> bool:
+    def _set_all_enabled(self, instance, stack, on: bool, files: StackFiles | None = None) -> bool:
         """Every user LoRA on, or every one off -- each keeping its multiplier
-        and its place.  WanGP-managed LoRAs are not the user's to switch."""
+        and its place.  WanGP-managed LoRAs are not the user's to switch.
+
+        One its mode left nothing to apply comes back as Normal: switched on,
+        it has to apply something."""
+        reset = 0
+        if on and files is not None:
+            for lora_id in sorted(stack.skipped()):
+                group = sm.group_of(stack, lora_id)
+                for member in (group.members if group and group.bake == lora_id else [lora_id]):
+                    if files.empty(member) and self._rename_mode(instance, stack, files, member, sm.NORMAL):
+                        reset += 1
+            self._rebake_changed(stack, files)
         changed = stack.set_all_enabled(on)
         if not changed:
             instance.note("Every LoRA is already on." if on else "No LoRAs are on.")
             return False
-        instance.note(f"Switched {changed} LoRA(s) {'on' if on else 'off'}.")
+        note = f"Switched {changed} LoRA(s) {'on' if on else 'off'}."
+        if reset:
+            note += f" {reset} had nothing to apply in their mode, so they are back to normal."
+        instance.note(note)
         return True
+
+    # -------------------------------------------- modes, groups and bakes
+
+    def _migrate(self, instance: InstanceState, old: str, new: str) -> None:
+        """What the panel remembers about a LoRA follows it to its new id."""
+        for memory in (instance.phase_memory, instance.hidden_phases):
+            if old in memory:
+                memory[new] = memory.pop(old)
+        for key in [key for key in instance.schedules if key[0] == old]:
+            instance.schedules[(new, key[1])] = instance.schedules.pop(key)
+
+    def _rename_mode(self, instance, stack, files: StackFiles, lora_id: str, mode: str) -> str:
+        new_id = sm.set_mode(stack, lora_id, mode, files.known)
+        if new_id:
+            self._migrate(instance, normalize_id(lora_id), new_id)
+        return new_id
+
+    @staticmethod
+    def _rebake_changed(stack, files: StackFiles) -> None:
+        """A baked group whose members now bring something else points at the
+        bake of what they bring now -- built by the next payload, or already
+        on disk if it was baked that way before."""
+        for group in sm.groups(stack).values():
+            if group.baked:
+                wanted = files.bake_id(group, dv.parse(group.bake).rank)
+                if wanted != group.bake:
+                    sm.rebake(stack, group.letter, wanted)
+
+    def _enable(self, instance, stack, files: StackFiles, lora_id: str, on: bool, letter: str = "") -> bool:
+        if letter:
+            group = sm.groups(stack).get(letter)
+            if group is None:
+                return False
+            if on and all(files.empty(member) for member in group.members):
+                for member in list(group.members):
+                    self._rename_mode(instance, stack, files, member, sm.NORMAL)
+                self._rebake_changed(stack, files)
+                instance.note(f"Group {letter} is on again and back to normal, since its mode left it nothing to apply.")
+            changed = sm.set_group_enabled(stack, letter, on)
+            sm.settle(stack, files.empty)
+            return changed
+        if on and files.empty(lora_id):
+            source, mode = files.source(lora_id)
+            new_id = self._rename_mode(instance, stack, files, lora_id, sm.NORMAL)
+            if new_id:
+                lora_id = new_id
+                instance.note(f"{display_name(source)} is on again and back to normal, since {mode} only left it nothing to apply.")
+        return stack.set_enabled(lora_id, on)
+
+    def _remove(self, instance, stack, files: StackFiles, lora_id: str) -> bool:
+        group = sm.group_of(stack, lora_id)
+        if group is not None:
+            if lora_id == group.bake:
+                return sm.remove_group(stack, group.letter)
+            sm.leave_group(stack, group.letter, lora_id)
+            self._rebake_changed(stack, files)
+        return stack.remove(lora_id)
+
+    def _mode_action(self, instance, action, stack, files: StackFiles) -> bool:
+        kind = action["type"]
+        letter = str(action.get("group", "") or "").upper()
+        name = lambda lora_id: display_name(files.source(lora_id)[0])  # noqa: E731
+
+        if kind in ("set_mode", "set_mode_all"):
+            mode = str(action.get("mode", ""))
+            if mode not in sm.MODES:
+                return False
+            if not files.sided:
+                instance.note("Visual only and audio only are for LTX-2 models, whose LoRAs change picture and sound separately.", True)
+                return False
+            if files.store is None:
+                instance.note("This model has no LoRA folder to build copies in.", True)
+                return False
+            if kind == "set_mode":
+                targets = [normalize_id(action.get("id"))]
+            else:
+                targets = self._mode_targets(stack, action.get("ids"))
+            renamed = [new_id for new_id in (self._rename_mode(instance, stack, files, lora_id, mode) for lora_id in targets) if new_id]
+            if not renamed:
+                instance.note("Nothing to change." if kind == "set_mode_all" else "")
+                return False
+            self._rebake_changed(stack, files)
+            moved = sm.settle(stack, files.empty)
+            instance.note(self._mode_note(files, renamed, mode, moved))
+            return True
+
+        if kind == "group_create":
+            ids = [normalize_id(value) for value in (action.get("ids") or [])]
+            made = sm.create_group(stack, ids, normalize_id(action.get("lead")))
+            if not made:
+                instance.note("Pick two or more LoRAs that are not in a group yet.", True)
+                return False
+            sm.sync_tokens(stack)
+            sm.settle(stack, files.empty)
+            members = sm.groups(stack)[made].members
+            instance.note(f"Grouped {', '.join(name(member) for member in members)} as Group {made}. "
+                          "They share one strength and schedule now; nothing was built.")
+            return True
+
+        if kind == "group_add":
+            lora_id = normalize_id(action.get("id"))
+            if not sm.add_to_group(stack, letter, lora_id):
+                return False
+            self._rebake_changed(stack, files)
+            sm.sync_tokens(stack)
+            sm.settle(stack, files.empty)
+            instance.note(f"{name(lora_id)} joined Group {letter} and takes its strength and schedule.")
+            return True
+
+        if kind == "group_leave":
+            lora_id = normalize_id(action.get("id"))
+            if not sm.leave_group(stack, letter, lora_id):
+                return False
+            self._rebake_changed(stack, files)
+            sm.settle(stack, files.empty)
+            instance.note(f"{name(lora_id)} left Group {letter} and keeps its strength and schedule.")
+            return True
+
+        if kind == "ungroup":
+            if not sm.ungroup(stack, letter):
+                return False
+            sm.settle(stack, files.empty)
+            instance.note(f"Group {letter} is separate LoRAs again; each keeps the group's strength and schedule.")
+            return True
+
+        if kind == "bake":
+            group = sm.groups(stack).get(letter)
+            if group is None or files.store is None:
+                return False
+            try:
+                rank = int(action.get("rank") or files.default_rank(group) or 0)
+            except (TypeError, ValueError):
+                rank = 0
+            if rank < 1:
+                instance.note("Choose a rank to bake at.", True)
+                return False
+            bake_id = files.bake_id(group, rank)
+            changed = sm.rebake(stack, letter, bake_id) if group.baked else sm.bake(stack, letter, bake_id)
+            if changed:
+                instance.note(f"Baking Group {letter} at rank {rank}. Until it is built, WanGP reports the baked file "
+                              "as missing if you generate.")
+            return changed
+
+        if kind == "unbake":
+            if not sm.unbake(stack, letter):
+                return False
+            sm.settle(stack, files.empty)
+            instance.note(f"Group {letter} is unbaked; WanGP loads its LoRAs separately again. "
+                          "The baked file stays under Built files until you delete it.")
+            return True
+        return False
+
+    @staticmethod
+    def _mode_targets(stack, ids) -> list[str]:
+        """The LoRAs a bulk change reaches: those named -- a group's row names
+        every member -- or, with none named, every user LoRA."""
+        found = sm.groups(stack)
+        if ids:
+            wanted, targets = [normalize_id(value) for value in ids], []
+            for lora_id in wanted:
+                group = next((g for g in found.values() if lora_id in g.members or lora_id == g.bake), None)
+                for member in (group.members if group else [lora_id]):
+                    if member not in targets:
+                        targets.append(member)
+            return targets
+        targets = []
+        for lora_id, _, _ in stack.user_entries():
+            group = next((g for g in found.values() if g.bake == lora_id), None)
+            targets.extend(group.members if group else [lora_id])
+        return targets
+
+    @staticmethod
+    def _mode_note(files: StackFiles, renamed: list[str], mode: str, moved: dict) -> str:
+        names = [display_name(files.source(lora_id)[0]) for lora_id in renamed]
+        label = "normal" if mode == sm.NORMAL else f"{mode} only"
+        if len(renamed) == 1:
+            if renamed[0] in moved["off"]:
+                other = "picture" if mode == sm.AUDIO else "sound"
+                back = "Visual" if mode == sm.AUDIO else "Audio"
+                return f"{names[0]} only changes the {other}, so {label} switches it off. Normal or {back} only switches it back on."
+            message = f"{names[0]} is back to normal." if mode == sm.NORMAL else f"{names[0]}: {label}."
+        else:
+            message = f"{len(renamed)} LoRAs set to {label}."
+            if moved["off"]:
+                other = "picture" if mode == sm.AUDIO else "sound"
+                message += f" Switched off {len(moved['off'])} that only change the {other}."
+        if moved["on"]:
+            message += f" Switched {len(moved['on'])} back on."
+        waiting = [
+            lora_id for lora_id in renamed
+            if not files.empty(lora_id) and files.state(lora_id)["state"] in ("pending", "queued", "building")
+        ]
+        if waiting:
+            message += f" Building {len(waiting)} {'copy' if len(waiting) == 1 else 'copies'}."
+        return message
 
     # ----------------------------------------------------- pasted stacks
 
@@ -906,7 +1254,12 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             inventory, self._civitai_names(self._catalogue_index(instance, inventory))
         )
         managed = {lora_id for position, lora_id in enumerate(stack.ids) if stack.is_system(position)}
+        files = self._stack_files(instance, inventory)
         entries, problems, first_line = [], [], {}
+        groups: dict[str, list[str]] = {}
+        group_token: dict[str, tuple[str, int]] = {}
+        bakes: dict[str, int] = {}
+        ignored_modes = 0
         for line in lines:
             lora_id, candidates = names.resolve(line.name)
             token = line.token or up.codec.default_token(phases.capacity)
@@ -921,11 +1274,25 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 reason = f"{names.label(lora_id)} is already on line {first_line[lora_id]}"
             else:
                 reason = stack_text.token_problem(token) or self._paste_phase_problem(token, phases)
+            if not reason and line.group and line.group in group_token and group_token[line.group][0] != token:
+                reason = (f"group {line.group} moves as one, so its lines share one multiplier; "
+                          f"line {group_token[line.group][1]} gives x{group_token[line.group][0]}")
             if reason:
                 problems.append(stack_text.LineProblem(line.number, line.text, reason))
                 continue
             first_line[lora_id] = line.number
-            entries.append((lora_id, True, token))
+            native = lora_id
+            if line.mode in (sm.VISUAL, sm.AUDIO):
+                if files.sided:
+                    native = dv.split_id(lora_id, line.mode)
+                else:
+                    ignored_modes += 1
+            if line.group:
+                group_token.setdefault(line.group, (token, line.number))
+                groups.setdefault(line.group, []).append(native)
+                if line.baked:
+                    bakes[line.group] = max(bakes.get(line.group, 0), line.baked)
+            entries.append((native, True, token))
 
         report["problems"] = [problem.to_dict() for problem in problems]
         if not entries:
@@ -945,7 +1312,13 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             instance.hidden_phases.pop(lora_id, None)
             for key in [key for key in instance.schedules if key[0] == lora_id]:
                 del instance.schedules[key]
-        stack.set_user_entries(entries)
+        stack.set_user_entries(entries, set())
+        stack.groups = {letter: members for letter, members in groups.items() if len(members) >= 2}
+        for letter, rank in bakes.items():
+            group = sm.groups(stack).get(letter)
+            if group is not None:
+                sm.bake(stack, letter, files.bake_id(group, rank))
+        sm.settle(stack, files.empty)
 
         unrun = sum(1 for _, _, token in entries if stack_text.phase_count(token) > phases.effective)
         pasted = {lora_id for lora_id, _, _ in entries}
@@ -960,6 +1333,14 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         notes = []
         if unrun:
             notes.append(self._unrun_note(unrun, phases))
+        if ignored_modes:
+            notes.append(
+                f"{ignored_modes} line{'s' if ignored_modes != 1 else ''} asked for visual or audio only, "
+                "which only LTX-2 models have; loaded as normal."
+            )
+        lonely = [letter for letter, members in groups.items() if len(members) < 2]
+        if lonely:
+            notes.append(f"Group {', '.join(lonely)} has one LoRA, so it is not a group.")
         carried = sum(1 for lora_id in entering if lora_id in pasted)
         if carried:
             notes.append(
@@ -1007,7 +1388,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
     def _stack_snapshot(stack: up.Stack) -> tuple:
         return (
             tuple(stack.ids), tuple(stack.tokens), stack.separator_index,
-            tuple((entry.id, entry.token, entry.at) for entry in stack.disabled),
+            tuple((entry.id, entry.token, entry.at, entry.skip) for entry in stack.disabled),
+            tuple(sorted((letter, tuple(members)) for letter, members in stack.groups.items())),
         )
 
     # ---------------------------------------------------------- profiles
@@ -1020,12 +1402,23 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
         try:
             if kind in ("profile_save", "profile_update"):
-                entries = self._user_entries(stack, phases)
+                entries, bakes = self._profile_entries(stack, self._stack_files(instance, inventory))
                 if not entries:
                     instance.note("Select at least one LoRA before saving a profile.", True)
                     return False
-                saved = self._profiles.save(name, model_type, entries, overwrite=(kind == "profile_update"))
-                instance.note(f"Profile '{saved.name}' saved.")
+                saved = self._profiles.save(
+                    name, model_type, entries, overwrite=(kind == "profile_update"), bakes=bakes
+                )
+                extras = []
+                modes = sum(1 for entry in entries if entry.mode != "normal")
+                if modes:
+                    extras.append(f"{modes} visual or audio only")
+                letters = {entry.group for entry in entries if entry.group}
+                if letters:
+                    extras.append(f"{len(letters)} group{'s' if len(letters) != 1 else ''}")
+                if bakes:
+                    extras.append(f"{len(bakes)} baked")
+                instance.note(f"Profile '{saved.name}' saved" + (f" ({', '.join(extras)})." if extras else "."))
                 return False
 
             if kind == "profile_rename":
@@ -1094,8 +1487,12 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
         # WanGP-managed LoRAs (left of the accelerator bar) are preserved; a
         # profile only ever replaces the user side of the stack, switched-off
-        # LoRAs included.
-        stack.set_user_entries([(entry.id, entry.enabled, entry.multiplier) for entry in applied])
+        # LoRAs included -- with their modes, groups and bakes, any copy or
+        # bake this folder lacks being built by the next payload.
+        files = self._stack_files(instance, inventory)
+        present = {entry.group for entry in applied if entry.group}
+        bakes = {letter: rank for letter, rank in profile.bakes.items() if letter in present}
+        self._apply_entries(stack, files, applied, bakes)
 
         if missing:
             instance.note(
@@ -1142,6 +1539,12 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 reply = self._serve_catalogue_media(instance, request, state_value)
             elif kind == "video":
                 reply = self._serve_preview_video(instance, request, state_value)
+            elif kind == "builds":
+                reply = {"kind": "builds", **self._builder.status()}
+            elif kind == "built":
+                reply = self._serve_built(instance, request, state_value)
+            elif kind == "bake_plan":
+                reply = self._serve_bake_plan(instance, request, state_value)
             else:
                 reply = self._serve_thumbnails(instance, request, state_value)
         except Exception as error:
@@ -1149,6 +1552,80 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             reply = {"kind": kind, "error": str(error)}
         reply["seq"] = request.get("seq")
         return json.dumps(reply)
+
+    def _request_files(self, instance: InstanceState, state_value) -> StackFiles:
+        model_type = self._model_type(state_value)
+        lora_dir = self._lora_dir(model_type)
+        inventory = build_inventory(self._native_loras(state_value, []), lora_dir)
+        instance.lora_dir = lora_dir
+        instance.sided = up.is_ltx2(self._model_def(model_type))
+        return self._stack_files(instance, inventory)
+
+    def _profile_references(self, files: StackFiles) -> dict[str, list[str]]:
+        """Built file id -> the profiles that use it."""
+        used: dict[str, list[str]] = {}
+        if not self._profiles:
+            return used
+        for name in self._profiles.names():
+            profile = self._profiles.get(name)
+            if profile is None:
+                continue
+            stack = up.Stack()
+            self._apply_entries(stack, files, profile.loras, profile.bakes)
+            for lora_id, _, _ in stack.user_entries():
+                if dv.parse(lora_id) is not None:
+                    used.setdefault(lora_id, []).append(name)
+        return used
+
+    def _serve_built(self, instance, request, state_value) -> dict:
+        """The built files for this model's LoRA folder, what uses each, and
+        deleting the ones nothing uses.
+
+        The frontend says which built files its stack uses -- it is the one
+        that knows the stack -- and the profiles are read here.
+        """
+        files = self._request_files(instance, state_value)
+        store = files.store
+        if store is None:
+            return {"kind": "built", "files": [], "error": "This model has no LoRA folder."}
+        in_stack = {normalize_id(value) for value in (request.get("in_use") or []) if dv.parse(value)}
+        used = self._profile_references(files)
+        listed = store.files() if (os.path.isdir(store.root) or os.path.isdir(store.link)) else []
+        unused = [item["id"] for item in listed if item["id"] not in in_stack and item["id"] not in used]
+        if request.get("action") == "delete_unused":
+            removed = store.delete(unused)
+            instance.note(f"Deleted {removed} unused built file{'s' if removed != 1 else ''}.")
+            listed = store.files()
+            unused = []
+        rows = []
+        for item in listed:
+            users = (["this stack"] if item["id"] in in_stack else []) + used.get(item["id"], [])
+            rows.append({
+                "id": item["id"], "bytes": item.get("bytes", 0), "kind": item.get("kind", ""),
+                "mode": item.get("mode", ""), "rank": item.get("rank", 0), "kept": item.get("kept"),
+                "exact": item.get("exact"), "label": item.get("label", ""), "linked": bool(item.get("linked")),
+                "members": [member.get("name", "") for member in item.get("members", []) or []],
+                "used_by": users,
+            })
+        folder = os.path.relpath(store.root, os.path.dirname(PLUGIN_DIR)).replace("\\", "/")
+        return {
+            "kind": "built", "files": rows, "unused": len(unused), "folder": folder,
+            "link": f"{dv.LINK_NAME}/", "linked": store.linked if listed else True,
+        }
+
+    def _serve_bake_plan(self, instance, request, state_value) -> dict:
+        """Sizes for the bake dialog, from the members' headers only."""
+        files = self._request_files(instance, state_value)
+        members = [normalize_id(value) for value in (request.get("members") or []) if normalize_id(value)]
+        if len(members) < 2:
+            return {"kind": "bake_plan", "error": "A bake needs at least two LoRAs."}
+        stack = up.Stack()
+        stack.set_user_entries([(member, True, "1") for member in members], set())
+        stack.groups = {"A": list(members)}
+        reply = files.bake_options(stack, "A")
+        reply["kind"] = "bake_plan"
+        reply["group"] = str(request.get("group", "") or "")
+        return reply
 
     def _entry_for(self, state_value, lora_id):
         """Resolve a frontend-supplied id against the current native inventory."""

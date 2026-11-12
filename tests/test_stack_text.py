@@ -147,3 +147,25 @@ class TestWritingTheStackOut:
         index = st.NameIndex(build_inventory(library))
         stack = [(f"{name}.safetensors", token) for name, token in pairs(EXAMPLE)]
         assert st.format_stack(stack, index) == EXAMPLE.strip()
+
+
+# ------------------------------------------------------------------ tags
+
+
+@pytest.mark.parametrize("line,name,mode,group,baked", [
+    ("Vocal_Enhance_1 [audio]: x0,0.3;0", "Vocal_Enhance_1", "audio", "", 0),
+    ("Body [group A, baked r32]: x1;0.25", "Body", "", "A", 32),
+    ("Skin [visual, group b, baked 16]: x1", "Skin", "visual", "B", 16),
+    ("Detail [v2]: x1", "Detail [v2]", "", "", 0),          # not tags: part of the name
+    ("Detail [visual] extra: x1", "Detail [visual] extra", "", "", 0),
+])
+def test_tags_come_off_the_name(line, name, mode, group, baked):
+    parsed = st.parse(line)[0]
+    assert (parsed.name, parsed.mode, parsed.group, parsed.baked) == (name, mode, group, baked)
+
+
+def test_tags_text():
+    assert st.tags_text() == ""
+    assert st.tags_text("normal", "", 0) == ""
+    assert st.tags_text("audio", "A", 32) == " [audio, group A, baked r32]"
+    assert st.tags_text("", "", 32) == ""          # a bake belongs to a group
