@@ -252,3 +252,17 @@ def test_fold_rows_of_a_baked_group_describes_its_members():
     folded = sm.fold_rows(rows, s, describe=lambda lora_id: {"name": "described " + lora_id})
     assert folded[0]["baked"] and folded[0]["bake_id"] == BAKE
     assert [member["name"] for member in folded[0]["members"]] == ["described a.safetensors", "described " + V]
+
+
+def test_phase_summary_counts_steps_not_strengths():
+    two = up.PhaseConfig(capacity=2, effective=2, staged=True)
+    assert up.phase_summary("0.8;0.4", two) == [{"kind": "value", "value": 0.8}, {"kind": "value", "value": 0.4}]
+    assert up.phase_summary("0,0,0,0,0.325,0.325,0,0;0", two) == [
+        {"kind": "steps", "steps": 2, "of": 8, "spans": [[5, 6]], "shared": False}, {"kind": "value", "value": 0}]
+    assert up.phase_summary("1;0.5,0.25,0", two)[1] == {
+        "kind": "steps", "steps": 2, "of": 3, "spans": [[1, 2]], "shared": False}
+    assert up.phase_summary("0.5:0.9", two) == [{"kind": "raw", "text": "0.5:0.9"}]
+    one = up.PhaseConfig(capacity=1, effective=1)
+    assert up.phase_summary("1,1,0.5,0", one) == [
+        {"kind": "steps", "steps": 3, "of": 4, "spans": [[1, 3]], "shared": True}]
+    assert up.phase_summary("1,0,1,1,0,2", one)[0]["spans"] == [[1, 1], [3, 4], [6, 6]]

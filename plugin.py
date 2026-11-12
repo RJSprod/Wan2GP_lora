@@ -573,6 +573,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             )
             rows = sm.fold_rows(rows, stack, lambda lora_id: files.describe(lora_id, catalogue))
             rows = files.decorate(rows, stack, catalogue)
+            for row in rows:
+                row["phase_summary"] = up.phase_summary(row.get("multiplier_raw", "1"), phases)
             missing = [row for row in rows if row["missing"]]
             if missing and not status:
                 names = ", ".join(row["name"] for row in missing[:3])
@@ -1157,7 +1159,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             bake_id = files.bake_id(group, rank)
             changed = sm.rebake(stack, letter, bake_id) if group.baked else sm.bake(stack, letter, bake_id)
             if changed:
-                instance.note(f"Baking Group {letter} at rank {rank}. Its LoRAs are loaded separately until it is ready.")
+                instance.note(f"Baking Group {letter} at rank {rank}. Until it is built, WanGP reports the baked file "
+                              "as missing if you generate.")
             return changed
 
         if kind == "unbake":

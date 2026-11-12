@@ -722,6 +722,51 @@ def build_active_rows(
     return rows
 
 
+def phase_summary(raw: str, phases: PhaseConfig) -> list[dict[str, Any]]:
+    """What the list view shows per phase: a phase's value, or -- for a
+    scheduled phase -- how many steps it runs on, never every step's strength.
+
+    ``{"kind": "value", "value": v}`` / ``{"kind": "steps", "steps": n, "of":
+    m, "spans": [[first, last], ...], "shared": bool}`` per visible phase, or a
+    single ``{"kind": "raw"}`` for a multiplier the editor preserves as it is.
+    """
+    info = codec.classify(raw, phases.capacity)
+    if info.kind == codec.ADVANCED:
+        return [{"kind": "raw", "text": info.raw}]
+    if info.kind == codec.SIMPLE:
+        return [{"kind": "value", "value": round(value, VALUE_DECIMALS)} for value in info.values[: phases.effective]]
+    schedule = info.schedule
+    summary = []
+    for phase in range(max(1, phases.effective)):
+        values = schedule.values_for(phase) if schedule else []
+        if not values:
+            summary.append({"kind": "value", "value": 0})
+        elif all(value == values[0] for value in values):
+            summary.append({"kind": "value", "value": round(values[0], VALUE_DECIMALS)})
+        else:
+            summary.append({
+                "kind": "steps",
+                "steps": sum(1 for value in values if value != 0),
+                "of": len(values),
+                "spans": _active_spans(values),
+                "shared": bool(schedule.shared),
+            })
+    return summary
+
+
+def _active_spans(values: list[float]) -> list[list[int]]:
+    """The runs of steps a schedule is not zero on, 1-based and inclusive."""
+    spans: list[list[int]] = []
+    for index, value in enumerate(values, 1):
+        if value == 0:
+            continue
+        if spans and spans[-1][1] == index - 1:
+            spans[-1][1] = index
+        else:
+            spans.append([index, index])
+    return spans
+
+
 def multiplier_fields(
     raw: str,
     phases: PhaseConfig,
