@@ -716,8 +716,11 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             "running": status["running"],
             "current": status["current"],
             "queued": len(status["queued"]),
+            "finished": status["finished"],
             "waiting": len(waiting),
             "failed": failed,
+            # Every failure, not only this stack's: the poll compares against it.
+            "failures": len(status["failed"]),
             "generation": status["generation"],
         }
 
@@ -1208,7 +1211,10 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 message += f" Switched off {len(moved['off'])} that only change the {other}."
         if moved["on"]:
             message += f" Switched {len(moved['on'])} back on."
-        waiting = [lora_id for lora_id in renamed if files.state(lora_id)["state"] in ("pending", "queued", "building")]
+        waiting = [
+            lora_id for lora_id in renamed
+            if not files.empty(lora_id) and files.state(lora_id)["state"] in ("pending", "queued", "building")
+        ]
         if waiting:
             message += f" Building {len(waiting)} {'copy' if len(waiting) == 1 else 'copies'}."
         return message

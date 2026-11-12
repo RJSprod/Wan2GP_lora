@@ -44,6 +44,19 @@ thumbnail browser and a real-time strength editor.
   `name: x multiplier` line per LoRA, press Enter, and that is the stack —
   schedules and all. *Copy current stack* writes the same format back out. See
   [Pasting a stack as text](#pasting-a-stack-as-text).
+- **A list view for long stacks.** One line per LoRA — picture, name, what each
+  phase applies and its switch — with a scheduled phase shown as how many steps
+  it runs on. Click a line to open that LoRA's full editor under it; one is
+  open at a time. *Cards* shows every editor at once, as before. See
+  [The list view](#the-list-view).
+- **Visual only / Audio only on LTX-2.** Apply just the picture side or just
+  the sound side of a LoRA, one LoRA at a time or every LoRA in one go. The
+  panel builds an exact copy holding only that side, in the background, the
+  moment you choose it. See [Visual only and audio only](#visual-only-and-audio-only-ltx-2).
+- **Groups and bakes.** LoRAs that share one strength and schedule can be
+  grouped, so they move as one, and a group can be baked into a single LoRA at
+  a rank you choose to save memory — and unbaked again. See
+  [Groups and bakes](#groups-and-bakes).
 - **Image previews first, video previews as a still.** A LoRA with only a video
   preview gets its *first frame* decoded server-side and cached; the video itself
   is never loaded in the browser.
@@ -79,7 +92,7 @@ thumbnail browser and a real-time strength editor.
 4. Enable the plugin, click **Save Settings**, and restart WanGP.
 
 No edits to `wgp.py` are required, and the plugin adds no pip dependencies — it
-uses the Pillow and OpenCV that WanGP already ships.
+uses the Pillow, OpenCV and NumPy that WanGP already ships.
 
 ## How it fits into WanGP
 
@@ -389,6 +402,103 @@ format, each named by the shortest name that reads back to it — so a stack
 copied here and pasted later, or on another machine with the same files, comes
 back as it was.
 
+### The list view
+
+The active LoRAs open as a list: one line per LoRA with its switch, its
+picture, its name and what each phase applies. A phase at one strength shows
+that strength; a scheduled phase shows how many steps it runs on —
+`∿ 6 steps` — never each step's strength (hover it to see which steps).
+
+Nothing in the list edits a value. Click a line and that LoRA's editor opens
+under it — the same editor *Cards* shows, phase chips, strength, schedule and
+all, plus the controls described below — and opening another line closes it.
+**Done** or **Collapse all** closes it again. **Cards** shows every LoRA's editor
+at once instead; the panel remembers which view you last used.
+
+**Select** turns the lines into checkboxes, for changing several LoRAs at once:
+make them visual only, audio only or normal (on LTX-2), or group them. On a
+narrow panel each line puts its phases under its name, each with its own
+`P1` / `P2` label.
+
+### Visual only and audio only (LTX-2)
+
+An LTX-2 LoRA can change the picture, the sound, or both. Every LoRA's editor
+on an LTX-2 model has **Applies to: Normal · Visual only · Audio only**.
+
+- **Visual only** applies only what the LoRA changes in the picture, **Audio
+  only** only what it changes in the sound, and **Normal** all of it. The editor
+  shows how the LoRA splits between the two, and what WanGP loads for it.
+- The panel builds a copy of the LoRA holding only that side's tensors. They
+  are byte-for-byte the original's — nothing is re-computed or re-quantised —
+  so the side you keep is exactly what it was. Attention from one side into the
+  other belongs to the side it writes into; the few layers both sides read,
+  such as the text-embedding projection, are kept in either. A LoRA with
+  nothing on the other side is linked rather than copied.
+- **The copy is built the moment you choose the mode**, in the background,
+  and used from then on. Choosing that mode for that LoRA later uses the same
+  copy at once; if the original file changes, the copy is built again.
+- While anything is building, a bar above the rows shows progress and warns
+  that **if you generate before it finishes you may get an unexpected result**:
+  WanGP reports a file that is not built yet as missing and does not start.
+  The panel warns rather than holding back WanGP's Generate button.
+- **Audio / visual ▾** above the rows changes every LoRA at once — *Make every
+  LoRA visual only*, *audio only* or *normal* — or *Select which LoRAs…* to pick
+  them. A LoRA that only changes the picture has nothing to apply in audio
+  only, so it is switched off, and normal (or visual only) switches it back on;
+  the same goes the other way round. A LoRA you switched off yourself stays off.
+- A mode lives in WanGP's own stack, the way *off* does, so presets, the queue
+  and settings saved with generated media keep it: the LoRA's entry in
+  `loras_choices` names its copy (`_lora_browser/<name>.visual.safetensors`),
+  and a LoRA switched off by its mode is a `#lora_skip` line in
+  `loras_multipliers`. Stack profiles and stack text carry modes and groups
+  too: a copied stack reads `Rain_Ambience [audio, group A]: x0.5`, and pasting
+  it back restores both.
+
+Visual only and audio only are offered on LTX-2 models only. MiniMax H3 and
+other models keep the list view, groups and bakes.
+
+### Groups and bakes
+
+LoRAs that share one strength and schedule — or should — can be **grouped**,
+so they move as one: **Group with…** in a LoRA's editor, or **Select** a few
+and press **Group**. If their settings differ, the panel asks whose the group
+keeps. A group is one line with its members listed under it; its editor has
+one set of phase chips, strength and schedule for all of them, each member's
+own Normal / Visual / Audio choice, and `×` to take a member out. **Ungroup**
+makes them separate LoRAs again, each keeping the group's settings.
+
+Grouping alone builds nothing and changes nothing WanGP loads. WanGP already
+applies every active LoRA as one sum per layer, so two LoRAs side by side cost
+no more memory than one file holding both exactly would.
+
+**Bake** is what saves memory: it re-fits the group's combined change as one
+LoRA at the rank you choose. It starts at the rank of the highest-rank LoRA in
+the group, and the dialog lists each size with what it saves. A rank at or
+above the group's combined rank is exact; a smaller one keeps the strongest
+directions of the combined change, layer by layer (a truncated SVD), and once
+it is built the group says how much of the change it kept. The originals are
+never touched: **Unbake** goes back to them and **Change size…** bakes again.
+Strength and schedule still apply live to the baked file, and changing a
+member's mode or the group's members bakes it again to match. LoRAs that are not
+plain low-rank pairs (DoRA, LoKr, full weight differences) cannot be baked, and
+the dialog says so.
+
+A group is stored as `#lora_group <letter> <lora>` lines in `loras_multipliers`;
+a baked group's lines also name its file
+(`_lora_browser/_bakes/<hash>.r<rank>.safetensors`), which is what
+`loras_choices` then holds.
+
+### Built files
+
+Visual-only and audio-only copies and baked groups are kept in the plugin's own
+folder, under `derived/<LoRA folder>-<hash>/`, and linked into the model's LoRA
+folder as `_lora_browser/` — a symlink, a junction on Windows, or a plain
+folder where neither can be made — which is how WanGP finds them like any other
+LoRA. They never show in the thumbnail grid. **Built files** in the status bar
+lists them with what each was built from, its size and what uses it (this stack
+or a saved profile), and **Delete unused** removes the ones nothing uses.
+Anything deleted is built again from its originals if it is ever used again.
+
 ### Phases
 
 Phase behaviour is resolved from live WanGP data (`guidance_phases`,
@@ -520,8 +630,8 @@ variable always wins.
 
 ## Preferences
 
-Favourites, tags, zoom, stack profiles and any Civitai API key you set are
-stored in
+Favourites, tags, zoom, the list or cards view, stack profiles and any Civitai
+API key you set are stored in
 `wan2gp_lora_browser.json` next to WanGP's own config file (falling back to a
 `data/` folder inside the plugin if that location cannot be discovered). Writes
 are atomic, and a corrupt file is backed up rather than crashing WanGP.
@@ -560,8 +670,15 @@ lora_browser/
   thumbnails.py            preview matching, first-frame decode, cache
   catalogue.py             read the Civitai sidecar folder
   civitai.py               fetch and build that folder on demand
-  metadata_store.py        favourites, tags, zoom, sort (atomic JSON)
+  metadata_store.py        favourites, tags, zoom, sort, view (atomic JSON)
   profile_store.py         stack profiles
+  lora_files.py            safetensors headers, byte-exact subset copies,
+                           LTX-2 picture/sound classification
+  bake.py                  re-fit a group as one LoRA (NumPy QR + SVD)
+  derived.py               built-file ids, the store and its link
+  builder.py               the background build queue
+  stack_modes.py           modes, groups and bakes in the native stack
+  stack_files.py           which built files a stack needs, and their state
 assets/                    panel CSS and JavaScript
 ```
 
@@ -585,6 +702,16 @@ Four things the design spec leaves to implementation, settled here:
 - **Multi-phase coordinates.** Phase-relative by default. Exact global step
   numbers are claimed only for a schedule that really does span the whole run at
   one slot per step.
+
+- **Building is triggered by the stack, not by a button.** Every payload
+  queues whatever built file the stack selects and does not have yet, so a
+  mode or bake that arrives from a preset, a profile, a pasted stack or the
+  queue is built exactly as one chosen in the panel is.
+- **A built file is never a guess.** Splits copy the original's tensor bytes;
+  a copy that would keep every tensor is a hard link. A file is written to a
+  temporary name and renamed into place only when complete, so WanGP never
+  sees half of one; and a manifest of each original's size, time and checksum
+  rebuilds anything whose original changed.
 
 ## Status and compatibility
 

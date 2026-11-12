@@ -398,7 +398,32 @@ WHY IT TOOK FOUR ROUNDS
     held state, so a late event can only cause a redundant, identical write.
     (WanGP's HierarchySelector, loras_choices, only fires on user clicks.)
 
-3.9 Noise you can ignore
+3.9 LoRA files the plugin builds (verified against WanGP 18.83 source)
+    loras_choices entries are resolved against the model's LoRA folder with
+    get_lora_local_path(lora_dir, entry), so an entry with a subfolder -
+    "_lora_browser/x.visual.safetensors" - loads like any other LoRA. The
+    plugin keeps its built files in <plugin>/derived/ and links that folder
+    into the LoRA folder as _lora_browser (symlink; on Windows a junction,
+    which needs no admin rights; a real folder as the last resort).
+
+    check_loras_exist() runs when a task is added to the queue and again when
+    it starts. A missing file is refused with "The following Loras files are
+    missing or invalid", so a task queued before a build finishes is refused,
+    not run without that LoRA. That is why the panel warns while it builds and
+    why every file is written as *.part and renamed into place: WanGP must
+    never find half a file.
+
+    mmgp applies every active LoRA as one sum per layer. Merging LoRAs
+    losslessly therefore saves no memory at all; only a smaller rank does, which
+    is what a bake is. Groups on their own are bookkeeping in the panel.
+
+    Built-file state that must survive WanGP lives in loras_multipliers as #
+    lines, which WanGP drops before parsing: #lora_skip <pos> <token> <lora>
+    (switched off because its mode leaves it nothing to apply) and
+    #lora_group <letter> <lora> (one per member; a baked group also lists its
+    file). The ids in loras_choices name the built file itself.
+
+3.10 Noise you can ignore
     "Too many arguments provided for the endpoint." is a stock Gradio 5.29
     client-side warning emitted for ANY event that passes `inputs`. Reproducible
     in a four-line Gradio app with no plugin loaded. Not your bug.
@@ -487,8 +512,15 @@ ALWAYS RUN THE NEGATIVE TEST
     thumbnails.py            preview matching, first-frame decode, cache
     catalogue.py             read the Civitai sidecar folder (tolerant of gaps)
     civitai.py               fetch/build that folder on demand (stdlib urllib)
-    metadata_store.py        favourites, tags, zoom, Civitai key (atomic JSON)
+    metadata_store.py        favourites, tags, zoom, view, Civitai key (atomic JSON)
     profile_store.py         stack profiles
+    lora_files.py            safetensors I/O without torch; LTX-2 picture/sound
+                             classification; byte-exact subset copies
+    bake.py                  low-rank re-fit of a group (NumPy QR + SVD)
+    derived.py               built-file ids, store, link into the LoRA folder
+    builder.py               background build queue (one worker thread)
+    stack_modes.py           modes, groups, bakes and auto-off, as native text
+    stack_files.py           what a stack needs built, and each file's state
   assets/lora_browser.css    panel styling, from Gradio theme tokens
   assets/lora_browser.js     panel frontend (mount, render, bridges, diagnose)
   tests/                     no WanGP, GPU or network required
@@ -512,8 +544,8 @@ ALWAYS RUN THE NEGATIVE TEST
 INSTALL
   WanGP > Plugins > Install New Plugin > paste the repo URL > Download and
   Install > enable > Save Settings > restart. The folder name WanGP creates must
-  be a valid Python identifier (see 3.3). No pip dependencies are added; Pillow
-  and OpenCV already ship with WanGP.
+  be a valid Python identifier (see 3.3). No pip dependencies are added; Pillow,
+  OpenCV and NumPy already ship with WanGP.
 
 ================================================================================
 END

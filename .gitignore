@@ -9,3 +9,6 @@ __pycache__/
 data/
 lora_browser_thumbs/
 wan2gp_lora_browser.json
+
+# Visual-only/audio-only copies and baked groups, built at runtime
+derived/
