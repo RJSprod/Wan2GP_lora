@@ -17,6 +17,16 @@ level is refused rather than guessed at, and so is a name nothing answers to.
 
 ``format_stack`` writes the same text back out, naming each LoRA by the
 shortest name that reads back to it.
+
+Tags in brackets after the name carry what the panel adds to a LoRA:
+
+    Vocal_Enhance_1 [audio]: x0,0,0,0,0.325,0.325,0,0;0
+    Body_Structure_1 [group A, baked r32]: x1;0.25
+    Skin_Texture_v3 [visual, group A, baked r32]: x1;0.25
+
+``visual``/``audio`` (or ``normal``) is the mode, ``group A`` the group it
+moves with, and ``baked r32`` that the group is baked at rank 32.  Brackets
+holding anything else are part of the name, as they always were.
 """
 
 from __future__ import annotations
@@ -41,6 +51,11 @@ _BULLET = re.compile(r"^[-*•]\s+")
 _SPACE = re.compile(r"\s+")
 _ATOMS = re.compile(r"[;,:]")
 _LOOSE = re.compile(r"[\W_]+")
+#: A name ending in a bracketed list, and the tags the list may hold.
+_TAGGED = re.compile(r"^(?P<name>.*?\S)\s*\[(?P<tags>[^\[\]]*)\]$")
+_GROUP_TAG = re.compile(r"^group\s+([a-z])$")
+_BAKED_TAG = re.compile(r"^baked\s+r?([1-9]\d{0,4})$")
+TAG_MODES = ("normal", "visual", "audio")
 
 
 @dataclass(frozen=True)
@@ -54,6 +69,11 @@ class StackLine:
     name: str
     #: The WanGP token with any spaces taken out, or "" for no multiplier.
     token: str
+    #: From the tags: the mode ("" when not given), the group letter, and the
+    #: rank the group is baked at (0 for not baked).
+    mode: str = ""
+    group: str = ""
+    baked: int = 0
 
 
 @dataclass(frozen=True)
@@ -87,8 +107,47 @@ def parse(text: str) -> list[StackLine]:
         else:
             bare = _BARE.match(body)
             name, token = (bare.group("name") if bare else body), ""
-        lines.append(StackLine(number=number, text=stripped, name=name.strip(), token=token))
+        name, mode, group, baked = split_tags(name.strip())
+        lines.append(StackLine(number=number, text=stripped, name=name, token=token,
+                               mode=mode, group=group, baked=baked))
     return lines
+
+
+def split_tags(name: str) -> tuple[str, str, str, int]:
+    """``(name, mode, group, baked rank)``: the tags taken off the end of a
+    name, or the name untouched when its brackets hold anything else."""
+    match = _TAGGED.match(str(name or ""))
+    if not match:
+        return name, "", "", 0
+    mode, group, baked = "", "", 0
+    for part in (piece.strip().lower() for piece in match.group("tags").split(",")):
+        if not part:
+            continue
+        if part in TAG_MODES:
+            mode = part
+            continue
+        found = _GROUP_TAG.match(part)
+        if found:
+            group = found.group(1).upper()
+            continue
+        found = _BAKED_TAG.match(part)
+        if found:
+            baked = int(found.group(1))
+            continue
+        return name, "", "", 0
+    return match.group("name").strip(), mode, group, baked
+
+
+def tags_text(mode: str = "", group: str = "", baked: int = 0) -> str:
+    """`` [visual, group A, baked r32]``, or "" for a plain LoRA."""
+    tags = []
+    if mode and mode != "normal":
+        tags.append(mode)
+    if group:
+        tags.append(f"group {group}")
+        if baked:
+            tags.append(f"baked r{int(baked)}")
+    return f" [{', '.join(tags)}]" if tags else ""
 
 
 def token_problem(token: str) -> str:
@@ -189,5 +248,11 @@ class NameIndex:
 
 
 def format_stack(entries, index: NameIndex) -> str:
-    """``entries`` -- ``(lora id, token)`` pairs -- as text ``parse`` reads back."""
-    return "\n".join(f"{index.name_for(lora_id)}: x{token}" for lora_id, token in entries)
+    """``entries`` -- ``(lora id, token)`` pairs, or ``(lora id, token, mode,
+    group, baked)`` -- as text ``parse`` reads back."""
+    lines = []
+    for entry in entries:
+        lora_id, token = entry[0], entry[1]
+        tags = tags_text(*entry[2:5]) if len(entry) > 2 else ""
+        lines.append(f"{index.name_for(lora_id)}{tags}: x{token}")
+    return "\n".join(lines)

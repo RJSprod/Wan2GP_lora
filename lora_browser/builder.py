@@ -177,18 +177,47 @@ def split_job(store: Store, derived_id: str, source_id: str, source_path: str, m
         if not any(lf.ltx2_side(lf.split_key(name)[0]) != lf.SHARED for name in keep):
             raise ValueError(f"{label}: nothing to keep in {mode} only")
         stamp = store.source_stamp(source_id)
+        target = store.write_path(derived_id)
+        if len(keep) == len(lora.tensors) and _link(source_path, target):
+            # The mode keeps everything -- visual only on a LoRA that only
+            # changes the picture -- so the copy is the original itself.
+            store.record(derived_id, {
+                "kind": "split", "mode": mode, "sources": [stamp], "linked": True,
+                "bytes": os.path.getsize(target), "label": label,
+            })
+            report(1.0)
+            return
         metadata = dict(lora.metadata)
         metadata.update({"lora_browser": mode, "lora_browser_source": source_id})
         digest = lf.copy_subset(
-            lora, keep, store.write_path(derived_id), metadata,
+            lora, keep, target, metadata,
             progress=lambda done, total: report(done / total if total else 1.0),
         )
         store.record(derived_id, {
             "kind": "split", "mode": mode, "sources": [dict(stamp, sha256=digest)],
-            "bytes": os.path.getsize(store.write_path(derived_id)), "label": label,
+            "bytes": os.path.getsize(target), "label": label,
         })
 
     return Job(key=derived_id, label=f"{label}, {mode} only", work=work, store=store)
+
+
+def _link(source: str, target: str) -> bool:
+    """Hard-link ``source`` at ``target``, replacing what is there; False when
+    the two are on different drives or links are not allowed."""
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    part = target + ".part"
+    try:
+        if os.path.exists(part):
+            os.remove(part)
+        os.link(source, part)
+        os.replace(part, target)
+        return True
+    except OSError:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        return False
 
 
 def bake_job(store: Store, derived_id: str, members: list[tuple[str, str, str, str]], rank: int,

@@ -619,28 +619,38 @@ def build_items(
     model_key: str = "",
     memory: dict[str, list[float]] | None = None,
     catalogue: dict[str, Any] | None = None,
+    aliases: dict[str, tuple[str, bool]] | None = None,
 ) -> list[dict[str, Any]]:
     """Browser tiles for everything WanGP can activate for this model.
 
     ``catalogue`` maps LoRA id -> CatalogueIndex, supplying the Civitai name and
     trigger words. Those travel with the payload so naming, search and sort all
     happen client-side with no round trip.
+
+    ``aliases`` maps an original's id to the id the stack holds it by and
+    whether it is on -- its visual-only copy, say, or the group bake it went
+    into -- so its tile still shows it in use.  The built files themselves,
+    under ``_lora_browser/``, are not tiles of their own.
     """
     memory = memory or {}
     catalogue = catalogue or {}
+    aliases = aliases or {}
     items = []
     off = {lora.id for lora in stack.disabled}
     for entry in inventory.entries:
-        position = stack.index_of(entry.id)
+        if entry.id.startswith("_lora_browser/"):
+            continue
+        native, alias_on = aliases.get(entry.id, (entry.id, None))
+        position = stack.index_of(native)
         index = catalogue.get(entry.id)
         item: dict[str, Any] = {
             "id": entry.id,
             "name": entry.name,
             "label": entry.label,
             "parent": entry.parent,
-            "active": position >= 0,
+            "active": bool(alias_on) if alias_on is not None else position >= 0,
             # In the stack, switched off: a tile click switches it back on.
-            "disabled": entry.id in off,
+            "disabled": (alias_on is False) if alias_on is not None else entry.id in off,
             "favorite": bool(metadata.is_favorite(model_key, entry.id)) if metadata else False,
             "tag": metadata.tag(model_key, entry.id) if metadata else "",
             "system_managed": stack.is_system(position),

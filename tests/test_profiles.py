@@ -221,3 +221,27 @@ class TestExactMatchDetection:
         # The stack is on screen, so its LoRAs are available by definition.
         profiles.save("Other", "wan22", STACK)
         assert profiles.match(STACK) == "Other"
+
+
+def test_modes_groups_and_bakes_round_trip(tmp_path):
+    from lora_browser.metadata_store import MetadataStore
+    from lora_browser.profile_store import ProfileEntry, ProfileStore
+
+    store = ProfileStore(MetadataStore(str(tmp_path / "p.json")))
+    entries = [
+        ProfileEntry(id="a.safetensors", multiplier="1;0.5", mode="visual", group="A"),
+        ProfileEntry(id="b.safetensors", multiplier="1;0.5", group="A"),
+        ProfileEntry(id="c.safetensors", multiplier="0.3", enabled=False, mode="audio", skipped=True),
+    ]
+    store.save("Concert", "ltx2", entries, bakes={"A": 32})
+    again = ProfileStore(MetadataStore(str(tmp_path / "p.json"))).get("Concert")
+    assert [(e.id, e.mode, e.group, e.skipped, e.enabled) for e in again.loras] == [
+        ("a.safetensors", "visual", "A", False, True),
+        ("b.safetensors", "normal", "A", False, True),
+        ("c.safetensors", "audio", "", True, False),
+    ]
+    assert again.bakes == {"A": 32}
+    assert store.match(entries, {"A": 32}) == "Concert"
+    assert store.match(entries, {"A": 16}) == ""
+    # A plain LoRA is written as it always was.
+    assert "mode" not in ProfileEntry(id="x").to_dict()
