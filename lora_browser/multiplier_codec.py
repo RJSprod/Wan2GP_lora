@@ -63,7 +63,21 @@ DEFAULT_TOKEN = "1"
 #: ones, so it comes back where it was.  The LoRA goes last, so a name with
 #: spaces in it reads back whole; a multiplier never has one.
 DISABLED_MARK = "#lora_off"
-_DISABLED_LINE = re.compile(r"^\s*#lora_off\s+(\d+)\s+(\S+)\s+(\S.*?)\s*$")
+_DISABLED_LINE = re.compile(r"^\s*#lora_(off|skip)\s+(\d+)\s+(\S+)\s+(\S.*?)\s*$")
+
+#: A LoRA the panel switched off because its visual-only or audio-only mode
+#: leaves it nothing to apply -- a LoRA that only changes the picture, set to
+#: audio only.  Written like ``#lora_off``, so WanGP skips it the same way;
+#: the different mark is what lets a mode that gives it something back switch
+#: it on again, where a LoRA switched off by hand stays off.
+SKIP_MARK = "#lora_skip"
+
+#: LoRAs that move together, sharing one multiplier: one line per LoRA in the
+#: group, in order.  A baked group also lists the file it was baked into.
+#:
+#:     #lora_group <letter> <lora>
+GROUP_MARK = "#lora_group"
+_GROUP_LINE = re.compile(r"^\s*#lora_group\s+([A-Z])\s+(\S.*?)\s*$")
 
 
 @dataclass
@@ -137,6 +151,8 @@ class DisabledLora:
     token: str = DEFAULT_TOKEN
     #: Its place among the user's LoRAs, counting switched-off ones.
     at: int = 0
+    #: Off because its mode leaves it nothing to apply, not by hand.
+    skip: bool = False
 
 
 def parse_disabled(text: str) -> list[DisabledLora]:
@@ -145,13 +161,37 @@ def parse_disabled(text: str) -> list[DisabledLora]:
     for line in str(text or "").replace("\r", "").split("\n"):
         match = _DISABLED_LINE.match(line)
         if match:
-            entries.append(DisabledLora(id=match.group(3), token=match.group(2), at=int(match.group(1))))
+            entries.append(DisabledLora(
+                id=match.group(4), token=match.group(3), at=int(match.group(2)),
+                skip=match.group(1) == "skip",
+            ))
     return entries
 
 
 def disabled_line(entry: DisabledLora) -> str:
     token = str(entry.token or "").strip() or DEFAULT_TOKEN
-    return f"{DISABLED_MARK} {max(0, int(entry.at))} {token} {entry.id}"
+    mark = SKIP_MARK if entry.skip else DISABLED_MARK
+    return f"{mark} {max(0, int(entry.at))} {token} {entry.id}"
+
+
+def parse_groups(text: str) -> dict[str, list[str]]:
+    """``letter -> [lora, ...]`` for every group the text declares, in order."""
+    groups: dict[str, list[str]] = {}
+    for line in str(text or "").replace("\r", "").split("\n"):
+        match = _GROUP_LINE.match(line)
+        if match:
+            members = groups.setdefault(match.group(1), [])
+            if match.group(2) not in members:
+                members.append(match.group(2))
+    return groups
+
+
+def group_lines(groups: dict[str, list[str]] | None) -> list[str]:
+    return [
+        f"{GROUP_MARK} {letter} {lora_id}"
+        for letter in sorted(groups or {})
+        for lora_id in (groups or {})[letter]
+    ]
 
 
 def strip_comments(text: str) -> str:
@@ -319,7 +359,10 @@ def default_token(phases: int) -> str:
 
 
 def serialize(
-    tokens: list[str], separator_index: int = -1, disabled: list[DisabledLora] | None = None
+    tokens: list[str],
+    separator_index: int = -1,
+    disabled: list[DisabledLora] | None = None,
+    groups: dict[str, list[str]] | None = None,
 ) -> str:
     """Rebuild the native multiplier string.
 
@@ -327,7 +370,8 @@ def serialize(
     and then splits on single spaces, so ``"1 | 1"`` would tokenise into empty
     strings and fail validation.
 
-    Switched-off LoRAs follow, one comment line each, after every token.
+    Switched-off LoRAs follow, one comment line each, after every token, and
+    then the group lines.
     """
     cleaned = [str(token).strip() or DEFAULT_TOKEN for token in tokens]
     if separator_index is None or separator_index < 0:
@@ -336,7 +380,7 @@ def serialize(
         index = min(max(int(separator_index), 0), len(cleaned))
         text = " ".join(cleaned[:index]) + "|" + " ".join(cleaned[index:])
 
-    lines = [disabled_line(entry) for entry in disabled or []]
+    lines = [disabled_line(entry) for entry in disabled or []] + group_lines(groups)
     return "\n".join(([text] if text else []) + lines)
 
 

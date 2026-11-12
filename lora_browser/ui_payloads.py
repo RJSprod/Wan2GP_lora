@@ -409,12 +409,15 @@ class Stack:
     ``ids``/``tokens`` are what WanGP applies.  ``disabled`` are LoRAs switched
     off in the panel: kept with their multipliers, as comment lines in the
     multiplier text (``codec.DISABLED_MARK``), and applied by nothing.
+    ``groups`` are the LoRAs that move together, by letter, as the multiplier
+    text's ``#lora_group`` lines declare them (see ``stack_modes``).
     """
 
     ids: list[str] = field(default_factory=list)
     tokens: list[str] = field(default_factory=list)
     separator_index: int = -1
     disabled: list[codec.DisabledLora] = field(default_factory=list)
+    groups: dict[str, list[str]] = field(default_factory=dict)
 
     @classmethod
     def from_native(cls, selected, multipliers: str) -> "Stack":
@@ -432,7 +435,13 @@ class Stack:
             # selection is what runs, so it wins over the switched-off copy.
             if lora_id and lora_id not in seen:
                 seen.add(lora_id)
-                stack.disabled.append(codec.DisabledLora(id=lora_id, token=entry.token, at=entry.at))
+                stack.disabled.append(
+                    codec.DisabledLora(id=lora_id, token=entry.token, at=entry.at, skip=entry.skip)
+                )
+        stack.groups = {
+            letter: [normalize_id(value) for value in members if normalize_id(value)]
+            for letter, members in codec.parse_groups(multipliers).items()
+        }
         return stack
 
     def index_of(self, lora_id: str) -> int:
@@ -480,6 +489,9 @@ class Stack:
         if len(kept) == len(entries):
             return False
         self.set_user_entries(kept)
+        for members in self.groups.values():
+            if target in members:
+                members.remove(target)
         return True
 
     def disabled_entry(self, lora_id: str) -> codec.DisabledLora | None:
@@ -497,16 +509,33 @@ class Stack:
             entries.insert(max(0, min(int(entry.at), len(entries))), (entry.id, False, entry.token))
         return entries
 
-    def set_user_entries(self, entries: list[tuple[str, bool, str]]) -> None:
+    def set_user_entries(
+        self, entries: list[tuple[str, bool, str]], skipped: set[str] | None = None
+    ) -> None:
         """Write the user's side back: on ones into the selection, in order,
-        off ones as comment lines that remember their place."""
+        off ones as comment lines that remember their place.
+
+        ``skipped`` names the off ones switched off for having nothing to apply
+        in their mode; left out, an off LoRA keeps whichever it was.
+        """
+        if skipped is None:
+            skipped = self.skipped()
         keep = self.separator_index if self.separator_index >= 0 else 0
         self.ids = self.ids[:keep] + [lora_id for lora_id, on, _ in entries if on]
         self.tokens = self.tokens[:keep] + [token for _, on, token in entries if on]
         self.disabled = [
-            codec.DisabledLora(id=lora_id, token=token, at=index)
+            codec.DisabledLora(id=lora_id, token=token, at=index, skip=lora_id in skipped)
             for index, (lora_id, on, token) in enumerate(entries) if not on
         ]
+
+    def skipped(self) -> set[str]:
+        """Off because their mode leaves them nothing to apply."""
+        return {entry.id for entry in self.disabled if entry.skip}
+
+    def has_entry(self, lora_id: str) -> bool:
+        """Selected, or kept switched off."""
+        target = normalize_id(lora_id)
+        return self.index_of(target) >= 0 or self.disabled_entry(target) is not None
 
     def set_enabled(self, lora_id: str, on: bool) -> bool:
         """Switch one of the user's LoRAs on or off, keeping its multiplier and
@@ -557,7 +586,29 @@ class Stack:
         for lora_id in self.ids:
             entry = inventory.get(lora_id) if inventory else None
             values.append(entry.native_value if entry else lora_id)
-        return values, codec.serialize(self.tokens, self.separator_index, self.disabled)
+        return values, codec.serialize(
+            self.tokens, self.separator_index, self.disabled, self.live_groups()
+        )
+
+    def live_groups(self) -> dict[str, list[str]]:
+        """The groups worth writing: those with two LoRAs still in the stack,
+        or a baked file in it.  A group a preset or a hand edit took apart
+        simply stops being written."""
+        from . import derived  # noqa: PLC0415 - pure module, avoids a cycle at import
+
+        live: dict[str, list[str]] = {}
+        for letter, members in self.groups.items():
+            bakes = [value for value in members if (derived.parse(value) or derived.Derived("", "")).kind == "bake"]
+            present_bake = [value for value in bakes if self.has_entry(value)]
+            if present_bake:
+                others = [value for value in members if value not in bakes]
+                if len(others) >= 2:
+                    live[letter] = others + present_bake[:1]
+                continue
+            present = [value for value in members if value not in bakes and self.has_entry(value)]
+            if len(present) >= 2:
+                live[letter] = present
+        return live
 
 
 def build_items(
@@ -2228,5 +2279,5 @@ def stack_signature(selected, multipliers: str) -> str:
     ids = [normalize_id(value) for value in (selected or [])]
     tokens = codec.align_tokens(codec.parse_multipliers(multipliers).tokens, len(ids))
     return _SIGNATURE_SEP.join(ids) + _SIGNATURE_SEP + codec.serialize(
-        tokens, stack.separator_index, stack.disabled
+        tokens, stack.separator_index, stack.disabled, stack.groups
     )
