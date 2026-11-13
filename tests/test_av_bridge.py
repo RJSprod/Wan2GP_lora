@@ -470,6 +470,12 @@ def test_a_picture_only_member_brings_nothing_to_the_sound_side(plugin, state):
                                   state, native(choices, None), native(mults, None))
     s_picture = dv.split_id(PICTURE, "sound")
     assert s_picture not in native(choices, None) and f"#lora_skip" in native(mults, None)
+    # Its empty sound half is not something Enable all can switch on.
+    assert payload["can_enable_all"] is False
+    selected, text = native(choices, None), native(mults, None)
+    choices, mults, payload = act(plugin, {"type": "enable_all"}, state, selected, text)
+    assert native(choices, selected) == selected and s_picture not in native(choices, selected)
+    assert "already on" in payload["status"]
     # A group whose LoRAs only change the picture has nothing to separate.
     v_big = dv.split_id("big.safetensors", "visual")
     lines = f"\n#lora_group A {PICTURE}\n#lora_group A {v_big}"

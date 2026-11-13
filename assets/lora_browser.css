@@ -1732,6 +1732,54 @@
 .lb-dialog .lb-table .lb-t-num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .lb-dialog .lb-table .lb-t-file { max-width: 14rem; }
 
+/* Separate picture and sound strengths: a section per side in the editor,
+   and in the list each phase shows the picture's over the sound's. */
+.__NS__ .lb-track { border-top: 1px solid var(--border-color-primary); }
+.__NS__ .lb-track-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 6px 7px 0;
+}
+.__NS__ .lb-track-head .lb-ic svg { width: 14px; height: 14px; }
+.__NS__ .lb-track-name {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.__NS__ .lb-track-picture .lb-track-head { color: var(--lb-visual); }
+.__NS__ .lb-track-sound .lb-track-head { color: var(--lb-audio); }
+.__NS__ .lb-track-head .lb-schedule-toggle { margin-left: auto; }
+.__NS__ .lb-li-ph.lb-li-pair { flex-direction: column; align-items: flex-start; gap: 1px; }
+.__NS__ .lb-li-side { display: flex; align-items: center; gap: 5px; }
+.__NS__ .lb-li-side .lb-ic svg { width: 11px; height: 11px; }
+.__NS__ .lb-li-side.lb-li-picture > .lb-ic { color: var(--lb-visual); }
+.__NS__ .lb-li-side.lb-li-sound > .lb-ic { color: var(--lb-audio); }
+.__NS__ .lb-li.lb-li-off .lb-li-pair .lb-li-side { opacity: 1; }
+.__NS__ .lb-mode-pill.lb-mode-separate {
+  color: var(--body-text-color);
+  border-color: color-mix(in srgb, var(--body-text-color) 45%, transparent);
+  background: linear-gradient(90deg,
+    color-mix(in srgb, var(--lb-visual) 16%, transparent),
+    color-mix(in srgb, var(--lb-audio) 16%, transparent));
+}
+.__NS__ .lb-mode-pill.lb-mode-separate .lb-ic:first-child { color: var(--lb-visual); }
+.__NS__ .lb-mode-pill.lb-mode-separate .lb-ic:nth-child(2) { color: var(--lb-audio); margin-left: -2px; }
+.__NS__ .lb-seg button.lb-seg-separate[aria-checked="true"] {
+  background: linear-gradient(90deg,
+    color-mix(in srgb, var(--lb-visual) 20%, var(--lb-raised)),
+    color-mix(in srgb, var(--lb-audio) 20%, var(--lb-raised)));
+}
+.__NS__ .lb-seg button.lb-seg-separate .lb-ic:first-of-type { color: var(--lb-visual); }
+.__NS__ .lb-seg button.lb-seg-separate .lb-ic:nth-of-type(2) { color: var(--lb-audio); margin-left: -3px; }
+.__NS__ .lb-seg button:disabled { opacity: 0.45; cursor: default; }
+.__NS__ .lb-load p { margin: 0; }
+.__NS__ .lb-load-side { font-weight: 600; }
+.__NS__ .lb-load-picture { color: var(--lb-visual); }
+.__NS__ .lb-load-sound { color: var(--lb-audio); }
+
 /* A narrow panel: each list line stacks its name over its phases, which
    then carry their own labels. */
 @container (max-width: 520px) {
@@ -1750,6 +1798,9 @@
   .__NS__ .lb-member > .lb-btn { grid-column: 3; grid-row: 1; }
   .__NS__ .lb-member > .lb-seg { grid-column: 1 / -1; grid-row: 2; justify-self: start; }
   .__NS__ .lb-extra-label { min-width: 0; }
+  /* Four ways to apply a LoRA fit a phone once "only" gives way. */
+  .__NS__ .lb-seg-long { display: none; }
+  .__NS__ .lb-seg button { padding: 4px 8px; gap: 4px; }
   .lb-dialog .lb-opt { grid-template-columns: auto minmax(0, 1fr); }
   .lb-dialog .lb-opt-side { grid-column: 2; justify-items: start; }
 }

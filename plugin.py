@@ -564,6 +564,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             files.ensure(stack)
 
             entries, bakes = self._profile_entries(stack, files)
+            # Halves off for having nothing to apply: not "off" for Enable all.
+            needless = self._needless(stack, files)
             signature = up.stack_signature(selected, multipliers)
 
             catalogue = self._catalogue_index(instance, inventory)
@@ -645,7 +647,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 },
                 # What the two bulk switches would change right now.
                 "can_disable_all": any(on for _, on, _ in stack.user_entries()),
-                "can_enable_all": bool(stack.disabled),
+                "can_enable_all": any(entry.id not in needless for entry in stack.disabled),
                 # The LoRAs that run, as text the paste box reads back.
                 "stack_text": stack_text.format_stack(
                     [
@@ -1018,6 +1020,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
         One its mode left nothing to apply comes back as Normal: switched on,
         it has to apply something."""
+        needless = self._needless(stack, files) if files is not None else set()
+        before = {lora_id for lora_id, entry_on, _ in stack.user_entries() if entry_on}
         reset = 0
         if on and files is not None:
             for lora_id in sorted(stack.skipped()):
@@ -1027,7 +1031,15 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                     if files.empty(member) and self._rename_mode(instance, stack, files, member, sm.NORMAL):
                         reset += 1
             self._rebake_changed(stack, files)
-        changed = stack.set_all_enabled(on)
+        stack.set_all_enabled(on)
+        if on and files is not None:
+            # A half its LoRA has nothing on stays off: it applies nothing.
+            sm.settle(stack, files.empty)
+        after = {lora_id for lora_id, entry_on, _ in stack.user_entries() if entry_on}
+        moved = (after ^ before) - needless
+        if files is not None:
+            moved = {files.source(lora_id)[0] for lora_id in moved}
+        changed = len(moved)
         if not changed:
             instance.note("Every LoRA is already on." if on else "No LoRAs are on.")
             return False
@@ -1087,6 +1099,23 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 wanted = files.bake_ids(group, dv.parse(group.bake).rank)
                 if wanted != group.bakes:
                     sm.set_bakes(stack, group.letter, wanted)
+
+    @staticmethod
+    def _needless(stack, files: StackFiles) -> set[str]:
+        """Halves that are off because their LoRA has nothing on that side --
+        the sound half of a picture-only LoRA in a group with separate
+        strengths.  Nothing switches them on: they would apply nothing."""
+        found: set[str] = set()
+        for group in sm.groups(stack).values():
+            if not group.separate:
+                continue
+            by_source: dict[str, list[str]] = {}
+            for member in group.members:
+                by_source.setdefault(files.source(member)[0], []).append(member)
+            for entries in by_source.values():
+                if len(entries) == 2:
+                    found.update(entry for entry in entries if files.empty(entry))
+        return found
 
     @staticmethod
     def _text_mode(entry: ProfileEntry, entries: list[ProfileEntry]) -> str:

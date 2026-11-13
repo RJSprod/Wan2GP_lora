@@ -53,6 +53,10 @@ thumbnail browser and a real-time strength editor.
   the sound side of a LoRA, one LoRA at a time or every LoRA in one go. The
   panel builds an exact copy holding only that side, in the background, the
   moment you choose it. See [Visual only and audio only](#visual-only-and-audio-only-ltx-2).
+- **Separate picture and sound strengths on LTX-2.** Give a LoRA, or a whole
+  group, one strength and schedule for the picture and another for the sound.
+  It stays one row with two editors; the panel quietly runs it as two files.
+  See [Separate picture and sound strengths](#separate-picture-and-sound-strengths-ltx-2).
 - **Groups and bakes.** LoRAs that share one strength and schedule can be
   grouped, so they move as one, and a group can be baked into a single LoRA at
   a rank you choose to save memory — and unbaked again. See
@@ -457,6 +461,39 @@ on an LTX-2 model has **Applies to: Normal · Visual only · Audio only**.
 Visual only and audio only are offered on LTX-2 models only. MiniMax H3 and
 other models keep the list view, groups and bakes.
 
+### Separate picture and sound strengths (LTX-2)
+
+**Applies to** has a fourth choice, **Separate**: the LoRA's picture and its
+sound each get a strength and a schedule of their own. It is still one row and
+one editor, now with a **Picture** section and a **Sound** section — each with
+its own phase chips, slider and Schedule button, working exactly as a LoRA's
+do. In the list, each phase shows the picture's value above the sound's.
+
+- Both start where the LoRA's strength was, so choosing Separate changes
+  nothing until you move one. Going back, **Normal** and **Visual only** keep
+  the picture's settings and **Audio only** the sound's.
+- Underneath, WanGP is given the LoRA as two files, each with its own
+  multiplier: its visual-only copy and its *sound half*
+  (`_lora_browser/<name>.sound.safetensors`), which holds the sound side alone.
+  The few layers both sides read stay in the visual copy, so they are applied
+  once, at the picture's strength — never twice. Both are exact copies of the
+  original's tensors, built the moment you choose Separate, with the same
+  warning while they build.
+- The switch, `×`, its tile and Inspect treat the two as the LoRA they are.
+  Stack profiles keep both strengths, and stack text writes the LoRA as two
+  lines — `Rain_Ambience [picture]: x1;1` and `Rain_Ambience [sound]: x0.4;0.2`
+  — which paste back the same way.
+- A LoRA that only changes one of picture and sound has no second strength to
+  give, so Separate is greyed out for it.
+
+A **group** gets the same with its **Strengths** switch: *One for both* or
+*Picture and sound*. With two, the group's editor has a Picture section and a
+Sound section; each member still has its own Normal / Visual / Audio choice
+and takes the group's strength for each side it brings. Baked, each side with
+two or more LoRAs becomes a file of its own (the sound one's name ends
+`.sound.safetensors`), both at the rank you choose. Switching back to one
+strength keeps the picture's.
+
 ### Groups and bakes
 
 LoRAs that share one strength and schedule — or should — can be **grouped**,
@@ -486,7 +523,8 @@ the dialog says so.
 A group is stored as `#lora_group <letter> <lora>` lines in `loras_multipliers`;
 a baked group's lines also name its file
 (`_lora_browser/_bakes/<hash>.r<rank>.safetensors`), which is what
-`loras_choices` then holds.
+`loras_choices` then holds. A group with separate picture and sound strengths
+lists each member as the halves it is selected as; nothing else marks it.
 
 ### Built files
 

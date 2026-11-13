@@ -1817,3 +1817,48 @@ class TestListView:
         assert host.selected[3] == "_lora_browser/sched.visual.safetensors"
         assert page.locator(".lb-li-editor .lb-timeline").count() == 1
         assert problems == []
+
+    def test_separate_strengths_edit_picture_and_sound_apart(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host)
+        line(page, "both.safetensors").locator(".lb-li-name").click()
+        settle(page, 300)
+        page.locator(".lb-li-editor .lb-seg-separate").click()
+        settle(page, 900)
+        visual, sound = "_lora_browser/both.visual.safetensors", "_lora_browser/both.sound.safetensors"
+        assert host.selected[:2] == [visual, sound]
+        # One line in the list, one editor with a section per side.
+        assert page.locator(".lb-li").count() == 4
+        sections = page.locator(".lb-li-editor .lb-track")
+        assert sections.count() == 2
+        assert sections.nth(0).locator(".lb-track-name").inner_text().lower() == "picture"
+        assert sections.nth(1).locator(".lb-track-name").inner_text().lower() == "sound"
+        # The sound side's own strength moves only the sound half.
+        number = sections.nth(1).locator(".lb-weight-main input[type=number]")
+        number.fill("0.3")
+        number.press("Enter")
+        settle(page, 900)
+        tokens = tokens_by_lora(host)
+        assert tokens[visual] == "0.8;0.5" and tokens[sound].startswith("0.3")
+        cells = line(page, "both.safetensors").locator(".lb-li-pair").first.locator(".lb-li-side code")
+        assert cells.all_inner_texts() == ["0.8", "0.3"]
+        host.plugin._builder.run_pending()
+        assert problems == []
+
+    def test_a_group_takes_picture_and_sound_strengths(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host, "0.8;0.5 0.6;0.6 0.6;0.6 1,1,0.875,0.875,0.25,0.25,0,0;0"
+                             "\n#lora_group A both.safetensors\n#lora_group A sound.safetensors")
+        page.locator(".lb-li-ghead .lb-li-name").click()
+        settle(page, 300)
+        page.locator(".lb-li-editor .lb-seg-separate").click()
+        settle(page, 900)
+        assert "#lora_group A _lora_browser/both.sound.safetensors" in host.multipliers
+        assert page.locator(".lb-li-editor .lb-track").count() == 2
+        assert "picture and sound" in page.locator(".lb-li-ghead .lb-li-sub").inner_text()
+        strengths = page.locator(".lb-li-editor .lb-extra-line", has_text="Strengths")
+        strengths.locator(".lb-seg-normal").click()
+        settle(page, 900)
+        assert "sound.safetensors" in host.selected and ".sound.safetensors" not in host.multipliers
+        host.plugin._builder.run_pending()
+        assert problems == []
