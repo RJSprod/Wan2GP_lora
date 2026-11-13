@@ -2146,6 +2146,10 @@ def schedule_set_kind(
         if schedule.regions:
             return False
         kept = parked.pop(target.key, None)
+        if kept is None and target.index == 0:
+            # Put aside as the run's one schedule and back as the first phase's,
+            # or the other way round: the token alone cannot say which it was.
+            kept = parked.pop(schedule_key(lora_id, 0, not target.shared), None)
         if kept is not None and kept.regions:
             schedule.regions = [replace(region) for region in kept.regions]
             schedule.selected_region_id = None

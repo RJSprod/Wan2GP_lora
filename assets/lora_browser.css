@@ -279,9 +279,8 @@
 }
 
 /* An active row is a small card with the same frame in every state: on/off,
-   identity and actions on the top line, then the phase chips, then -- when
-   scheduling -- the schedule's tools and timeline, and last the one strength
-   control. Everything the finger aims at is at least 34px, most 40px. */
+   identity and actions on the top line, then the phase chips, One strength or
+   Per step, and that one's controls. Everything the finger aims at is at least 34px, most 40px. */
 .__NS__ .lb-row {
   display: flex;
   /* A second line only for the band an editor adds under its strengths. */
@@ -374,24 +373,6 @@
   color: var(--body-text-color-subdued, var(--body-text-color));
   white-space: nowrap;
 }
-.__NS__ button.lb-schedule-toggle {
-  flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-}
-.__NS__ .lb-sched-mark { opacity: 0.55; }
-/* Some phase of this LoRA is scheduled, open or not: its wave is the badge
-   the phase chips wear. */
-.__NS__ button.lb-schedule-toggle.lb-scheduled .lb-sched-mark {
-  opacity: 1;
-  padding: 0 6px;
-  border-radius: 999px;
-  background: var(--lb-sched-bg);
-  color: var(--lb-sched-fg);
-  font-weight: 700;
-}
-
 /* On/off. A real switch, so it reads as a state rather than an action. */
 .__NS__ button.lb-switch {
   flex: 0 0 auto;
@@ -538,39 +519,6 @@
 }
 .__NS__ .lb-sched-badge .lb-wave { font-size: 14px; line-height: 1; }
 
-/* A scheduled phase, collapsed: a readout and a way in, never a scrubber. */
-.__NS__ .lb-sched-summary {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: calc(100% - 14px);
-  margin: 0 7px 7px;
-  min-height: 40px;
-  padding: 4px 10px;
-  border: 1px dashed var(--border-color-primary);
-  border-radius: var(--radius-sm, 6px);
-  background: var(--lb-raised);
-  color: var(--body-text-color);
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-.__NS__ .lb-sched-summary:hover { border-color: var(--border-color-accent, var(--color-accent)); }
-.__NS__ .lb-sched-summary-text {
-  flex: 1 1 auto;
-  min-width: 0;
-  font-size: var(--text-xs, 12px);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.__NS__ .lb-sched-summary-hint {
-  flex: 0 0 auto;
-  font-size: 10px;
-  color: var(--body-text-color-subdued, var(--body-text-color));
-}
-
 /* ------------------------------------------------------ strength control */
 
 /* [-] slider [number] [+] on one line at every width: the slider is the only
@@ -582,10 +530,6 @@
   align-items: center;
   padding: 0 7px 7px;
 }
-.__NS__ .lb-schedule .lb-weight { padding: 8px 0 0; }
-/* Scheduler mode owns the row, so its panel sits flush rather than as a
-   footnote under a control that is no longer there. */
-.__NS__ .lb-row-main > .lb-schedule { margin-top: 0; }
 .__NS__ .lb-weight input[type="range"] {
   width: 100%;
   min-height: 40px;
@@ -671,146 +615,6 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* --------------------------------------------------------- step schedule */
-
-.__NS__ .lb-schedule {
-  border-top: 1px solid var(--border-color-primary);
-  background: var(--background-fill-secondary, var(--background-fill-primary));
-  padding: 8px;
-}
-/* Whole-schedule tools on the left; Delete, for the selected region only, at
-   the far end where it cannot be mistaken for them. */
-.__NS__ .lb-sched-tools {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-}
-.__NS__ .lb-sched-tools button.lb-delete-region { margin-left: auto; }
-.__NS__ .lb-timeline-wrap {
-  margin-top: 8px;
-  overflow: hidden;
-}
-/* The whole run is always in view: the timeline takes the width it is given and
-   the slots divide it. Dense schedules get their room from the full-screen
-   editor rather than from a scrollbar. */
-.__NS__ .lb-timeline {
-  position: relative;
-  /* Its own border is part of the width it was given, or it overflows by 2px
-     and the wrapper finds something to scroll after all. */
-  box-sizing: border-box;
-  width: 100%;
-  height: 128px;
-  border: 1px solid var(--border-color-primary);
-  border-radius: var(--radius-xs, 4px);
-  background: var(--background-fill-primary);
-  overflow: hidden;
-  user-select: none;
-  touch-action: pan-y;
-}
-.__NS__ .lb-gridline {
-  position: absolute;
-  top: 0;
-  bottom: 18px;
-  width: 1px;
-  background: var(--border-color-primary);
-  opacity: 0.5;
-}
-.__NS__ .lb-tick {
-  position: absolute;
-  bottom: 3px;
-  transform: translateX(-50%);
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-  color: var(--body-text-color-subdued, var(--body-text-color));
-  pointer-events: none;
-}
-.__NS__ .lb-baseline {
-  position: absolute;
-  left: 6px;
-  top: 4px;
-  font-size: 10px;
-  color: var(--body-text-color-subdued, var(--body-text-color));
-  pointer-events: none;
-}
-/* Part of the schedule is past the end of the run: kept, not lost. */
-.__NS__ .lb-kept {
-  position: absolute;
-  right: 5px;
-  top: 3px;
-  padding: 0 6px;
-  font-size: 10px;
-  line-height: 15px;
-  border-radius: 999px;
-  border: 1px dashed var(--border-color-accent, var(--color-accent, currentColor));
-  color: var(--body-text-color-subdued, var(--body-text-color));
-  background: var(--background-fill-primary);
-  cursor: help;
-}
-.__NS__ .lb-region {
-  position: absolute;
-  top: 22px;
-  height: 76px;
-  display: flex;
-  align-items: stretch;
-  border: 2px solid var(--border-color-primary);
-  border-radius: var(--radius-xs, 5px);
-  background: var(--input-background-fill, var(--background-fill-primary));
-  overflow: hidden;
-  cursor: grab;
-  touch-action: none;   /* the region owns the gesture, not the scroller */
-  box-sizing: border-box;
-}
-.__NS__ .lb-region.lb-on {
-  border-color: var(--border-color-accent, var(--color-accent, currentColor));
-  background: color-mix(in srgb, var(--color-accent, currentColor) 20%, var(--input-background-fill));
-  z-index: 2;
-}
-.__NS__ .lb-region.lb-dragging { cursor: grabbing; opacity: 0.92; }
-/* The region being drawn: no handles yet, and it must not eat the gesture. */
-.__NS__ .lb-region.lb-ghost {
-  pointer-events: none;
-  opacity: 0.75;
-  border-style: dashed;
-}
-/* Empty timeline space is a target, so say so. */
-.__NS__ .lb-timeline { cursor: crosshair; }
-.__NS__ .lb-region:focus-visible { outline: 2px solid var(--color-accent, Highlight); outline-offset: -3px; }
-.__NS__ .lb-region-body {
-  flex: 1 1 auto;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 2px;
-  overflow: hidden;
-  pointer-events: none;   /* the body drags the region, it is not a target */
-  font-variant-numeric: tabular-nums;
-}
-.__NS__ .lb-region-body strong { font-size: var(--text-sm, 13px); }
-.__NS__ .lb-region-body span {
-  font-size: 10px;
-  color: var(--body-text-color-subdued, var(--body-text-color));
-  white-space: nowrap;
-}
-/* Handles give way before the body does, so a one-slot region is still a drag
-   target when the run is long. Precise resizing is what full screen is for. */
-.__NS__ .lb-handle {
-  flex: 0 1 22px;
-  min-width: 5px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: ew-resize;
-  touch-action: none;
-  color: var(--body-text-color-subdued, var(--body-text-color));
-  background: var(--background-fill-secondary, var(--background-fill-primary));
-  font-size: 15px;
-  line-height: 1;
-}
-.__NS__ .lb-handle-left { border-right: 1px solid var(--border-color-primary); }
-.__NS__ .lb-handle-right { border-left: 1px solid var(--border-color-primary); }
 
 .__NS__ .lb-row.lb-missing { border-style: dashed; opacity: 0.85; }
 
@@ -970,10 +774,7 @@
 
 @media (max-width: 620px) {
   .__NS__ .lb-search { flex-basis: 100%; }
-  /* The name needs the width more than the button needs its word. */
-  .__NS__ .lb-sched-word { display: none; }
   .__NS__ .lb-weight { grid-template-columns: 42px minmax(50px, 1fr) 70px 42px; }
-  .__NS__ .lb-timeline { height: 112px; }
 }
 
 /* ------------------------------------------------------- video previews */
@@ -1029,42 +830,6 @@
   display: block;
 }
 
-/* ------------------------------------------------ full-screen schedule */
-
-/* Same shell as the inspect view, different contents: the row's schedule
-   editor -- tools, timeline, strength control -- with room to work in. */
-.lb-sched-modal .lb-sched-modal-body {
-  flex: 1 1 auto;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 12px 14px 14px;
-  overflow-y: auto;
-}
-.lb-sched-modal .lb-schedule {
-  border-top: 0;
-  background: transparent;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  flex: 1 1 auto;
-  min-height: 0;
-}
-/* Full width, because width is what a timeline needs -- but only as tall as its
-   contents. A region does not get easier to aim at by being a wall. */
-.lb-modal-overlay .lb-modal.lb-sched-modal {
-  height: auto;
-  max-height: 88vh;
-}
-.lb-sched-modal .lb-sched-modal-body { overflow-y: auto; }
-.lb-sched-modal .lb-timeline-wrap { flex: 0 0 auto; }
-.lb-sched-modal .lb-timeline { height: clamp(170px, 24vh, 230px); }
-.lb-sched-modal .lb-region { top: 34px; bottom: 34px; height: auto; }
-.lb-sched-modal .lb-handle { flex: 0 0 26px; }
-.lb-sched-modal .lb-region-body strong { font-size: var(--text-lg, 17px); }
-.lb-sched-modal .lb-weight { flex: 0 0 auto; }
-.lb-sched-modal .lb-tick { font-size: 11px; }
 
 /* -------------------------------------------------------- inspect view */
 
@@ -1552,7 +1317,6 @@
 .__NS__ .lb-row-thumb-group .lb-thumb-part { min-height: 0; overflow: hidden; }
 .__NS__ .lb-row-thumb-group .lb-thumb-part + .lb-thumb-part { border-top: 1px solid var(--border-color-primary); }
 .__NS__ .lb-row-thumb-group .lb-thumb { width: 100%; height: 100%; aspect-ratio: auto; border-radius: 0; }
-.__NS__ button.lb-btn.lb-done { margin-left: 2px; }
 
 /* What an editor adds under a LoRA's strengths. */
 .__NS__ .lb-row-extra {
@@ -1751,7 +1515,6 @@
 }
 .__NS__ .lb-track-picture .lb-track-head { color: var(--lb-visual); }
 .__NS__ .lb-track-sound .lb-track-head { color: var(--lb-audio); }
-.__NS__ .lb-track-head .lb-schedule-toggle { margin-left: auto; }
 .__NS__ .lb-li-ph.lb-li-pair { flex-direction: column; align-items: flex-start; gap: 1px; }
 .__NS__ .lb-li-side { display: flex; align-items: center; gap: 5px; }
 .__NS__ .lb-li-side .lb-ic svg { width: 11px; height: 11px; }
@@ -1804,3 +1567,288 @@
   .lb-dialog .lb-opt { grid-template-columns: auto minmax(0, 1fr); }
   .lb-dialog .lb-opt-side { grid-column: 2; justify-items: start; }
 }
+
+/* ---------------------------------------------------- the open editor */
+
+/* Everything an editor lays out measures the room it is given rather than the
+   window: a panel can be narrow on a wide screen, and full screen is wide on
+   an unfolded phone. */
+.__NS__ .lb-rows { container-type: inline-size; }
+
+/* Under its line in the list, or full screen, an editor opens on its tools --
+   the line above it, or the sheet's header, has the picture, name and switch. */
+.__NS__ .lb-toolbar-row {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  gap: 8px;
+  padding: 10px 10px 2px;
+}
+.__NS__ .lb-toolbar-row button.lb-btn {
+  min-width: 0;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-style: normal;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.__NS__ .lb-ic.lb-ic-full svg { width: 14px; height: 14px; }
+.__NS__ button.lb-btn.lb-full.lb-icon {
+  flex: 0 0 auto;
+  min-width: 34px;
+  min-height: 34px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.__NS__ button.lb-btn.lb-full[aria-pressed="true"] {
+  border-color: var(--border-color-accent, var(--color-accent, currentColor));
+  background: color-mix(in srgb, var(--color-accent, currentColor) 18%, transparent);
+}
+.__NS__ .lb-full-note { padding: 8px 10px 10px; color: var(--lb-muted); font-size: 12.5px; }
+.__NS__ .lb-ed-title {
+  padding: 12px 10px 0;
+  color: var(--lb-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.__NS__ .lb-row-inline .lb-off-summary { padding: 8px 10px 10px; }
+/* Done closes the editor: a line of its own under everything it edits. */
+.__NS__ .lb-row > button.lb-btn.lb-done {
+  flex: 0 0 calc(100% - 20px);
+  margin: 0 10px 10px;
+  min-height: 46px;
+}
+
+/* One strength or Per step, then that one's controls. */
+.__NS__ .lb-strength {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 7px 8px;
+}
+.__NS__ .lb-row-inline .lb-strength { gap: 10px; padding: 8px 10px 12px; }
+.__NS__ .lb-strength > .lb-phase-strip,
+.__NS__ .lb-strength .lb-weight { padding: 0; }
+/* The phase chips and One strength / Per step share a line in a card; an
+   open editor stacks them, each across its width, the chips as big buttons. */
+.__NS__ .lb-strength-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-width: 0; }
+.__NS__ .lb-strength-head > .lb-phase-strip { flex: 0 1 auto; min-width: 0; }
+.__NS__ .lb-strength-head > .lb-kind-seg { flex: 0 0 auto; }
+.__NS__ .lb-row-inline .lb-strength-head { flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 10px; }
+.__NS__ .lb-row-inline .lb-strength-head > .lb-kind-seg { display: flex; }
+.__NS__ .lb-row-inline .lb-kind-seg button { flex: 1 1 0; justify-content: center; min-height: 46px; }
+.__NS__ .lb-row-inline .lb-phase-strip { flex-wrap: wrap; overflow: visible; }
+.__NS__ .lb-row-inline .lb-phase-strip .lb-chip {
+  flex: 1 1 0;
+  justify-content: center;
+  min-height: 48px;
+  border-radius: var(--radius-md, 8px);
+}
+.__NS__ .lb-row-inline .lb-phase-strip .lb-chip.lb-chip-static { flex: 0 0 100%; min-height: 34px; }
+/* A card says what each choice does in its tooltip; an open editor says it. */
+.__NS__ .lb-row:not(.lb-row-inline) .lb-kind-note { display: none; }
+.__NS__ .lb-kind-seg button { min-height: 38px; padding: 4px 14px; }
+.__NS__ .lb-kind-seg button[aria-checked="true"] {
+  background: color-mix(in srgb, var(--color-accent, currentColor) 22%, var(--lb-raised));
+}
+.__NS__ .lb-kind-wave { font-weight: 700; }
+.__NS__ .lb-kind-note { flex: 0 0 auto; min-width: 0; color: var(--lb-muted); font-size: 12px; }
+.__NS__ .lb-range-note { font-size: 12px; line-height: 1.4; }
+.__NS__ .lb-range-note[hidden] { display: none; }
+.__NS__ .lb-strength button.lb-fill-stage-2 { align-self: flex-start; }
+
+/* Per step: a bar for every step on the slider's 0..1. Past 1 a bar is capped
+   at its top; below 0 it hangs under the zero line, capped past -1. */
+.__NS__ .lb-steps { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.__NS__ .lb-bars {
+  --lb-bar-up: 96px;
+  --lb-bar-down: 28px;
+  display: flex;
+  gap: 4px;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: pan-y;   /* a sideways drag selects; up and down still scroll */
+}
+.__NS__ button.lb-bar {
+  /* Each bar knows its own width, so its number can fit it. */
+  container-type: inline-size;
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: 7px;
+  background: var(--lb-raised);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.__NS__ button.lb-bar:focus-visible { outline: 2px solid var(--color-accent, Highlight); outline-offset: 1px; }
+.__NS__ .lb-bar-value,
+.__NS__ .lb-bar-n {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  white-space: nowrap;
+  color: var(--lb-muted);
+  font-variant-numeric: tabular-nums;
+}
+.__NS__ .lb-bar-value { height: 20px; font: 11px/1 var(--lb-mono); }
+@container (max-width: 38px) {
+  .__NS__ .lb-bar-value { font-size: 9px; letter-spacing: -0.04em; }
+}
+.__NS__ .lb-bar-n { height: 18px; font-size: 10.5px; }
+.__NS__ .lb-bar-up,
+.__NS__ .lb-bar-down { display: flex; flex-direction: column; padding: 0 3px; }
+.__NS__ .lb-bar-up { height: var(--lb-bar-up); justify-content: flex-end; }
+.__NS__ .lb-bar-down { height: var(--lb-bar-down); justify-content: flex-start; }
+.__NS__ .lb-bar-up i,
+.__NS__ .lb-bar-down i { display: block; flex: 0 0 auto; box-sizing: border-box; }
+.__NS__ .lb-bar-up i {
+  border-radius: 3px 3px 0 0;
+  background: color-mix(in srgb, var(--body-text-color) 72%, transparent);
+}
+/* Below zero is a hue of its own, as far from the picture's and the sound's
+   as from the bars above the line. */
+.__NS__ .lb-bar-down i {
+  border-radius: 0 0 3px 3px;
+  background: color-mix(in srgb, #4f7fe8 66%, var(--body-text-color));
+}
+.__NS__ .lb-bar-zero { height: 2px; background: var(--lb-muted); }
+.__NS__ .lb-bar.lb-bar-over .lb-bar-up i { border-top: 4px solid var(--body-text-color); }
+.__NS__ .lb-bar.lb-bar-under .lb-bar-down i { border-bottom: 4px solid var(--body-text-color); }
+.__NS__ .lb-bar.lb-bar-odd .lb-bar-value { color: var(--body-text-color); font-weight: 700; }
+.__NS__ button.lb-bar.lb-bar-on {
+  border-color: var(--border-color-accent, var(--color-accent, currentColor));
+  background: color-mix(in srgb, var(--color-accent, currentColor) 16%, var(--lb-raised));
+}
+.__NS__ .lb-bar.lb-bar-on .lb-bar-value,
+.__NS__ .lb-bar.lb-bar-on .lb-bar-n { color: var(--body-text-color); font-weight: 700; }
+/* A long run: thin bars, a number under every fifth step, and each value in
+   its bar's tooltip and in the field rather than over the bar. */
+.__NS__ .lb-bars.lb-bars-dense { gap: 2px; }
+.__NS__ .lb-bars-dense button.lb-bar { border-width: 1px; border-radius: 4px; }
+.__NS__ .lb-bars-dense .lb-bar-value { display: none; }
+.__NS__ .lb-bars-dense .lb-bar-up { height: calc(var(--lb-bar-up) + 20px); }
+.__NS__ .lb-bars-dense .lb-bar-up,
+.__NS__ .lb-bars-dense .lb-bar-down { padding: 0 1px; }
+.__NS__ .lb-bars-dense .lb-bar-n { overflow: visible; }
+/* The first and last numbers stay inside the run rather than hang off it. */
+.__NS__ .lb-bars-dense .lb-bar:first-child .lb-bar-n { justify-content: flex-start; }
+.__NS__ .lb-bars-dense .lb-bar:last-child .lb-bar-n { justify-content: flex-end; }
+.__NS__ .lb-bars-dense .lb-bar-quiet .lb-bar-n { visibility: hidden; }
+.__NS__ .lb-steps-pick { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.__NS__ .lb-steps-picked { flex: 1 1 0; min-width: 7em; color: var(--lb-muted); font-size: 12px; }
+.__NS__ .lb-steps-pick button.lb-btn { min-height: 38px; padding: 4px 16px; }
+.__NS__ .lb-steps .lb-kept {
+  align-self: flex-start;
+  padding: 0 8px;
+  border: 1px dashed var(--border-color-accent, var(--color-accent, currentColor));
+  border-radius: 999px;
+  color: var(--lb-muted);
+  font-size: 11px;
+  line-height: 18px;
+  cursor: help;
+}
+.__NS__ .lb-weight.lb-weight-steps:has(input:disabled) { opacity: 0.6; }
+
+/* A narrow editor -- a phone, or a narrow panel -- gives the slider a line of
+   its own and the fingers bigger targets under it; the open editor's
+   sections stack rather than share a line. */
+@container (max-width: 480px) {
+  .__NS__ .lb-weight {
+    grid-template-columns: 48px minmax(0, 1fr) 48px;
+    grid-template-areas: "range range range" "down number up";
+    row-gap: 4px;
+  }
+  .__NS__ .lb-weight > .lb-down { grid-area: down; }
+  .__NS__ .lb-weight > input[type="range"] { grid-area: range; }
+  .__NS__ .lb-weight > input.lb-number { grid-area: number; }
+  .__NS__ .lb-weight > .lb-up { grid-area: up; }
+  .__NS__ .lb-weight button.lb-step,
+  .__NS__ .lb-weight input.lb-number { min-height: 46px; }
+  .__NS__ .lb-strength-head > .lb-kind-seg { display: flex; flex: 1 1 100%; }
+  .__NS__ .lb-kind-seg button { flex: 1 1 0; justify-content: center; min-height: 44px; }
+  .__NS__ .lb-row-inline .lb-extra-line { flex-direction: column; align-items: stretch; }
+  .__NS__ .lb-row-inline .lb-extra-line > .lb-grow { display: none; }
+  .__NS__ .lb-row-inline .lb-extra-line > .lb-seg { display: flex; }
+  .__NS__ .lb-row-inline .lb-extra-line > .lb-seg button { flex: 1 1 0; justify-content: center; min-height: 40px; }
+  .__NS__ .lb-row-inline .lb-extra-line select.lb-select { max-width: none; min-height: 40px; }
+  .__NS__ .lb-bars { --lb-bar-up: 88px; }
+}
+
+/* Full screen: a sheet up from the bottom of the window with the editor in
+   it -- the same editor, given the room. */
+.lb-modal-overlay.lb-sheet-overlay {
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+}
+.lb-sheet-overlay .lb-sheet {
+  box-sizing: border-box;
+  width: min(1180px, 100vw);
+  max-height: 96vh;
+  max-height: 96dvh;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-color-primary);
+  border-bottom: 0;
+  border-radius: 18px 18px 0 0;
+  background: var(--lb-card);
+  color: var(--body-text-color);
+  box-shadow: 0 -12px 48px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+.lb-sheet-overlay .lb-sheet-grab {
+  align-self: center;
+  width: 40px;
+  height: 4px;
+  margin: 8px 0 2px;
+  border-radius: 2px;
+  background: var(--lb-muted);
+  opacity: 0.6;
+}
+.lb-sheet-overlay .lb-sheet-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  padding: 6px 14px 12px;
+  border-bottom: 1px solid var(--border-color-primary);
+}
+.lb-sheet-overlay .lb-sheet-title { flex: 1 1 12em; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.lb-sheet-overlay .lb-sheet-name { font-size: 16px; font-weight: 700; overflow-wrap: anywhere; }
+.lb-sheet-overlay .lb-sheet-sub { color: var(--lb-muted); font-size: 12.5px; }
+.lb-sheet-overlay .lb-sheet-actions { display: flex; gap: 8px; margin-left: auto; }
+.lb-sheet-overlay .lb-sheet-actions button.lb-btn {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+.lb-sheet-overlay .lb-sheet-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  container-type: inline-size;
+}
+.lb-sheet-overlay .lb-row { border: 0; border-radius: 0; box-shadow: none; }
+/* The room is for the steps: the whole width of the sheet, and taller. */
+.lb-sheet-overlay .lb-bars { --lb-bar-up: 150px; --lb-bar-down: 44px; }

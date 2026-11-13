@@ -373,6 +373,23 @@ class TestScheduleStateModel:
         assert stack.tokens[0].startswith("-2,-2,0.6,") and not parked
         assert not up.schedule_set_kind(stack, "a.safetensors", 0, True, *args, parked=parked)
 
+    def test_a_one_phase_model_gets_its_steps_back_too(self):
+        """On a model with one phase a schedule spans the run, so it is kept
+        under the run's key -- and a plain token cannot say it was shared."""
+        phases = up.resolve_phases(SINGLE_PHASE_MODEL_DEF, 1)
+        stack = up.Stack.from_native(["a.safetensors"], "0.6")
+        up.sync_schedules(stack, phases, self.schedules, self.context)
+        args = (phases, self.memory, self.schedules, self.context)
+        parked = {}
+        assert up.schedule_set_kind(stack, "a.safetensors", 0, True, *args, parked=parked)
+        assert up.schedule_set_steps(stack, "a.safetensors", 0, [3], -2, *args)
+        stepped = stack.tokens[0]
+        assert up.schedule_set_kind(stack, "a.safetensors", 0, False, *args, parked=parked)
+        assert stack.tokens[0] == "0.6"
+        assert ("a.safetensors", up.SHARED_PHASE) in parked
+        assert up.schedule_set_kind(stack, "a.safetensors", 0, True, *args, parked=parked)
+        assert stack.tokens[0] == stepped and not parked
+
     def test_steps_take_any_strength_but_only_per_step(self):
         stack = self._stack("0.6;0.9")
         args = (self.phases, self.memory, self.schedules, self.context)

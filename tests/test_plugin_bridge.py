@@ -1099,6 +1099,38 @@ class TestScheduleActions:
         choices, mults, _ = sact(plugin, {"type": "ready"}, state, self.LORAS, raw + " 1;1")
         assert "value" not in choices and "value" not in mults
 
+    def test_one_strength_says_per_step_has_values_to_bring_back(self, plugin, state):
+        start = "0.71;1.23 1;1"
+        _, mults, payload = sact(
+            plugin, {"type": "schedule_set_kind", "id": "a.safetensors", "phase": 0, "per_step": True},
+            state, self.LORAS, start, steps=4,
+        )
+        stepped = mults["value"]
+        assert stepped.split()[0] == "0.71,0.71,0.71,0.71;1.23"
+        assert self._schedule(payload, "a.safetensors")["values"] == [0.71] * 4
+        assert row_of(payload, "a.safetensors")["parked"][0] is False
+
+        _, mults, payload = sact(
+            plugin, {"type": "schedule_set_steps", "id": "a.safetensors", "phase": 0, "steps": [2], "value": -2},
+            state, self.LORAS, stepped, steps=4,
+        )
+        stepped = mults["value"]
+        assert stepped.split()[0] == "0.71,-2,0.71,0.71;1.23"
+
+        _, mults, payload = sact(
+            plugin, {"type": "schedule_set_kind", "id": "a.safetensors", "phase": 0, "per_step": False},
+            state, self.LORAS, stepped, steps=4,
+        )
+        assert mults["value"] == start
+        assert row_of(payload, "a.safetensors")["parked"][0] is True
+
+        _, mults, payload = sact(
+            plugin, {"type": "schedule_set_kind", "id": "a.safetensors", "phase": 0, "per_step": True},
+            state, self.LORAS, start, steps=4,
+        )
+        assert mults["value"] == stepped
+        assert row_of(payload, "a.safetensors")["parked"][0] is False
+
     def test_opening_a_schedule_does_not_change_the_native_token(self, plugin, state):
         choices, mults, payload = sact(
             plugin, {"type": "schedule_enable", "id": "a.safetensors", "phase": 0},

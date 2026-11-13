@@ -582,8 +582,10 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             for row in rows:
                 row["phase_summary"] = up.phase_summary(row.get("multiplier_raw", "1"), phases)
                 for track in [row] + ([row["sound_track"]] if row.get("sound_track") else []):
+                    parked = instance.parked_schedules
                     track["parked"] = [
-                        (track["id"], index) in instance.parked_schedules
+                        (track["id"], index) in parked
+                        or (index == 0 and (track["id"], up.SHARED_PHASE) in parked)
                         for index in range(phases.capacity)
                     ]
                 if row.get("sound_track"):

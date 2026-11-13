@@ -510,11 +510,12 @@ ALWAYS RUN THE NEGATIVE TEST
   plugin.py                  WanGP lifecycle, component wiring, JSON bridge only
   lora_browser/
     multiplier_codec.py      parse/serialise loras_multipliers  (heavily tested)
-    schedule.py              step-schedule regions: compile, reconstruct,
-                             place, resolve collisions (pure, heavily tested).
-                             Uncovered slots are 0 -- a scheduled phase applies
-                             the LoRA only where a region says so. The step
-                             count is a window onto the regions, not a resize.
+    schedule.py              step schedules: compile, reconstruct, set steps
+                             (pure, heavily tested). The panel edits a phase
+                             a value per step; the regions under those values
+                             are how a schedule survives the step counter --
+                             the step count is a window onto them, not a
+                             resize.
     ui_payloads.py           state model, phase resolution, action application
     inventory.py             native LoRA list -> displayable entries
     thumbnails.py            preview matching, first-frame decode, cache
@@ -543,8 +544,15 @@ ALWAYS RUN THE NEGATIVE TEST
   headless Chromium over the real _build_payload/_apply_action pair (WanGP and
   Gradio stubbed exactly as the bridge tests stub them) and drives the panel
   with real pointer events. It skips without Playwright/Chromium. Layout rules
-  like the three-row cap and gesture rules like region dragging can only be
-  checked there - both were wrong in ways no unit test could see.
+  like the three-row cap and the editor at phone width, and gesture rules like
+  selecting steps by dragging across them, can only be checked there - such
+  rules were wrong in ways no unit test could see.
+
+  The open editor is laid out with container queries on .lb-rows (and on the
+  full-screen sheet's body), never media queries: the panel is one column of
+  WanGP's page, so the window's width says nothing about the room an editor
+  has. A viewport query cramped it on a folding phone, open or shut. Narrow,
+  the slider takes a line of its own and every target is at least 44px.
 
   Placeholder markers to be aware of: assets/*.js and *.css contain __INST__,
   __NS__, __ROOT__ etc. which plugin.py substitutes per instance at build time.

@@ -23,19 +23,21 @@ thumbnail browser and a real-time strength editor.
   fit it — the thumb goes to the nearest place it can and the number keeps the
   truth until you actually move the slider.
 - **Phase chips.** On a multi-phase model each phase is a chip showing its own
-  value; tapping one chooses what the strength control and the timeline edit.
-  A scheduled phase has no single value, so its chip wears a `∿ Scheduled`
-  badge instead of a number — `∿` is the panel's mark for "the strength changes
-  from step to step".
+  value; tapping one chooses which phase the controls under it edit. A phase
+  run per step has no single value, so its chip wears a `∿ Per step` badge
+  instead of a number — `∿` is the panel's mark for "the strength changes from
+  step to step".
 - **Every active row starts with its LoRA's picture** — the tile's preview, a
   video preview's first frame with a play button, or a placeholder — in one
   column the same width on every row, so the rows stay aligned. Pressing the
   picture opens Inspect.
-- **Step schedules you can draw.** WanGP's comma multipliers (`1,0.8,0.4,0`) are
-  a first-class editing surface: regions you draw, move, resize and re-weight on
-  an inline timeline, one slot per inference step, per phase — and on LTX-2 and
-  MiniMax H3, per pipeline stage. A scheduled row keeps the same strength
-  control as any other, pointed at the selected region. See
+- **One strength or per step.** Each phase runs at one strength or per step —
+  one or the other. Per step is WanGP's comma multiplier (`1,0.8,0.4,0`) as a
+  bar for every inference step, per phase — and on LTX-2 and MiniMax H3, per
+  pipeline stage: tap or drag across bars to select steps, then set them with
+  the same slider, number and `±` as one strength, any value from −10 to 10.
+  The open editor fits the width it has, phone included, and *Full screen*
+  opens it in a sheet when you want the room. See
   [Step schedules](#step-schedules).
 - **Switch a LoRA off without losing it.** Every row has an on/off switch: off
   keeps the strength, the schedule and the LoRA's place in the list, and WanGP
@@ -125,10 +127,10 @@ its syntax:
 | --- | --- | --- |
 | `0.8` | one multiplier | strength control |
 | `0.4;0.9` | per guidance phase | one phase chip each |
-| `1,0.5,0.25` | step/time varying schedule | editable timeline, spread over the whole run |
-| `0,0,0.5,0.5` | a schedule that is off at first | two empty slots, then one region |
-| `1,0.8;0.7,0.5` | a schedule inside each phase | one editable timeline per phase |
-| `1;0.7,0.5,0.2` | scalar phase + scheduled phase | phase 1 is a number, phase 2 a timeline |
+| `1,0.5,0.25` | step/time varying schedule | per step: a bar a step, spread over the whole run |
+| `0,0,0.5,0.5` | a schedule that is off at first | per step: two bars at 0, two at 0.5 |
+| `1,0.8;0.7,0.5` | a schedule inside each phase | per step, in each phase |
+| `1;0.7,0.5,0.2` | scalar phase + scheduled phase | phase 1 at one strength, phase 2 per step |
 | `0.5:0.9` | LoRA multiplier branches | preserved verbatim, read-only |
 | `#lora_off 1 0.8 x.safetensors` | a LoRA switched off in the panel | listed, dimmed, not applied |
 | `0.9,0.8;1,1` on a 3-phase model | ambiguous phase expansion | preserved verbatim, read-only |
@@ -150,56 +152,84 @@ cannot shift another LoRA's multiplier onto the wrong file.
 
 ### Step schedules
 
-A comma in a WanGP multiplier makes it vary over the run. The panel edits those
-as **regions on a timeline**. A row looks the same scheduled or not: the
-timeline and its tools sit above the one strength control every row has.
+A comma in a WanGP multiplier makes it vary over the run. In the panel that is
+**Per step**: each phase runs at **one strength** or **per step** — one or the
+other — and per step is a bar for every step, each at a value of its own.
 
 ```
-[●] Detail Enhancer                       [∿ Schedule ▴]  [i]  [×]
-    [Phase 1 (∿ Scheduled)]  [Phase 2 0.5]
+[Full screen]      [Inspect]       [Remove]
 
-    [⤢ Full screen]  [Clear schedule]                       [Delete]
-    empty steps = 0
-              ┌──────────┐                    ┌────┐
-    ──────────│   0.95   │────────────────────│ 0.2│────────
-              └──────────┘                    └────┘
-     1    4    7    10   13   16   19   22   25   28   30
-    [−]  ------------ slider ------------  [0.2]  [+]
+STRENGTH
+[ Phase 1  ∿ Per step ]  [ Phase 2  0.5 ]
+[    One strength    |   ∿ Per step    ]
+Each of the 8 steps runs at a value of its own. One strength goes back to 0.7.
+
+ 1    1   0.88 0.88 0.25 0.25  0   −2
+ █    █    █    █    ▄    ▄
+ ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔   zero
+                                   █
+ 1    2    3    4    5    6    7   [8]
+Step 8 selected.                  [All] [None]
+
+[−]  ------------ slider ------------  [−2]  [+]
+−2 is outside the slider's 0–1: the number is what applies.
 ```
 
-The strength control under the timeline is the plain row's own control, pointed
-at the selected region — the highlighted one; tap another to switch. **Delete**
-removes that region and is only there while one is selected. Before anything is
-drawn, the control edits what the phase is worth, which is also the strength a
-new region starts at.
+- **Tap a bar to select it**, tap again to let it go, or drag across bars to
+  select every one you pass; *All* and *None* do the rest. With a keyboard, Tab
+  to a bar and press Space. A sideways drag selects; a finger moving up or down
+  scrolls the page as it would anywhere else.
+- **The selected steps share one control** — the same slider, number field and
+  `−`/`+` one strength has. The slider and a typed number set every selected
+  step to that value; `−`/`+` move each one by 0.01 from its own. Steps that
+  disagree show `mixed` in the field until you set them.
+- **The bars are 0 to 1, the values are not.** Type any strength WanGP takes,
+  `−10` to `10`: a bar past 1 tops out with a cap, a negative one hangs under
+  the zero line (capped past −1), and the line under the control says when a
+  value is outside the slider. Its number is printed over its bar, or, on a run
+  of more than 12 steps, in its tooltip and the field.
+- **Per step starts where the phase was.** Every step starts at the phase's one
+  strength, so nothing WanGP applies changes until you set a step.
+- **One strength puts the steps aside.** The phase goes back to its one
+  strength, and Per step brings the values back exactly as they were, while
+  WanGP runs.
+- Each phase is its own choice: `∿ Per step` on a phase chip says that phase
+  runs per step. Linking phases acts on one strength, so a phase run per step
+  is left out of it.
 
-**`∿` means scheduled.** A phase whose strength changes from step to step shows
-a solid `∿ Scheduled` badge on its chip where a plain phase shows its number;
-the wave on the row's *Schedule* button fills in the same way while any phase
-of that LoRA is scheduled, and so does the line a closed timeline leaves
-behind. The badge is drawn in the theme's text colour, so it stands out in
-any theme — including WanGP's dark one, whose accent is the same white as its
-text. The chip's own outline still marks the phase being edited, so the two
-never share a cue.
+**`∿` means per step.** A phase whose strength changes from step to step shows
+a solid `∿ Per step` badge on its chip where a one-strength phase shows its
+number, and the list shows how many steps it runs on. The badge is drawn in the
+theme's text colour, so it stands out in any theme — including WanGP's dark
+one, whose accent is the same white as its text. The chip's own outline still
+marks the phase being edited, so the two never share a cue.
 
-**Where a timeline can be exact.** WanGP stretches each phase's comma list to
+**Full screen, when you ask for it.** The open editor is laid out for the width
+it has — a phone, a narrow panel or a wide one — so it works where it is. *Full
+screen* (or the ⛶ button on a card) opens the same editor in a sheet over the
+page, its bars the width of the window and taller. It is live: everything set
+there goes straight to WanGP. *Exit full screen*, the backdrop or Escape put it
+back in the panel; *Done* closes the LoRA.
+
+**Where per step can be exact.** WanGP stretches each phase's comma list to
 fill the steps that phase runs, so a list runs one value per step only when its
-length matches them. That decides where the panel schedules:
+length matches them. That decides where the panel offers per step:
 
 - **One Phase, on every model.** Phase 1 covers the whole run, so a 30-value
-  schedule at 30 steps runs exactly as drawn.
+  schedule at 30 steps runs exactly as set.
 - **LTX-2 and MiniMax H3, in either mode.** Their phases are not cut out of one
   run at a switch step: each is a pipeline stage whose length is known while you
-  edit, so each phase gets a timeline exactly as long as its stage (below).
+  edit, so each phase gets exactly as many bars as its stage runs steps (below).
 - **Elsewhere, with two or more phases** — Wan 2.2, say — phase 1 covers only up
   to `model_switch_step`, derived at generation time from the sampler's
-  timesteps and the switch threshold and unknowable while editing, so a timeline
+  timesteps and the switch threshold and unknowable while editing, so bars
   would show something WanGP is not going to do. The panel offers none there,
   and **does not touch a schedule either**: the row says what the schedule does,
   read-only, and One Phase edits it again exactly as it was.
 
-**Switching phase mode never changes phase 1.** A scheduled phase 1 is the same
-schedule, and a plain phase 1 the same strength, in One Phase and in Two.
+**Switching phase mode never changes phase 1.** A phase 1 run per step is the
+same steps, and a one-strength phase 1 the same strength, in One Phase and in
+Two.
 
 **Staged models.** On LTX-2, 2.3 and 2.5, phase 1 is the first denoising pass
 and phase 2 the refinement after the upscale, each running its own fixed sigma
@@ -222,7 +252,7 @@ again, as it was, in Two Phases.
 The two stages are never one shared schedule. WanGP would play a list with no
 `;` in both — one value per step in stage 1, then squeezed into stage 2's few —
 and a stage-1 schedule squeezed into the refinement is not something anyone
-drew. So when such a list enters Two Phases, it stays stage 1's, and **stage 2
+set. So when such a list enters Two Phases, it stays stage 1's, and **stage 2
 carries on from the end of stage 1**, matched by noise level rather than
 stretched. On a distilled LTX-2 stage 1 — the distilled checkpoints, or Dev on
 a *Distilled 8 Steps* sampler — the refinement re-runs the noise levels of
@@ -238,99 +268,54 @@ stage 1's last three steps, so stage 2 gets steps 6–8:
 Where stage 1's steps do not line up with stage 2's — LTX-2 Dev with Euler or
 res2s, and MiniMax H3 — stage 2 holds the strength stage 1 ends at. The same
 goes for a list with no `;` that arrives any other way in Two Phases, such as a
-preset. What stage 2 gets is ordinary regions with no link to stage 1: edit
-either stage and the other stays as it is. *Clear schedule* empties it; a
-region drawn on an empty stage 2 starts at full strength.
+preset. What stage 2 gets is ordinary steps with no link to stage 1: edit
+either stage and the other stays as it is.
 
-**Fill from stage 1.** The same copy, on request: an empty Phase 2 timeline —
-cleared, or a plain strength — offers it, and its tooltip shows what it will
-write. *Clear schedule* afterwards puts back whatever stage 2 was before.
+**Fill from stage 1.** The same carry, on request: phase 2 at one strength,
+while phase 1 runs per step, offers it, and its tooltip shows what it will
+write. Disabled, it says why there is nothing to carry. Afterwards phase 2 runs
+per step; *One strength* puts back what it was before.
 
-**One strength control, never two.** While a phase has regions, the row's
-strength control edits the selected region; there is no plain strength left to
-show. That is not cosmetic: a scheduled phase is its regions, so a plain
-strength would be a number WanGP never applies.
+**One strength control, never two.** A phase run per step has no one strength
+to show — it is its steps, so a single number would be one WanGP never applies
+— and a phase at one strength has no bars.
 
-**Steps no region covers are zero.** There is no base strength hiding behind
-the timeline. Boxes over steps 1–2 and 4–6 mean step 3 is off, and stays off
-until something covers it. A phase you have not drawn on yet is simply not
-scheduled — it is worth its plain strength, and opening the scheduler writes
-nothing.
-
-- **Draw a region by dragging across empty timeline space**, or tap once for one
-  of the default width; an empty timeline says so. A new region starts at the
-  strength the row already had. Drawing stops at the neighbouring region rather
-  than overrunning it — dragging is for that — and a full timeline is refused
-  rather than overlapped.
-- Drag a region's body to move it, its edges to resize it. Bounds snap to whole
-  steps, and on drop the dragged region wins: a partial overlap shrinks its
-  neighbour, dropping inside one splits it, covering one deletes it. The steps a
-  region leaves behind go back to zero.
-- **The whole run is always in view.** The timeline takes the width it is given
-  and the steps divide it, however many there are — it never scrolls sideways.
-- **Full screen** opens the same editor as a dialog the width of the window,
-  with more height per region. It is live, not a preview: everything drawn or
-  dragged there goes straight to WanGP, and the row behind it stays in step.
-  Close it with `×`, the backdrop, or Escape.
-- **Schedule ▴** hides the timeline and keeps the schedule; the row then shows
-  what it is doing (`∿ Scheduled  0.95 at steps 4–10, 0.2 at steps 13–19`) and
-  tapping that goes back in. **Collapse all**, above the rows, hides every open
-  timeline at once, the same way. **Clear schedule** is the one that removes
-  it, returning that phase — and only that phase — to a plain multiplier and its
-  ordinary strength control.
-- Schedule state is held **per phase** internally, so a model that carries a
-  phase 2 value in One Phase mode keeps it untouched while phase 1 is scheduled.
-  Linking acts on plain strengths only, so it is not offered while a timeline is
-  open.
-
-**One slot per inference step, always.** There is no resolution to choose:
-timelines follow the step counter live — change it in WanGP and every schedule
-in the panel comes with it, without being asked.
+**One bar per inference step, always.** There is no resolution to choose: the
+bars follow the step counter live — change it in WanGP and every schedule in
+the panel comes with it, without being asked.
 
 How a schedule follows depends on where it came from, because a slot means two
 different things:
 
-- A schedule **drawn in the panel** is step-aligned — slot *i* is step *i* — so
-  the step count only moves where the run ends; nothing on the timeline moves or
-  stretches. Going 4 → 5 steps keeps steps 1–4 exactly as they were and adds an
-  empty step 5 (so, 0, until you draw on it). Going 5 → 3 stops the run after
-  step 3: WanGP is given three values, and a region crossing the new end shows
-  only up to it.
+- A schedule **set in the panel** is step-aligned — bar *i* is step *i* — so
+  the step count only moves where the run ends; nothing on it moves or
+  stretches. Going 4 → 5 steps keeps steps 1–4 exactly as they were and adds a
+  step 5 at 0. Going 5 → 3 stops the run after step 3, and WanGP is given three
+  values.
 - **A lower step count hides; it does not delete.** What a shorter run no longer
-  reaches is kept — the timeline says `+2 steps kept` — and raising the count
-  brings it back exactly as it was. So 5 → 3 → 5 is the schedule you started
-  with, and typing `12` over `4`, which passes through `1`, loses nothing.
-  Editing at the lower count still works: a region crossing the end is one
-  region, so a new strength or a delete reaches the part past the end too, while
-  moving it or pulling its right edge in lets that part go. The memory lasts
-  while WanGP runs; a restart or a model switch starts again from the
-  multipliers as they stand.
+  reaches is kept — the steps say `+2 steps kept past the end of the run` — and
+  raising the count brings it back exactly as it was. So 5 → 3 → 5 is the
+  schedule you started with, and typing `12` over `4`, which passes through `1`,
+  loses nothing. The memory lasts while WanGP runs; a restart or a model switch
+  starts again from the multipliers as they stand.
 - A schedule **that arrived from a preset, an `.lset` file or a hand edit** was
   authored at its own resolution, and WanGP spreads it across the whole run.
   Truncating that would change what it renders, so it is resampled into step
   alignment once — and is step-aligned from then on.
 
 Read-only multipliers are never refitted: branch syntax, an ambiguous phase
-count, or a list too long to drag all stay exactly as imported. A list too long
-to drag is offered one way back to editable — **Fit to N steps**, which
-resamples it to one value per step and rewrites the multiplier.
+count, or a list too long for its steps all stay exactly as imported. A list
+too long for its steps is offered one way back to editable — **Fit to N
+steps**, which resamples it to one value per step and rewrites the multiplier.
 
 This is the one place the panel rewrites a schedule you did not touch. Binding
-the timeline to the step counter is what makes the two agree, and the trade is
+the steps to the step counter is what makes the two agree, and the trade is
 that changing steps writes `loras_multipliers` for every scheduled LoRA.
 
-**Slot numbers say what they are.** A comma-only token spans the whole run, and
-a stage of known length runs one value per step, so those regions are labelled
-in steps (`Steps 4–10`). A phase-specific schedule on a model whose phases are
-cut from one run is expanded inside an interval that depends on runtime model
-switching, which the plugin cannot see — its regions say *slots* rather than
-inventing step numbers, even when there is one slot per step.
-
-**Opening a timeline writes nothing.** A schedule that works out to one value
-everywhere is emitted as that single value, so opening the panel — or adding a
-region and not yet changing its strength — leaves the native multiplier exactly
-as it was. An imported schedule is likewise rendered, never re-serialised, until
-you make a material edit.
+**Looking writes nothing.** Opening a LoRA, picking a phase or selecting steps
+leaves the native multiplier exactly as it was, and an imported schedule is
+rendered, never re-serialised, until you make a material edit. Per step itself
+writes one value per step, every one the strength the phase already had.
 
 ### Switching a LoRA off
 
@@ -376,7 +361,7 @@ as `loras_multipliers` takes it: `;` between phases, `,` between steps, `:`
 between branches. So the lines above, on LTX-2 in Two Phases, are four LoRAs:
 the first scheduled over stage 1's eight steps and off in stage 2, the second
 at 0.8 in stage 1 and scheduled over the refinement's three steps. They arrive
-exactly as written and open on the timeline like any other schedule.
+exactly as written and open per step like any other schedule.
 
 - The `x` is optional, and so are spaces around the numbers. A name on its own
   loads at 1. Blank lines, `#` and `//` comments, list bullets and code fences
@@ -682,14 +667,15 @@ python -m pytest
 ```
 
 The test suite covers the parts that can be reasoned about without a running
-WanGP: multiplier parsing and serialisation, schedule compilation, region
-placement and collision resolution, state reconciliation, phase switching,
+WanGP: multiplier parsing and serialisation, schedule compilation, setting
+steps and the regions under them, state reconciliation, phase switching,
 preview matching and caching, profile and metadata persistence, and the JSON
 bridge in `plugin.py` (against stubbed WanGP/Gradio modules).
 
 The panel itself is also tested in a real browser, against that same Python
 bridge rather than a mock of it — the grid's three-row cap, the weight controls,
-and region dragging are all things only layout and pointer events can answer.
+selecting steps by dragging across them, and the editor at phone width are all
+things only layout and pointer events can answer.
 Those tests skip unless Playwright and a Chromium build are present:
 
 ```bash
@@ -701,7 +687,7 @@ python -m pytest tests/test_panel_browser.py
 plugin.py                  WanGP lifecycle, component wiring, JSON bridge
 lora_browser/
   multiplier_codec.py      parse/serialise loras_multipliers
-  schedule.py              region model: compile, reconstruct, place, collide
+  schedule.py              step schedules: compile, reconstruct, set steps
   ui_payloads.py           state model, phase resolution, action application
   stack_text.py            a stack as "name: x multiplier" text, both ways
   inventory.py             native LoRA list -> displayable entries
@@ -727,15 +713,15 @@ Four things the design spec leaves to implementation, settled here:
 - **Numeric precision.** Direct entry keeps four decimals — the same precision
   the serialiser emits — rather than the two the editor used to round to. An
   untouched imported token is not rewritten at all, whatever its precision.
-- **Linked phases.** Linking moves the plain strength of every visible phase
-  that has one, skipping any phase that is scheduled. It never copies regions
-  between phases; schedules stay independent.
-- **What fills the gaps.** Nothing: an uncovered slot is 0, not a base. The
-  strength a phase had before scheduling survives only as what a new region
-  starts at and what *Clear schedule* restores.
+- **Linked phases.** Linking moves the one strength of every visible phase
+  that has one, skipping any phase run per step. It never copies steps between
+  phases; schedules stay independent.
+- **What a phase is worth per step.** Its steps and nothing else: there is no
+  base hiding behind them. The strength a phase had before Per step starts
+  every step at it, and is what *One strength* goes back to.
 - **Irregular imported schedules.** Resampled into step alignment the first time
   they are seen, which preserves what they render; after that they follow the
-  step counter like any other. A list too long to drag usefully is preserved and
+  step counter like any other. A list too long for its steps is preserved and
   shown read-only instead, with **Fit to N steps** offered.
 - **Multi-phase coordinates.** Phase-relative by default. Exact global step
   numbers are claimed only for a schedule that really does span the whole run at
