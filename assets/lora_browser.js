@@ -78,16 +78,15 @@
     requested: {},
     pendingThumbs: [],
     linked: {},
-    // View state, not data: which phase chip is selected, whether a row's
-    // timeline is expanded, and which region is highlighted. Losing any of it
-    // costs a click; it never costs a schedule.
+    // View state, not data: which phase chip is selected, and which steps of
+    // a phase are selected to be set. Losing any of it costs a click; it
+    // never costs a value.
     selectedPhaseById: {},
-    scheduleOpenById: {},
-    selectedRegionByKey: {},
-    //: Transient pointer state for a region drag; never anything canonical.
-    drag: null,
-    //: The full-screen schedule editor, when one is open.
-    scheduleModal: null,
+    //: Selected steps, by "id#phase", 1-based.
+    pickedSteps: {},
+    //: The LoRA edited full screen, by row key, and the sheet it is in.
+    fullKey: "",
+    sheet: null,
     ready: false,
     mounted: false,
     forceNative: false,
@@ -331,7 +330,7 @@
           '<button type="button" class="lb-btn" data-lb="av" aria-haspopup="menu" hidden ' +
             'title="Make every LoRA visual only, audio only, or normal again">Audio / visual \u25BE</button>' +
           '<button type="button" class="lb-btn" data-lb="collapse-all" disabled ' +
-            'title="Close every open schedule - nothing in them changes">Collapse all</button>' +
+            'title="Close the open LoRA - nothing in it changes">Collapse all</button>' +
           '<button type="button" class="lb-btn" data-lb="paste" aria-haspopup="dialog" aria-expanded="false" ' +
             'title="Load a LoRA stack from text - one name: x multiplier per line">Paste stack</button>' +
           '<button type="button" class="lb-btn" data-lb="disable-all" ' +
@@ -1156,33 +1155,32 @@
 
   /* ------------------------------------------------------ active rows */
 
-  /* Every row has the same frame, whatever it is doing:
+  /* An open LoRA is the same editor in a card, under its line in the list,
+   * or full screen:
    *
-   *   [on] LoRA name                       [Schedule v]  [i]  [x]
-   *        [Phase 1 0.71] [Phase 2 1.23] [Independent]          (more than one phase)
-   *        [-]  --------- slider ---------  [0.71]  [+]
+   *   [Full screen] [Inspect] [Remove]
+   *   [Phase 1  0.71] [Phase 2  ~ Per step]          (more than one phase)
+   *   [ One strength | ~ Per step ]                   a phase is one or the other
+   *   one strength:  [-]  ------ slider ------  [0.71]  [+]
+   *   per step:      a bar for every step -- tap or drag across them to
+   *                  select some -- then the same [-] slider [number] [+]
+   *                  for the selected ones
    *
-   * and scheduling only changes what sits above the strength control:
+   * The slider covers 0..1; the number takes any strength WanGP takes, -2 as
+   * well as 0.5, and -/+ move by 0.01 past either end. A value outside 0..1
+   * says so under the control, and a bar shows it past its zero line or
+   * capped at its top.
    *
-   *   [on] LoRA name                     [~ Schedule ^]  [i]  [x]
-   *        [Phase 1 ~2] [Phase 2 1.23]
-   *        [Full screen] [Clear schedule]             [Delete]
-   *        timeline -- tap or drag on empty space to draw
-   *        [-]  --------- slider ---------  [0.9]  [+]    the selected region
-   *
-   * The strength control is the same control in both: it edits the plain
-   * strength, or the selected region -- never a number WanGP is not applying.
-   * A scheduled phase is its regions and every slot they do not cover is zero,
-   * so there is no plain strength left for it to show. Before anything is drawn
-   * it still edits the strength the phase is worth, and new regions start at.
+   * Per step is the phase's comma schedule, a value per step of the run. One
+   * strength puts it aside rather than deleting it: switching back brings the
+   * values back while the panel is open.
    *
    * A switched-off row keeps everything and shows what switching it back on
    * brings back; nothing in it is editable until it is on.
    *
-   * Selected phase and expansion are view state held here; regions are
-   * canonical state that Python validates. Collapsing is a view change only --
-   * it never deletes a schedule, and it never brings the plain control back for
-   * a phase that has one. */
+   * Which phase and which steps are selected is view state held here; the
+   * values are WanGP's, written through Python. Full screen is a view change
+   * too: a sheet over the page with the same editor in it. */
 
   function isOn(row) { return row.enabled !== false; }
 
@@ -1206,55 +1204,30 @@
     return list[index] || null;
   }
 
-  function hasActiveSchedule(row) {
-    return (row.phase_schedules || []).some(function (schedule) { return schedule && schedule.active; });
-  }
-
-  function regionKey(row, phase) {
-    return row.id + ":" + (row.schedule_shared ? "shared" : phase);
-  }
-
-  /* The payload's selection wins whenever the local one has gone stale, which
-     is how a freshly drawn region arrives already selected. */
-  function selectedRegion(row, phase, schedule) {
-    if (!schedule) { return null; }
-    var regions = schedule.regions || [];
-    var wanted = S.selectedRegionByKey[regionKey(row, phase)];
-    var found = null;
-    regions.forEach(function (region) {
-      if (region.id === wanted) { found = region; }
-    });
-    if (found) { return found; }
-    regions.forEach(function (region) {
-      if (region.id === schedule.selected_region_id) { found = region; }
-    });
-    return found || regions[0] || null;
-  }
-
   function rowsKey() {
     return S.rows.map(function (row) {
       return rowKeyParts(row).concat(row.sound_track ? rowKeyParts(row.sound_track) : []).join(":");
     }).join("|") + "#" + S.phases.effective + "#" + S.nameMode + "#" + S.steps
       + "#" + S.phaseSteps.join(",") + "#" + (S.schedulingEnabled ? "sched" : "nosched")
-      + "#" + S.view + "#" + S.openRow + "#" + (S.avSupported ? "av" : "")
+      + "#" + S.view + "#" + S.openRow + "#" + S.fullKey + "#" + (S.avSupported ? "av" : "")
       + "#" + (S.selecting ? "sel:" + Object.keys(S.selected).sort().join(",") : "");
   }
 
-  /* What decides a row's structure -- its own, or one side's. */
+  /* What decides a row's structure -- its own, or one side's. Values are not
+     structure: they repaint in place, so a payload that only moved a number
+     never takes the focus out of a field. */
   function rowKeyParts(row) {
     var phase = phaseOf(row);
     var schedule = scheduleOf(row, phase);
     var shape = schedule
-      ? schedule.slots + "/" + schedule.editable + "/" + (schedule.drawn_past_end || 0) + "/" +
-        (schedule.regions || []).map(function (region) {
-          return region.id + "@" + region.start + "-" + region.end;
-        }).join(",")
+      ? [schedule.slots, schedule.editable, schedule.drawn_past_end || 0, schedule.stage || 0,
+        schedule.normalization_required ? "n" : ""].join("/")
       : "-";
     // Shared is structure too: the chip strip differs, and a list with no
     // ';' turning into one per stage keeps the same stage-1 shape.
     // So is what "Fill from stage 1" offers: its tooltip names the values.
     var fill = row.stage_2_fill;
-    // Which phases are scheduled: each one's pill wears a badge for it.
+    // Which phases run per step: each one's chip and switch say so.
     var scheduled = (row.phase_schedules || []).map(function (each) {
       return each && each.active ? "1" : "0";
     }).join("");
@@ -1262,8 +1235,9 @@
       row.id, rowName(row), row.multiplier_kind, (row.phase_values || []).length,
       row.missing ? "m" : "", row.system_managed ? "s" : "",
       isOn(row) ? "on" : "off:" + (row.summary || ""),
-      phase, S.scheduleOpenById[row.id] ? "open" : "shut", shape,
+      phase, shape, (S.pickedSteps[stepsKey(row, phase)] || []).join("."),
       row.schedule_shared ? "shared" : "own", scheduled,
+      (row.parked || []).map(function (kept) { return kept ? "1" : "0"; }).join(""),
       fill ? (fill.empty ? "fill-none" : "fill-" + fill.values.join(",")) : "",
       // What a list cell is, though not the values it shows.
       (row.phase_summary || []).map(function (cell) {
@@ -1282,7 +1256,7 @@
   function renderRows(force) {
     if (!el.rows) { return; }
     // Never rebuild the DOM under a pointer that is dragging something.
-    if (S.dragging || S.drag) { return; }
+    if (S.dragging) { return; }
 
     var key = rowsKey();
     if (!force && key === S.rowsKey) {
@@ -1310,61 +1284,47 @@
     fitThumbColumn();
     requestRowThumbs();
     paintCollapseAll();
+    paintSheet();
   }
 
-  /* Rows whose Schedule menu is open right now. */
-  function openScheduleCount() {
-    if (!S.schedulingEnabled) { return 0; }
-    var count = 0;
-    S.rows.forEach(function (row) {
-      tracksOf(row).forEach(function (track) {
-        if (S.scheduleOpenById[track.id] && rowEditable(track)) { count += 1; }
-      });
-    });
-    return count;
-  }
-
-  /* Every open Schedule menu closed in one go. A view change, as each row's own
-     Schedule button is: every schedule stays exactly as it is. */
+  /* Closes the open LoRA, and full screen with it. A view change, as each
+     row's own Done is: nothing in it changes. */
   function collapseAll() {
-    S.scheduleOpenById = {};
     S.openRow = "";
-    closeScheduleModal();
+    S.fullKey = "";
     renderRows(true);
   }
 
   function paintCollapseAll() {
     if (!el.collapseAll) { return; }
-    var count = openScheduleCount();
-    var open = S.view === "list" && !!S.openRow;
-    el.collapseAll.disabled = !count && !open;
-    el.collapseAll.title = count
-      ? "Close the " + (count === 1 ? "open schedule" : count + " open schedules") + " - nothing in them changes"
-      : open ? "Close the open LoRA - nothing in it changes" : "No schedule is open";
+    var open = (S.view === "list" && !!S.openRow) || !!S.fullKey;
+    el.collapseAll.disabled = !open;
+    el.collapseAll.title = open ? "Close the open LoRA - nothing in it changes" : "No LoRA is open";
   }
 
-  /* The picture column is as wide as a row at rest is tall -- a row showing
-     its strengths, not an open timeline -- so such a row shows a square; and
-     it is that wide on every row, so switches, names and controls stay in one
-     column. A taller row (an open timeline) or a shorter one (switched off)
-     crops its picture to its own height rather than pushing its controls
+  /* The picture column is as wide as a card at rest is tall -- a card showing
+     one strength, not a phase's steps -- so such a card shows a square; and
+     it is that wide on every card, so switches, names and controls stay in one
+     column. A taller card (steps, two strengths) or a shorter one (switched
+     off) crops its picture to its own height rather than pushing its controls
      sideways. A narrow panel gives the picture less of its width. */
   function fitThumbColumn() {
     if (!el.rows) { return; }
     var width = el.rows.clientWidth;
     if (!width) { return; }                  // a hidden tab measures nothing
     var rest = 0;
-    el.rows.querySelectorAll(".lb-row").forEach(function (node) {
-      // A row with two strengths is taller at rest; it crops its picture.
-      if (node.querySelector(".lb-track")) { return; }
-      if (node.querySelector(".lb-weight-main, .lb-sched-summary")) {
+    el.rows.querySelectorAll(".lb-row:not(.lb-row-inline)").forEach(function (node) {
+      // A card with two strengths, or with steps, is taller; it crops.
+      if (node.querySelector(".lb-track, .lb-steps")) { return; }
+      if (node.querySelector(".lb-weight-main")) {
         var height = node.clientHeight;
         node.querySelectorAll(".lb-row-extra, .lb-members").forEach(function (part) { height -= part.offsetHeight; });
         rest = Math.max(rest, height);
       }
     });
     if (!rest) { return; }                   // nothing at rest: keep the last size
-    var side = Math.round(Math.max(56, Math.min(rest, 168, width * 0.24)));
+    // A phone's panel leaves the controls the width rather than the picture.
+    var side = Math.round(Math.max(56, Math.min(rest, 168, width * (width < 520 ? 0.15 : 0.24))));
     var current = parseFloat(el.rows.style.getPropertyValue("--lb-thumb")) || 0;
     if (Math.abs(side - current) >= 2) { el.rows.style.setProperty("--lb-thumb", side + "px"); }
   }
@@ -1373,43 +1333,55 @@
      number (and so must not steal focus or interrupt a gesture). */
   function updateRowValues() {
     S.rows.forEach(function (row) {
-      var node = el.rows.querySelector('.lb-row[data-id="' + cssEscape(row.id) + '"]');
-      if (node && node.__lbPaint) { node.__lbPaint(row); }
+      var selector = '.lb-row[data-id="' + cssEscape(row.id) + '"]';
+      editorRoots().forEach(function (root) {
+        root.querySelectorAll(selector).forEach(function (node) {
+          if (node.__lbPaint) { node.__lbPaint(row); }
+        });
+      });
       var item = el.rows.querySelector('.lb-li[data-id="' + cssEscape(row.id) + '"]');
       if (item && item.__lbPaint) { item.__lbPaint(row); }
     });
   }
 
-  function buildRow(row) {
+  /* One LoRA's editor. A card shows its picture and its own top line; under
+     its line in the list, or full screen, the line above it or the sheet's
+     header already does, so it opens on its tools instead. */
+  function buildRow(row, options) {
+    var inSheet = !!(options && options.sheet);
+    var inline = inSheet || S.view === "list";
     var node = document.createElement("div");
     node.className = "lb-row" + (row.missing ? " lb-missing" : "") + (isOn(row) ? "" : " lb-row-off") +
-      (row.kind === "group" ? " lb-row-group" : "");
+      (row.kind === "group" ? " lb-row-group" : "") + (inline ? " lb-row-inline" : "") +
+      (inSheet ? " lb-row-sheet" : "");
     node.dataset.id = row.id;
 
     var tracks = tracksOf(row);
     var single = tracks.length === 1;
-    var editable = rowEditable(row);
-    var open = single && editable && !!S.scheduleOpenById[row.id] && S.schedulingEnabled;
 
-    // The picture first, then everything the row edits in a column of its own.
-    node.appendChild(buildRowThumb(row));
+    if (!inline) { node.appendChild(buildRowThumb(row)); }
     var main = document.createElement("div");
     main.className = "lb-row-main";
     node.appendChild(main);
+    main.appendChild(inline ? buildToolbar(row, inSheet) : buildRowTop(row));
 
-    // With separate picture and sound strengths, each side has its own
-    // Schedule button, so the top line has none.
-    main.appendChild(buildRowTop(row, open, editable && single));
+    // Full screen has it: the panel keeps its place and says where it went.
+    if (!inSheet && S.fullKey === rowKey(row)) {
+      main.appendChild(span("lb-full-note", "Open in full screen."));
+      return node;
+    }
     if (row.kind === "group") { main.appendChild(buildMembers(row)); }
 
     if (!isOn(row)) {
       main.appendChild(buildOffSummary(row));
       appendExtras(node, row);
+      if (inline && !inSheet) { node.appendChild(doneBar(row)); }
       return node;
     }
 
     var painters = [];
     if (single) {
+      if (inline) { main.appendChild(editorHeading("Strength")); }
       painters = buildStrengths(main, row, rowName(row));
     } else {
       // One LoRA, two strengths: each side gets the editor a LoRA has.
@@ -1422,10 +1394,6 @@
         head.className = "lb-track-head";
         head.appendChild(icon(side));
         head.appendChild(span("lb-track-name", side === "sound" ? "Sound" : "Picture"));
-        var trackEditable = rowEditable(track);
-        if (trackEditable && S.schedulingEnabled) {
-          head.appendChild(scheduleToggle(track, !!S.scheduleOpenById[track.id]));
-        }
         section.appendChild(head);
         buildStrengths(section, track, rowName(row) + " " + side).forEach(function (paint) {
           painters.push(function (next) {
@@ -1438,65 +1406,11 @@
     }
 
     appendExtras(node, row);
+    if (inline && !inSheet) { node.appendChild(doneBar(row)); }
     node.__lbPaint = function (next) {
       painters.forEach(function (paint) { paint(next); });
     };
     return node;
-  }
-
-  /* A LoRA's strengths: one set, or -- with separate picture and sound
-     strengths -- the picture's and the sound's, each an entry of its own. */
-  function tracksOf(row) {
-    return row.sound_track ? [row, row.sound_track] : [row];
-  }
-
-  /* Phase chips, then the timeline or the one strength control, for one
-     entry; returns what repaints it. */
-  function buildStrengths(main, row, label) {
-    var painters = [];
-    var phase = phaseOf(row);
-    var schedule = scheduleOf(row, phase);
-    var editable = rowEditable(row);
-    var open = editable && !!S.scheduleOpenById[row.id] && S.schedulingEnabled;
-    if (row.multiplier_kind === "advanced") {
-      main.appendChild(buildPreserved(row));
-      return painters;
-    }
-    if (!editable) {
-      // A schedule this guidance mode cannot show: kept as it is, read-only.
-      main.appendChild(buildKeptSchedule(row));
-      return painters;
-    }
-    if ((row.phase_values || []).length > 1) {
-      var strip = buildPhaseStrip(row, phase, open);
-      main.appendChild(strip.node);
-      painters.push(strip.paint);
-    }
-
-    if (open) {
-      // Scheduler mode: the timeline, its tools, and the same strength control.
-      var built = buildSchedule(row, phase, schedule);
-      main.appendChild(built.node);
-      if (built.paint) { painters.push(built.paint); }
-    } else if (schedule && schedule.active) {
-      // Collapsed, but this phase is still scheduled: say so instead of
-      // offering a strength that is not the one being applied.
-      main.appendChild(buildScheduleSummary(row, schedule));
-    } else {
-      var weight = buildWeightLine({
-        value: currentValue(row, phase, schedule),
-        label: (label + " " + (S.phaseLabels[phase] || "strength")).trim(),
-        commit: function (value) { commitBase(row, phase, value); },
-        settle: flushSync
-      });
-      weight.node.classList.add("lb-weight-main");
-      main.appendChild(weight.node);
-      painters.push(function (next) {
-        var nextPhase = phaseOf(next);
-        weight.paint(currentValue(next, nextPhase, scheduleOf(next, nextPhase)));
-      });
-    }
-    return painters;
   }
 
   function currentValue(row, phase, schedule) {
@@ -1507,15 +1421,9 @@
     return values[phase] !== undefined ? values[phase] : 1;
   }
 
-  function regionValue(row, phase, region) {
-    var pending = S.localValues[regionKeyFor(row.id, phase, region.id)];
-    return pending !== undefined ? pending : region.strength;
-  }
-
   /* An edit is the user's until WanGP has answered for it. Keys are per
      control so two of them cannot overwrite each other. */
   function baseKey(id, phase) { return id + "#" + phase; }
-  function regionKeyFor(id, phase, regionId) { return id + "#" + phase + "#" + regionId; }
 
   /* The LoRA's picture, so a row is known at a glance: the tile's preview -- a
      video's first frame, with the tile's play control -- or the placeholder a
@@ -1557,44 +1465,9 @@
     return cell;
   }
 
-  /* Schedule: shows or hides the timeline of one entry's selected phase. */
-  function scheduleToggle(row, open) {
-    var scheduled = hasActiveSchedule(row);
-    var toggle = document.createElement("button");
-    toggle.type = "button";
-    toggle.className = "lb-btn lb-schedule-toggle" + (open ? " lb-on" : "") +
-      (scheduled ? " lb-scheduled" : "");
-    // The word gives way on a phone; the mark and the arrow do not.
-    [["lb-sched-mark", "\u223F"], ["lb-sched-word", "Schedule"], ["lb-sched-arrow", open ? "\u25B4" : "\u25BE"]]
-      .forEach(function (part) {
-        var mark = document.createElement("span");
-        mark.className = part[0];
-        mark.textContent = part[1];
-        toggle.appendChild(mark);
-      });
-    toggle.setAttribute("aria-label", scheduled ? "Schedule - this LoRA is scheduled" : "Schedule");
-    toggle.title = open
-      ? "Hide the timeline - the schedule is kept"
-      : scheduled
-        ? "Show this LoRA's schedule"
-        : "Schedule this phase over the steps instead of one strength";
-    toggle.setAttribute("aria-expanded", open ? "true" : "false");
-    toggle.addEventListener("click", function () {
-      var next = !S.scheduleOpenById[row.id];
-      S.scheduleOpenById[row.id] = next;
-      // Opening a phase that has no schedule yet asks Python for one; it
-      // creates the timeline without writing anything to WanGP.
-      var phase = phaseOf(row);
-      if (next && !scheduleOf(row, phase)) {
-        send({ type: "schedule_enable", id: row.id, phase: phase });
-        return;
-      }
-      renderRows(true);
-    });
-    return toggle;
-  }
-
-  function buildRowTop(row, open, editable) {
+  /* A card's top line: on/off, the name, then full screen, Inspect (or
+     Ungroup for a group) and Remove -- Remove at the far edge, apart. */
+  function buildRowTop(row) {
     var top = document.createElement("div");
     top.className = "lb-row-top";
 
@@ -1617,52 +1490,26 @@
     if (row.missing) { name.appendChild(note("Missing locally")); }
     top.appendChild(name);
 
-    if (editable && S.schedulingEnabled) {
-      top.appendChild(scheduleToggle(row, open));
-    }
+    top.appendChild(fullScreenButton(row, false));
 
     if (row.kind === "group") {
-      var ungroup = document.createElement("button");
-      ungroup.type = "button";
-      ungroup.className = "lb-btn";
-      ungroup.textContent = "Ungroup";
-      ungroup.title = "Make these separate LoRAs again; each keeps the group's strength and schedule";
-      ungroup.addEventListener("click", function () { send({ type: "ungroup", group: row.group }); });
-      top.appendChild(ungroup);
+      top.appendChild(makeButton("Ungroup", "lb-btn lb-ungroup", function () {
+        send({ type: "ungroup", group: row.group });
+      }, "Make these separate LoRAs again; each keeps the group's strength and schedule"));
     } else {
-      // One tap from every row to the full record.
-      var inspect = document.createElement("button");
-      inspect.type = "button";
-      inspect.className = "lb-btn lb-icon lb-inspect";
-      inspect.textContent = "i";
-      inspect.title = (row.has_catalogue ? "Inspect " : "Inspect / fetch info for ")
-        + (row.civitai_name || row.name);
+      // One tap from every card to the full record.
+      var inspect = makeButton("i", "lb-btn lb-icon lb-inspect", function () { openInspect(sourceId(row)); },
+        (row.has_catalogue ? "Inspect " : "Inspect / fetch info for ") + (row.civitai_name || row.name));
       inspect.setAttribute("aria-label", inspect.title);
-      inspect.addEventListener("click", function () { openInspect(sourceId(row)); });
       top.appendChild(inspect);
     }
 
     // Remove stays isolated at the far edge so it is never hit by accident.
-    var remove = document.createElement("button");
-    remove.type = "button";
-    remove.className = "lb-btn lb-icon lb-remove";
-    remove.textContent = "×";
-    remove.title = "Remove " + rowName(row) + (isOn(row) ? "" : " - and forget its settings");
-    remove.setAttribute("aria-label", "Remove " + rowName(row));
-    remove.addEventListener("click", function () {
+    var remove = makeButton("×", "lb-btn lb-icon lb-remove", function () {
       send(row.kind === "group" ? { type: "remove", id: row.id, group: row.group } : { type: "remove", id: row.id });
-    });
+    }, "Remove " + rowName(row) + (isOn(row) ? "" : " - and forget its settings"));
+    remove.setAttribute("aria-label", "Remove " + rowName(row));
     top.appendChild(remove);
-
-    if (S.view === "list") {
-      var done = document.createElement("button");
-      done.type = "button";
-      done.className = "lb-btn lb-done";
-      done.textContent = "Done \u25B4";
-      done.title = "Back to the list";
-      done.addEventListener("click", function () { S.openRow = ""; renderRows(true); });
-      top.appendChild(done);
-    }
     return top;
   }
 
@@ -1764,9 +1611,9 @@
     return wrap;
   }
 
-  /* The one mark for "this phase is scheduled" -- its strength changes from
+  /* The one mark for "this phase runs per step" -- its strength changes from
      step to step, which is what the wave stands for -- wherever it shows: a
-     phase chip, the Schedule button's wave, a collapsed schedule. The theme's
+     phase chip, the Per step switch, a list cell. The theme's
      text colour as a fill with the card colour on it, so it stands out from a
      plain value in any theme, whatever its accent. */
   function schedBadge(label) {
@@ -1782,20 +1629,18 @@
   }
 
   /* Phase chips: every effective phase, its current value, and which one the
-     strength control and timeline are editing. */
-  /* What a phase chip says it is worth. A scheduled phase has no single value:
-     it is its regions, so the chip says it is scheduled rather than show a
-     number that is not applied anywhere. */
+     controls under them are editing. A phase run per step has no single
+     value, so its chip says so rather than show a number that is not applied
+     anywhere. */
   function chipReadout(row, index) {
     var phaseName = S.phaseLabels[index] || ("Phase " + (index + 1));
     var schedule = scheduleOf(row, index);
     if (schedule && schedule.active) {
-      var count = (schedule.regions || []).length;
       return {
         scheduled: true,
-        text: "Scheduled",
-        title: phaseName + " is scheduled: its strength changes over the steps (" + count +
-          (count === 1 ? " region" : " regions") + "; steps no region covers are 0)"
+        text: "Per step",
+        title: phaseName + " runs per step: each of its " + plural(schedule.slots, "step", "steps") +
+          " at a value of its own"
       };
     }
     var values = row.phase_values || [];
@@ -1835,10 +1680,6 @@
         if (S.selectedPhaseById[row.id] === index) { return; }
         S.selectedPhaseById[row.id] = index;
         // Switching chips is a view change: it must not rewrite a token.
-        if (S.scheduleOpenById[row.id] && !scheduleOf(row, index)) {
-          send({ type: "schedule_enable", id: row.id, phase: index });
-          return;
-        }
         renderRows(true);
       });
       strip.appendChild(chip);
@@ -1854,8 +1695,8 @@
         : "One comma schedule spans the whole run, so every phase uses it";
       strip.appendChild(sharedNote);
     } else if (values.length > 1 && !scheduling) {
-      // Linking acts on the plain strength control, which scheduler mode does
-      // not have, so it is not offered there.
+      // Linking acts on one strength, which a phase run per step does not
+      // have, so it is not offered there.
       var linked = !!S.linked[row.id];
       var link = document.createElement("button");
       link.type = "button";
@@ -1884,40 +1725,6 @@
     };
   }
 
-  /* What a scheduled phase shows when its timeline is collapsed: what it is
-     doing, and a way back in. Deliberately not a control -- the strength this
-     phase applies varies over the run, so there is no one number to set. */
-  function buildScheduleSummary(row, schedule) {
-    var regions = schedule.regions || [];
-    var summary = document.createElement("button");
-    summary.type = "button";
-    summary.className = "lb-sched-summary";
-
-    summary.appendChild(schedBadge("Scheduled"));
-
-    var label = document.createElement("span");
-    label.className = "lb-sched-summary-text";
-    label.textContent = regions.length
-      ? regions.map(function (region) {
-          return fmt(region.strength) + " at " + rangeLabel(region, schedule).toLowerCase();
-        }).join(",  ")
-      : "nothing drawn - every step is 0";
-    summary.appendChild(label);
-
-    var hint = document.createElement("span");
-    hint.className = "lb-sched-summary-hint";
-    hint.textContent = "Edit schedule";
-    summary.appendChild(hint);
-
-    summary.title = "This phase is scheduled over " + schedule.slots
-      + " steps; steps no region covers are 0. Tap to edit it.";
-    summary.addEventListener("click", function () {
-      S.scheduleOpenById[row.id] = true;
-      renderRows(true);
-    });
-    return summary;
-  }
-
   /* ------------------------------------------------- strength controls */
 
   /* [-] slider [number] [+], with three deliberately different semantics:
@@ -1932,7 +1739,7 @@
     var accepted = Number(options.value);
     if (!isFinite(accepted)) { accepted = 1; }
 
-    var down = stepButton("−", "Decrease by " + fmt(S.nudgeStep));
+    var down = stepButton("−", "Decrease by " + fmt(S.nudgeStep), "lb-down");
     var range = document.createElement("input");
     range.type = "range";
     range.min = String(S.sliderMin);
@@ -1948,14 +1755,26 @@
     number.className = "lb-number";
     number.setAttribute("aria-label", (options.label || "Strength") + " value");
 
-    var up = stepButton("+", "Increase by " + fmt(S.nudgeStep));
+    var up = stepButton("+", "Increase by " + fmt(S.nudgeStep), "lb-up");
 
+    var mixed = false;
     function paint(value) {
       var next = Number(value);
       if (!isFinite(next)) { return; }
       accepted = next;
+      mixed = false;
+      number.placeholder = "";
       if (document.activeElement !== number) { number.value = fmt(next); }
       syncSliderState(range, next);
+    }
+
+    /* Several values at once, not all the same: the field says so rather than
+       show one of them as if it were all of them. */
+    function showMixed(first) {
+      paint(first);
+      mixed = true;
+      number.placeholder = "mixed";
+      if (document.activeElement !== number) { number.value = ""; }
     }
 
     function apply(value) {
@@ -1964,6 +1783,11 @@
     }
 
     function nudgeBy(delta) {
+      // Several values move each from its own.
+      if (options.nudge) {
+        options.nudge(delta);
+        return;
+      }
       var next = round4(accepted + delta);
       if (next < S.valueMin || next > S.valueMax) { return; }
       apply(next);
@@ -1987,6 +1811,8 @@
     // or "1.5e" would otherwise be pushed to WanGP mid-keystroke.
     number.addEventListener("input", function () { syncSliderState(range, number.value); });
     var applyTyped = function () {
+      // Nothing typed over "mixed" leaves every value as it is.
+      if (mixed && number.value.trim() === "") { return; }
       var value = Number(number.value);
       if (number.value.trim() === "" || !isFinite(value) ||
           value < S.valueMin || value > S.valueMax) {
@@ -2013,13 +1839,13 @@
     line.appendChild(number);
     line.appendChild(up);
     paint(accepted);
-    return { node: line, paint: paint, number: number, range: range };
+    return { node: line, paint: paint, mixed: showMixed, number: number, range: range };
   }
 
-  function stepButton(glyph, title) {
+  function stepButton(glyph, title, extra) {
     var button = document.createElement("button");
     button.type = "button";
-    button.className = "lb-btn lb-step";
+    button.className = "lb-btn lb-step" + (extra ? " " + extra : "");
     button.textContent = glyph;
     button.title = title;
     button.setAttribute("aria-label", title);
@@ -2057,10 +1883,10 @@
      rebuilt from here, so a drag keeps its pointer capture. */
   function commitBase(row, phase, value) {
     var linked = !!S.linked[row.id] && !row.schedule_shared;
-    var node = el.rows.querySelector('.lb-row[data-id="' + cssEscape(row.id) + '"]');
-    if (linked && node) {
-      node.querySelectorAll(".lb-phase-strip .lb-chip strong").forEach(function (readout) {
-        readout.textContent = fmt(value);
+    if (linked) {
+      var chips = '.lb-row[data-id="' + cssEscape(row.id) + '"] .lb-phase-strip .lb-chip strong';
+      editorRoots().forEach(function (root) {
+        root.querySelectorAll(chips).forEach(function (readout) { readout.textContent = fmt(value); });
       });
     }
     S.localValues[baseKey(row.id, phase)] = Number(value);
@@ -2075,24 +1901,198 @@
     scheduleSync();
   }
 
-  /* ------------------------------------------------------- timeline */
+  /* ----------------------------------------------- strength and steps */
 
-  /* Tools, then the timeline, then the strength control the plain row has --
-     so a row looks the same scheduled or not, give or take a timeline. The
-     timeline always has one slot per step: the step counter decides its
-     length, never a setting here. */
-  function buildSchedule(row, phase, schedule, options) {
-    options = options || {};
-    var box = document.createElement("div");
-    box.className = "lb-schedule";
-    if (!schedule) {
-      var pending = document.createElement("div");
-      pending.className = "lb-empty";
-      pending.textContent = "Opening schedule...";
-      box.appendChild(pending);
-      return { node: box, paint: null };
+  /* A LoRA's strengths: one set, or -- with separate picture and sound
+     strengths -- the picture's and the sound's, each an entry of its own. */
+  function tracksOf(row) {
+    return row.sound_track ? [row, row.sound_track] : [row];
+  }
+
+  /* A row, or the sound side of one with separate strengths: each is an
+     entry with strengths of its own. */
+  function rowById(id) {
+    var found = null;
+    S.rows.forEach(function (row) {
+      tracksOf(row).forEach(function (track) { if (track.id === id) { found = track; } });
+    });
+    return found;
+  }
+
+  /* Which schedule a phase edits: its own, or the one a shared schedule
+     gives every phase. */
+  function stepsIndex(row, phase) { return row.schedule_shared ? 0 : phase; }
+  function stepsKey(row, phase) { return row.id + "#" + stepsIndex(row, phase); }
+  function stepKeyFor(id, index, step) { return id + "#" + index + "@" + step; }
+
+  function pickedSteps(row, phase, slots) {
+    return (S.pickedSteps[stepsKey(row, phase)] || []).filter(function (step) {
+      return step >= 1 && step <= slots;
+    });
+  }
+
+  function stepValue(row, phase, schedule, step) {
+    var pending = S.localValues[stepKeyFor(row.id, stepsIndex(row, phase), step)];
+    if (pending !== undefined) { return pending; }
+    var values = (schedule && schedule.values) || [];
+    var value = values[step - 1];
+    return value === undefined ? 0 : Number(value);
+  }
+
+  function editorHeading(label) {
+    var node = document.createElement("div");
+    node.className = "lb-ed-title";
+    node.setAttribute("role", "heading");
+    node.setAttribute("aria-level", "3");
+    node.textContent = label;
+    return node;
+  }
+
+  /* Phase buttons, then One strength or Per step -- a phase is one or the
+     other -- then that one's controls; returns what repaints them. */
+  function buildStrengths(main, row, label) {
+    var painters = [];
+    if (row.multiplier_kind === "advanced") {
+      main.appendChild(buildPreserved(row));
+      return painters;
     }
+    if (!rowEditable(row)) {
+      // A schedule this guidance mode cannot show: kept as it is, read-only.
+      main.appendChild(buildKeptSchedule(row));
+      return painters;
+    }
+    var phase = phaseOf(row);
+    var schedule = scheduleOf(row, phase);
+    var perStep = !!(schedule && schedule.active);
+    var box = document.createElement("div");
+    box.className = "lb-strength";
 
+    // Which phase, and how it runs: one line where there is room for it.
+    var head = document.createElement("div");
+    head.className = "lb-strength-head";
+    if ((row.phase_values || []).length > 1) {
+      var strip = buildPhaseStrip(row, phase, perStep);
+      head.appendChild(strip.node);
+      painters.push(strip.paint);
+    }
+    var kind = S.schedulingEnabled ? kindSwitch(row, phase, schedule, perStep) : null;
+    if (kind) { head.appendChild(kind.seg); }
+    if (head.firstChild) { box.appendChild(head); }
+    if (kind) { box.appendChild(kind.note); }
+
+    if (perStep) {
+      var steps = buildSteps(row, phase, schedule, label);
+      box.appendChild(steps.node);
+      if (steps.paint) { painters.push(steps.paint); }
+    } else {
+      var range = rangeNote();
+      var weight = buildWeightLine({
+        value: currentValue(row, phase, schedule),
+        label: (label + " " + (S.phaseLabels[phase] || "strength")).trim(),
+        commit: function (value) {
+          commitBase(row, phase, value);
+          range.paint([value]);
+        },
+        settle: flushSync
+      });
+      weight.node.classList.add("lb-weight-main");
+      box.appendChild(weight.node);
+      range.paint([currentValue(row, phase, schedule)]);
+      box.appendChild(range.node);
+      painters.push(function (next) {
+        var nextPhase = phaseOf(next);
+        var value = currentValue(next, nextPhase, scheduleOf(next, nextPhase));
+        weight.paint(value);
+        range.paint([value]);
+      });
+      // Stage 2 can run per step from where stage 1 ends, in one go.
+      var fill = fillButton(row, phase);
+      if (fill) { box.appendChild(fill); }
+    }
+    main.appendChild(box);
+    return painters;
+  }
+
+  /* One strength or Per step. Per step starts with every step at the
+     phase's strength, which changes nothing WanGP applies; One strength puts
+     the per-step values aside, and Per step brings them back. */
+  function kindSwitch(row, phase, schedule, perStep) {
+    var seg = document.createElement("div");
+    seg.className = "lb-seg lb-kind-seg";
+    seg.setAttribute("role", "radiogroup");
+    seg.setAttribute("aria-label", (S.phaseLabels[phase] || "Strength") + ": one strength or per step");
+    // A list WanGP was given that does not fit the run stays as it is until
+    // it is fitted; nothing here may quietly drop it.
+    var locked = perStep && !schedule.editable;
+    [[false, "One strength"], [true, "Per step"]].forEach(function (option) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute("role", "radio");
+      button.className = option[0] ? "lb-kind-steps" : "lb-kind-flat";
+      button.setAttribute("aria-checked", option[0] === perStep ? "true" : "false");
+      if (option[0]) {
+        var wave = span("lb-kind-wave", "∿");
+        wave.setAttribute("aria-hidden", "true");
+        button.appendChild(wave);
+      }
+      button.appendChild(document.createTextNode(option[1]));
+      button.disabled = locked;
+      button.addEventListener("click", function () {
+        if (option[0] === perStep) { return; }
+        send({ type: "schedule_set_kind", id: row.id, phase: phase, per_step: option[0] });
+      });
+      seg.appendChild(button);
+    });
+    var slots = schedule ? schedule.slots : (S.phaseSteps[phase] || S.steps || 0);
+    var kept = (row.parked || [])[stepsIndex(row, phase)];
+    var note = span("lb-kind-note", perStep
+      ? (slots ? "Each of the " + plural(slots, "step", "steps") + " runs at a value of its own. "
+        : "Each step runs at a value of its own. ") +
+        "One strength goes back to " + fmt(schedule.base).replace("-", "−") + "."
+      : kept ? "One value for every step. Per step brings back the values it had."
+        : "One value for every step.");
+    seg.title = note.textContent;
+    return { seg: seg, note: note };
+  }
+
+  /* Values outside the slider's 0..1 are as good as any: the number field
+     holds them, and they are what WanGP is given. */
+  function rangeNote() {
+    var node = span("lb-range-note");
+    node.hidden = true;
+    return {
+      node: node,
+      paint: function (values) {
+        var outside = values.filter(function (value) {
+          return Number(value) < S.sliderMin || Number(value) > S.sliderMax;
+        });
+        node.hidden = !outside.length;
+        node.textContent = outside.length
+          ? fmt(outside[0]).replace("-", "−") + " is outside the slider's " + fmt(S.sliderMin) +
+            "–" + fmt(S.sliderMax) + ": the number is what applies."
+          : "";
+      }
+    };
+  }
+
+  /* Stage 2 of a staged model, at one strength while stage 1 runs per step:
+     carry stage 1 on into it. Disabled, it says why there is nothing to carry. */
+  function fillButton(row, phase) {
+    var info = row.stage_2_fill;
+    if (phase !== 1 || !info || !S.schedulingEnabled) { return null; }
+    var fill = makeButton("Fill from stage 1", "lb-btn lb-fill-stage-2", function () {
+      send({ type: "schedule_fill_stage_2", id: row.id });
+    }, info.note);
+    fill.disabled = !!info.empty;
+    return fill;
+  }
+
+  /* Per step: a bar per step on a 0..1 scale -- a value past either end says
+     so -- tapped or dragged across to select, and set with the same slider,
+     number field and -/+ as one strength. */
+  function buildSteps(row, phase, schedule, label) {
+    var box = document.createElement("div");
+    box.className = "lb-steps";
     if (!schedule.editable) {
       var locked = document.createElement("div");
       locked.className = "lb-preserved-note";
@@ -2103,602 +2103,461 @@
       if (fit) { box.appendChild(fit); }
       return { node: box, paint: null };
     }
+    var slots = Math.max(1, schedule.slots);
+    var picked = pickedSteps(row, phase, slots);
+    var strip = document.createElement("div");
+    strip.className = "lb-bars" + (slots > 12 ? " lb-bars-dense" : "");
+    strip.dataset.key = stepsKey(row, phase);
+    strip.setAttribute("role", "group");
+    strip.setAttribute("aria-label", label + ": " + plural(slots, "step", "steps") + ". Tap or drag across to select");
+    for (var step = 1; step <= slots; step += 1) {
+      strip.appendChild(buildBar(step, stepValue(row, phase, schedule, step), picked.indexOf(step) >= 0, slots));
+    }
+    wireBarPicking(strip, row, phase, picked);
+    box.appendChild(strip);
+    var kept = keptPastEnd(schedule);
+    if (kept) { box.appendChild(kept); }
 
-    var selected = selectedRegion(row, phase, schedule);
-    box.appendChild(scheduleTools(row, phase, schedule, selected, options));
-    var wrap = document.createElement("div");
-    wrap.className = "lb-timeline-wrap";
-    var timeline = buildTimeline(row, phase, schedule, selected);
-    wrap.appendChild(timeline);
-    box.appendChild(wrap);
-    var weight = buildScheduleWeight(row, phase, schedule, selected, timeline);
+    var pick = document.createElement("div");
+    pick.className = "lb-steps-pick";
+    pick.appendChild(span("lb-steps-picked", !picked.length ? "Tap or drag across steps to select them."
+      : picked.length === 1 ? "Step " + picked[0] + " selected."
+        : plural(picked.length, "step", "steps") + " selected."));
+    pick.appendChild(makeButton("All", "lb-btn lb-pick-all", function () {
+      var all = [];
+      for (var each = 1; each <= slots; each += 1) { all.push(each); }
+      setPicked(row, phase, all);
+    }, "Select every step"));
+    pick.appendChild(makeButton("None", "lb-btn lb-pick-none", function () {
+      setPicked(row, phase, []);
+    }, "Select no step"));
+    box.appendChild(pick);
+
+    var valuesOf = function (next, nextSchedule) {
+      return picked.map(function (each) { return stepValue(next, phase, nextSchedule, each); });
+    };
+    var current = valuesOf(row, schedule);
+    var range = rangeNote();
+    var weight = buildWeightLine({
+      value: current.length ? current[0] : 0,
+      label: label + (picked.length === 1 ? " step " + picked[0] : " selected steps"),
+      commit: function (value) {
+        commitSteps(row, phase, picked, value);
+        range.paint([value]);
+      },
+      nudge: function (delta) { nudgeSteps(row, phase, picked, delta); },
+      settle: flushSync,
+      disabled: !picked.length
+    });
+    weight.node.classList.add("lb-weight-steps");
+    var paintWeight = function (values) {
+      if (!values.length) { return; }
+      if (values.every(function (value) { return value === values[0]; })) {
+        weight.paint(values[0]);
+      } else {
+        weight.mixed(values[0]);
+      }
+    };
+    paintWeight(current);
+    if (!picked.length) {
+      // Nothing selected is nothing to show, not a 0.
+      weight.number.value = "";
+      weight.number.placeholder = "–";
+    }
     box.appendChild(weight.node);
+    range.paint(current);
+    box.appendChild(range.node);
 
-    // Strengths can change without any region moving, so they repaint in place
-    // rather than through a rebuild that would interrupt whoever is typing.
     return {
       node: box,
       paint: function (next) {
-        var nextSchedule = scheduleOf(next, phaseOf(next));
-        if (!nextSchedule) { return; }
-        var regions = nextSchedule.regions || [];
-        regions.forEach(function (region) {
-          var node = timeline.querySelector('.lb-region[data-region="' + cssEscape(region.id) + '"]');
-          var readout = node && node.querySelector("strong");
-          if (readout) { readout.textContent = fmt(regionValue(next, phase, region)); }
+        if (phaseOf(next) !== phase) { return; }
+        var nextSchedule = scheduleOf(next, phase);
+        if (!nextSchedule || !nextSchedule.active) { return; }
+        strip.querySelectorAll(".lb-bar").forEach(function (bar) {
+          paintBar(bar, stepValue(next, phase, nextSchedule, Number(bar.dataset.step)));
         });
-        if (!regions.length) {
-          weight.paint(currentValue(next, phase, nextSchedule));
-          return;
-        }
-        regions.forEach(function (region) {
-          if (selected && region.id === selected.id) { weight.paint(regionValue(next, phase, region)); }
-        });
+        var now = valuesOf(next, nextSchedule);
+        paintWeight(now);
+        range.paint(now);
       }
     };
   }
 
-  /* One row of tools for the whole schedule, and Delete for the selected
-     region at its far end -- there only while a region is selected. */
-  function scheduleTools(row, phase, schedule, selected, options) {
-    var tools = document.createElement("div");
-    tools.className = "lb-sched-tools";
+  function buildBar(step, value, on, slots) {
+    var bar = document.createElement("button");
+    bar.type = "button";
+    bar.className = "lb-bar" + (on ? " lb-bar-on" : "") +
+      // A long run labels every fifth step, and its ends.
+      (slots > 12 && step !== 1 && step % 5 !== 0 && step !== slots ? " lb-bar-quiet" : "");
+    bar.dataset.step = String(step);
+    bar.setAttribute("aria-pressed", on ? "true" : "false");
+    bar.appendChild(span("lb-bar-value"));
+    var up = span("lb-bar-up");
+    up.appendChild(document.createElement("i"));
+    bar.appendChild(up);
+    bar.appendChild(span("lb-bar-zero"));
+    var down = span("lb-bar-down");
+    down.appendChild(document.createElement("i"));
+    bar.appendChild(down);
+    bar.appendChild(span("lb-bar-n", String(step)));
+    paintBar(bar, value);
+    return bar;
+  }
 
-    if (!options.modal) {
-      // A long run leaves little room per slot inline; this is where the
-      // timeline gets the width to work in.
-      var expand = document.createElement("button");
-      expand.type = "button";
-      expand.className = "lb-btn";
-      expand.textContent = "⤢ Full screen";
-      expand.title = "Edit this schedule in a full-screen view";
-      expand.addEventListener("click", function () { openScheduleModal(row.id, phase); });
-      tools.appendChild(expand);
-    }
+  /* 0..1 fills the bar; past 1 it tops out with a cap, below 0 it hangs
+     under the zero line, capped past -1. The number is printed above it. */
+  function paintBar(bar, value) {
+    var number = Number(value);
+    if (!isFinite(number)) { number = 0; }
+    var text = fmt(number);
+    bar.querySelector(".lb-bar-value").textContent = text.replace("-", "−");
+    bar.querySelector(".lb-bar-up i").style.height = (Math.max(0, Math.min(1, number)) * 100) + "%";
+    bar.querySelector(".lb-bar-down i").style.height = (Math.max(0, Math.min(1, -number)) * 100) + "%";
+    bar.classList.toggle("lb-bar-over", number > 1);
+    bar.classList.toggle("lb-bar-under", number < -1);
+    bar.classList.toggle("lb-bar-odd", number < 0 || number > 1);
+    bar.dataset.value = text;
+    bar.setAttribute("aria-label", "Step " + bar.dataset.step + ", " + text);
+  }
 
-    var clear = document.createElement("button");
-    clear.type = "button";
-    clear.className = "lb-btn";
-    clear.textContent = "Clear schedule";
-    clear.title = (row.phase_values || []).length > 1 && !row.schedule_shared
-      ? "Remove only this phase's schedule and go back to one strength"
-      : "Remove the schedule and go back to one strength";
-    clear.addEventListener("click", function () {
-      if ((schedule.regions || []).length &&
-          !window.confirm("Remove this schedule and keep " + fmt(schedule.base) + " as the strength?")) {
-        return;
+  /* Tap a bar to select or unselect it; drag across bars to do the same to
+     each one passed. A finger that moves up or down is scrolling the page,
+     not selecting, so a touch waits to see which it is. The keyboard
+     toggles one bar at a time. */
+  function wireBarPicking(strip, row, phase, picked) {
+    var chosen = picked.slice();
+    var mark = function (bar, on) {
+      var step = Number(bar.dataset.step);
+      var at = chosen.indexOf(step);
+      if (on && at < 0) { chosen.push(step); }
+      if (!on && at >= 0) { chosen.splice(at, 1); }
+      bar.classList.toggle("lb-bar-on", on);
+      bar.setAttribute("aria-pressed", on ? "true" : "false");
+    };
+    strip.addEventListener("pointerdown", function (event) {
+      var first = event.target.closest(".lb-bar");
+      if (!first || event.button > 0) { return; }
+      var touch = event.pointerType === "touch";
+      var on = chosen.indexOf(Number(first.dataset.step)) < 0;
+      var startX = event.clientX;
+      var seen = {};
+      var started = false;
+      var begin = function () {
+        if (started) { return; }
+        started = true;
+        seen[first.dataset.step] = true;
+        mark(first, on);
+      };
+      if (!touch) {
+        event.preventDefault();
+        begin();
       }
-      delete S.selectedRegionByKey[regionKey(row, phase)];
-      S.scheduleOpenById[row.id] = false;
-      if (options.modal) { closeScheduleModal(); }
-      send({ type: "schedule_clear_phase", id: row.id, phase: phase });
+      S.dragging = true;
+      try { strip.setPointerCapture(event.pointerId); } catch (error) { /* not every pointer can be */ }
+      var move = function (moved) {
+        if (!started) {
+          if (Math.abs(moved.clientX - startX) < 6) { return; }
+          begin();
+        }
+        var under = document.elementFromPoint(moved.clientX, moved.clientY);
+        var bar = under && under.closest ? under.closest(".lb-bar") : null;
+        if (bar && strip.contains(bar) && !seen[bar.dataset.step]) {
+          seen[bar.dataset.step] = true;
+          mark(bar, on);
+        }
+      };
+      var finish = function (meant) {
+        strip.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", cancel);
+        S.dragging = false;
+        if (meant) {
+          begin();
+          setPicked(row, phase, chosen);
+        } else {
+          // The page took the gesture to scroll: nothing was meant.
+          setPicked(row, phase, picked);
+        }
+      };
+      var up = function () { finish(true); };
+      var cancel = function () { finish(started && !touch); };
+      strip.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+      window.addEventListener("pointercancel", cancel);
     });
-    tools.appendChild(clear);
-
-    // An empty stage 2 can be drawn once from stage 1. Disabled, it says why
-    // there is nothing to carry.
-    var fillInfo = row.stage_2_fill;
-    if (schedule.stage === 2 && fillInfo && !(schedule.regions || []).length) {
-      var fill = document.createElement("button");
-      fill.type = "button";
-      fill.className = "lb-btn lb-fill-stage-2";
-      fill.textContent = "Fill from stage 1";
-      fill.title = fillInfo.note;
-      fill.disabled = !!fillInfo.empty;
-      fill.addEventListener("click", function () {
-        delete S.selectedRegionByKey[regionKey(row, phase)];
-        send({ type: "schedule_fill_stage_2", id: row.id });
+    strip.addEventListener("click", function (event) {
+      var bar = event.target.closest(".lb-bar");
+      if (!bar || event.detail !== 0) { return; }            // a pointer already did it
+      var step = bar.dataset.step;
+      mark(bar, chosen.indexOf(Number(step)) < 0);
+      setPicked(row, phase, chosen);
+      // The rebuilt bar takes the focus back, so the keyboard can go on.
+      editorRoots().some(function (root) {
+        var again = root.querySelector('.lb-bars[data-key="' + cssEscape(stepsKey(row, phase)) +
+          '"] .lb-bar[data-step="' + step + '"]');
+        if (again) { again.focus(); }
+        return !!again;
       });
-      tools.appendChild(fill);
-    }
-
-    if (selected) {
-      var remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "lb-btn lb-delete-region";
-      remove.textContent = "Delete";
-      remove.title = "Delete the selected region (" + rangeLabel(selected, schedule).toLowerCase()
-        + "); its steps go back to 0";
-      remove.addEventListener("click", function () {
-        delete S.selectedRegionByKey[regionKey(row, phase)];
-        send({ type: "schedule_delete_region", id: row.id, phase: phase, region_id: selected.id });
-      });
-      tools.appendChild(remove);
-    }
-    return tools;
-  }
-
-  /* The plain row's strength control, pointed at what a scheduled phase has:
-     the selected region -- or, before anything is drawn, the strength the
-     phase is worth and new regions start at. */
-  function buildScheduleWeight(row, phase, schedule, selected, timeline) {
-    var drawn = (schedule.regions || []).length > 0;
-    if (!drawn || !selected) {
-      return buildWeightLine({
-        value: currentValue(row, phase, schedule),
-        label: (row.name + " " + (S.phaseLabels[phase] || "strength")).trim(),
-        commit: function (value) { commitBase(row, phase, value); },
-        settle: flushSync
-      });
-    }
-    return buildWeightLine({
-      value: regionValue(row, phase, selected),
-      label: "Strength at " + rangeLabel(selected, schedule).toLowerCase(),
-      commit: function (value) {
-        var node = timeline.querySelector('.lb-region[data-region="' + cssEscape(selected.id) + '"]');
-        var readout = node && node.querySelector("strong");
-        if (readout) { readout.textContent = fmt(value); }
-        S.localValues[regionKeyFor(row.id, phase, selected.id)] = Number(value);
-        S.pendingValues[regionKeyFor(row.id, phase, selected.id)] = {
-          type: "schedule_set_region_strength", id: row.id, phase: phase,
-          region_id: selected.id, value: Number(value)
-        };
-        scheduleSync();
-      },
-      settle: flushSync
     });
   }
 
-  /* A list too long to drag is offered one way back to editable: one value
-     per step of the run, which is what every editable timeline is. */
+  function setPicked(row, phase, steps) {
+    S.pickedSteps[stepsKey(row, phase)] = steps.slice().sort(function (a, b) { return a - b; });
+    renderRows(true);
+  }
+
+  /* Set the selected steps at once, painting them before WanGP answers. The
+     latest change is sent last, so it is the one that stays. */
+  function commitSteps(row, phase, steps, value) {
+    if (!steps.length) { return; }
+    var index = stepsIndex(row, phase);
+    var number = Number(value);
+    steps.forEach(function (step) { S.localValues[stepKeyFor(row.id, index, step)] = number; });
+    paintStepsNow(row, phase, steps, number);
+    var key = "steps#" + row.id + "#" + index + "#" + steps.join(",");
+    delete S.pendingValues[key];
+    S.pendingValues[key] = {
+      type: "schedule_set_steps", id: row.id, phase: phase, steps: steps.slice(), value: number
+    };
+    scheduleSync();
+  }
+
+  /* -/+ moves each selected step from its own value, as WanGP has it now. */
+  function nudgeSteps(row, phase, steps, delta) {
+    var current = rowById(row.id) || row;
+    var schedule = scheduleOf(current, phase);
+    steps.forEach(function (step) {
+      var next = round4(stepValue(current, phase, schedule, step) + delta);
+      if (next < S.valueMin || next > S.valueMax) { return; }
+      commitSteps(current, phase, [step], next);
+    });
+    flushSync();
+  }
+
+  function paintStepsNow(row, phase, steps, value) {
+    var selector = '.lb-bars[data-key="' + cssEscape(stepsKey(row, phase)) + '"] .lb-bar';
+    editorRoots().forEach(function (root) {
+      root.querySelectorAll(selector).forEach(function (bar) {
+        if (steps.indexOf(Number(bar.dataset.step)) >= 0) { paintBar(bar, value); }
+      });
+    });
+  }
+
+  /* A list too long for its steps is offered one way back to editable: one
+     value per step of the run, which is what every editable phase is. */
   function fitButton(row, phase, schedule) {
     var steps = schedule.stage_steps || S.steps;
     if (!schedule.normalization_required || !steps) { return null; }
-    var button = document.createElement("button");
-    button.type = "button";
-    button.className = "lb-btn";
-    button.textContent = "Fit to " + steps + " steps";
-    button.title = "Resample it to one value per step - this rewrites the multiplier";
-    button.addEventListener("click", function () {
+    return makeButton("Fit to " + steps + " steps", "lb-btn", function () {
       setStatus("Fitting this schedule to " + steps + " steps...");
       send({ type: "schedule_normalize", id: row.id, phase: phase, slots: steps });
-    });
-    return button;
-  }
-
-  function buildTimeline(row, phase, schedule, selected) {
-    var slots = Math.max(1, schedule.slots);
-    var timeline = document.createElement("div");
-    timeline.className = "lb-timeline";
-    timeline.dataset.slots = String(slots);
-
-    var ticks = tickPositions(slots);
-    ticks.forEach(function (slot) {
-      var line = document.createElement("div");
-      line.className = "lb-gridline";
-      line.style.left = ((slot - 1) / slots * 100) + "%";
-      timeline.appendChild(line);
-
-      var tick = document.createElement("div");
-      tick.className = "lb-tick";
-      tick.style.left = ((slot - 0.5) / slots * 100) + "%";
-      tick.textContent = String(slot);
-      timeline.appendChild(tick);
-    });
-
-    // Uncovered steps are zero, and saying so is the difference between "the
-    // rest is off" and "the rest is some strength you cannot see". Drawing is
-    // the only way in, so an empty timeline says how.
-    var gapNote = document.createElement("div");
-    gapNote.className = "lb-baseline";
-    gapNote.textContent = (schedule.regions || []).length
-      ? "empty steps = " + fmt(schedule.gap_strength || 0)
-      : "Tap or drag to draw a region";
-    timeline.appendChild(gapNote);
-
-    var kept = keptPastEnd(schedule);
-    if (kept) { timeline.appendChild(kept); }
-
-    (schedule.regions || []).forEach(function (region) {
-      timeline.appendChild(buildRegion(row, phase, schedule, region, selected));
-    });
-
-    // Empty space is a target too: press and drag to draw a region, or just tap
-    // for one of the default width. Regions sit above this, so a gesture that
-    // starts here always starts in free space.
-    timeline.addEventListener("pointerdown", function (event) {
-      if (event.target.closest(".lb-region")) { return; }
-      beginDraw(event, { row: row, phase: phase, schedule: schedule, timeline: timeline, slots: slots });
-    });
-    timeline.title = "Drag across empty space to draw a region, or tap for one";
-    return timeline;
+    }, "Resample it to one value per step - this rewrites the multiplier");
   }
 
   /* A lower step count hides the end of a schedule rather than deleting it,
-     so the timeline says when something is waiting past its last step. */
+     so the steps say when something is waiting past the last of them. */
   function keptPastEnd(schedule) {
     var last = Number(schedule.drawn_past_end) || 0;
     if (last <= schedule.slots) { return null; }
     var more = last - schedule.slots;
     var label = document.createElement("div");
     label.className = "lb-kept";
-    label.textContent = "+" + more + (more === 1 ? " step kept" : " steps kept");
+    label.textContent = "+" + more + (more === 1 ? " step" : " steps") + " kept past the end of the run";
     label.title = "Steps " + (schedule.slots + 1) + "-" + last + " are past the end of this "
       + schedule.slots + "-step run. They are kept, not deleted: raise the step count "
       + "and they come back as they were.";
     return label;
   }
 
-  /* ----------------------------------------------- full-screen schedule */
-
-  /* The same editor the row holds, given the whole window. Everything inside is
-     the inline code path, so dragging, drawing and committing behave
-     identically -- only the width differs. */
-  function openScheduleModal(id, phase) {
-    closeScheduleModal();
-    var row = rowById(id);
-    if (!row) { return; }
-
-    var overlay = document.createElement("div");
-    overlay.className = "lb-modal-overlay " + NS;
-    overlay.setAttribute("role", "dialog");
-    overlay.setAttribute("aria-modal", "true");
-    overlay.innerHTML =
-      '<div class="lb-modal lb-sched-modal">' +
-        '<div class="lb-modal-head">' +
-          '<div class="lb-modal-title" data-lb="title"></div>' +
-          '<button type="button" class="lb-btn lb-icon" data-lb="close" aria-label="Close">\u00D7</button>' +
-        '</div>' +
-        '<div class="lb-sched-modal-body" data-lb="body"></div>' +
-      '</div>';
-    document.body.appendChild(overlay);
-
-    S.scheduleModal = { id: id, phase: phase, node: overlay };
-    overlay.querySelector('[data-lb="close"]').addEventListener("click", closeScheduleModal);
-    overlay.addEventListener("click", function (event) {
-      if (event.target === overlay) { closeScheduleModal(); }
-    });
-    document.addEventListener("keydown", onScheduleModalKey);
-    paintScheduleModal();
+  /* Where editors are: the rows, and the full-screen sheet. */
+  function editorRoots() {
+    var roots = [];
+    if (el.rows) { roots.push(el.rows); }
+    if (S.sheet) { roots.push(S.sheet); }
+    return roots;
   }
 
-  function onScheduleModalKey(event) {
-    if (event.key === "Escape") { closeScheduleModal(); }
+  /* ------------------------------------------------- toolbar and sheet */
+
+  function fullScreenButton(row, labelled) {
+    var full = S.fullKey === rowKey(row);
+    var title = full ? "Back to the panel" : "Edit this LoRA full screen";
+    var button = makeButton(labelled ? (full ? "Exit full screen" : "Full screen") : "",
+      "lb-btn lb-full" + (labelled ? "" : " lb-icon"), function () { toggleFull(row); }, title);
+    button.insertBefore(full ? shrinkIcon() : expandIcon(), button.firstChild);
+    button.setAttribute("aria-pressed", full ? "true" : "false");
+    if (!labelled) { button.setAttribute("aria-label", title); }
+    return button;
   }
 
-  function closeScheduleModal() {
-    if (!S.scheduleModal) { return; }
-    document.removeEventListener("keydown", onScheduleModalKey);
-    S.scheduleModal.node.remove();
-    S.scheduleModal = null;
+  function expandIcon() {
+    var holder = span("lb-ic lb-ic-full");
+    holder.setAttribute("aria-hidden", "true");
+    holder.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" ' +
+      'stroke-linecap="round"><path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10"/></svg>';
+    return holder;
   }
 
-  /* A row, or the sound side of one with separate strengths: each is an
-     entry the schedule editor can be opened on. */
-  function rowById(id) {
-    var found = null;
-    S.rows.forEach(function (row) {
-      tracksOf(row).forEach(function (track) { if (track.id === id) { found = track; } });
-    });
-    return found;
+  function shrinkIcon() {
+    var holder = span("lb-ic lb-ic-full");
+    holder.setAttribute("aria-hidden", "true");
+    holder.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" ' +
+      'stroke-linecap="round"><path d="M6 2.5V6H2.5M13.5 6H10V2.5M10 13.5V10h3.5M2.5 10H6v3.5"/></svg>';
+    return holder;
   }
 
-  /* Rebuilt from each payload, the way the rows are -- never while a pointer is
-     mid-gesture inside it. */
-  function paintScheduleModal() {
-    var modal = S.scheduleModal;
-    if (!modal || S.drag || S.dragging) { return; }
-
-    var row = rowById(modal.id);
-    var schedule = row ? scheduleOf(row, modal.phase) : null;
-    if (!row || !schedule) { closeScheduleModal(); return; }
-
-    // The inline editor names the phase with its chip; here the title does.
-    var phased = (row.phase_values || []).length > 1 && !row.schedule_shared;
-    modal.node.querySelector('[data-lb="title"]').textContent =
-      "Schedule \u2014 " + rowName(row) +
-      (phased ? " \u00b7 " + (S.phaseLabels[modal.phase] || ("Phase " + (modal.phase + 1))) : "");
-    var body = modal.node.querySelector('[data-lb="body"]');
-    body.innerHTML = "";
-    body.appendChild(buildSchedule(row, modal.phase, schedule, { modal: true }).node);
-  }
-
-  /* ---------------------------------------------------- drawing a region */
-
-  function slotAt(timeline, clientX, slots) {
-    var rect = timeline.getBoundingClientRect();
-    if (!rect.width) { return 1; }
-    var slot = Math.floor((clientX - rect.left) / (rect.width / slots)) + 1;
-    return Math.max(1, Math.min(slots, slot));
-  }
-
-  /* The free run a slot falls in. Drawing is clipped to it, so a gesture that
-     starts in a gap cannot swallow the region next to it -- that is what
-     dragging a region is for. */
-  function freeRunAt(regions, slots, slot) {
-    var first = 1;
-    var last = slots;
-    (regions || []).forEach(function (region) {
-      if (region.end < slot && region.end + 1 > first) { first = region.end + 1; }
-      if (region.start > slot && region.start - 1 < last) { last = region.start - 1; }
-      if (region.start <= slot && slot <= region.end) { first = 0; }
-    });
-    return first === 0 || first > last ? null : { start: first, end: last };
-  }
-
-  function beginDraw(event, context) {
-    if (S.drag) { return; }
-    var anchor = slotAt(context.timeline, event.clientX, context.slots);
-    var run = freeRunAt(context.schedule.regions, context.slots, anchor);
-    if (!run) { return; }
-
-    event.preventDefault();
-    var ghost = document.createElement("div");
-    ghost.className = "lb-region lb-on lb-ghost";
-    var body = document.createElement("div");
-    body.className = "lb-region-body";
-    body.appendChild(document.createElement("strong"));
-    body.appendChild(document.createElement("span"));
-    ghost.appendChild(body);
-    context.timeline.appendChild(ghost);
-
-    S.drag = {
-      mode: "draw",
-      context: context,
-      anchor: anchor,
-      run: run,
-      ghost: ghost,
-      current: { start: anchor, end: anchor },
-      moved: false,
-      pointerId: event.pointerId
-    };
-    paintGhost();
-
-    try { context.timeline.setPointerCapture(event.pointerId); } catch (error) { /* mouse */ }
-    context.timeline.addEventListener("pointermove", onDrawMove);
-    context.timeline.addEventListener("pointerup", onDrawEnd);
-    context.timeline.addEventListener("pointercancel", onDrawCancel);
-  }
-
-  function paintGhost() {
-    var drag = S.drag;
-    if (!drag || drag.mode !== "draw") { return; }
-    var schedule = drag.context.schedule;
-    var region = {
-      start: drag.current.start, end: drag.current.end,
-      strength: schedule.seed_strength !== undefined ? schedule.seed_strength : schedule.base
-    };
-    placeRegion(drag.ghost, region, drag.context.slots, drag.context.schedule);
-  }
-
-  function onDrawMove(event) {
-    var drag = S.drag;
-    if (!drag || drag.mode !== "draw") { return; }
-    var slot = slotAt(drag.context.timeline, event.clientX, drag.context.slots);
-    slot = Math.max(drag.run.start, Math.min(drag.run.end, slot));
-    var next = {
-      start: Math.min(drag.anchor, slot),
-      end: Math.max(drag.anchor, slot)
-    };
-    if (next.start === drag.current.start && next.end === drag.current.end) { return; }
-    drag.current = next;
-    drag.moved = true;
-    paintGhost();
-  }
-
-  function onDrawEnd() {
-    var drag = S.drag;
-    if (!drag || drag.mode !== "draw") { return; }
-    var context = drag.context;
-    var span = drag.current;
-    var drew = drag.moved;
-    releaseDraw();
-
-    // A tap asks for a region of the default width; a drag asks for the one
-    // that was drawn. Python clips either to the free run and owns the result.
-    delete S.selectedRegionByKey[regionKey(context.row, context.phase)];
-    send({
-      type: "schedule_add_region",
-      id: context.row.id,
-      phase: context.phase,
-      start: span.start,
-      end: drew ? span.end : null
-    });
-  }
-
-  function onDrawCancel() {
-    if (!S.drag || S.drag.mode !== "draw") { return; }
-    releaseDraw();
-    renderRows(true);
-  }
-
-  function releaseDraw() {
-    var drag = S.drag;
-    if (!drag || drag.mode !== "draw") { return; }
-    var timeline = drag.context.timeline;
-    timeline.removeEventListener("pointermove", onDrawMove);
-    timeline.removeEventListener("pointerup", onDrawEnd);
-    timeline.removeEventListener("pointercancel", onDrawCancel);
-    try { timeline.releasePointerCapture(drag.pointerId); } catch (error) { /* already gone */ }
-    if (drag.ghost && drag.ghost.parentElement) { drag.ghost.remove(); }
-    S.drag = null;
-  }
-
-  function tickPositions(slots) {
-    var step = Math.max(1, Math.round(slots / 10));
-    var ticks = [];
-    for (var slot = 1; slot <= slots; slot += step) { ticks.push(slot); }
-    if (ticks[ticks.length - 1] !== slots) { ticks.push(slots); }
-    return ticks;
-  }
-
-  function buildRegion(row, phase, schedule, region, selected) {
-    var shown = { id: region.id, start: region.start, end: region.end,
-                  strength: regionValue(row, phase, region) };
-    var slots = Math.max(1, schedule.slots);
-    var node = document.createElement("div");
-    node.className = "lb-region" + (selected && selected.id === region.id ? " lb-on" : "");
-    node.dataset.region = region.id;
-    node.tabIndex = 0;
-    node.setAttribute("role", "button");
-
-    var left = document.createElement("div");
-    left.className = "lb-handle lb-handle-left";
-    left.textContent = "⋮";
-    var body = document.createElement("div");
-    body.className = "lb-region-body";
-    var strength = document.createElement("strong");
-    var span = document.createElement("span");
-    body.appendChild(strength);
-    body.appendChild(span);
-    var right = document.createElement("div");
-    right.className = "lb-handle lb-handle-right";
-    right.textContent = "⋮";
-    node.appendChild(left);
-    node.appendChild(body);
-    node.appendChild(right);
-
-    placeRegion(node, shown, slots, schedule);
-
-    var start = function (event, mode) {
-      beginDrag(event, {
-        row: row, phase: phase, schedule: schedule, region: region,
-        node: node, mode: mode, slots: slots
-      });
-    };
-    node.addEventListener("pointerdown", function (event) {
-      if (event.target === left || event.target === right) { return; }
-      start(event, "move");
-    });
-    left.addEventListener("pointerdown", function (event) { start(event, "left"); });
-    right.addEventListener("pointerdown", function (event) { start(event, "right"); });
-
-    node.addEventListener("click", function () { selectRegion(row, phase, region.id); });
-    node.addEventListener("keydown", function (event) {
-      if (event.key !== "Enter" && event.key !== " ") { return; }
-      event.preventDefault();
-      selectRegion(row, phase, region.id);
-    });
-    return node;
-  }
-
-  function placeRegion(node, region, slots, schedule) {
-    node.style.left = ((region.start - 1) / slots * 100) + "%";
-    node.style.width = ((region.end - region.start + 1) / slots * 100) + "%";
-    var strength = node.querySelector("strong");
-    var span = node.querySelector(".lb-region-body span");
-    if (strength) { strength.textContent = fmt(region.strength); }
-    if (span) { span.textContent = rangeLabel(region, schedule); }
-    node.setAttribute("aria-label", rangeLabel(region, schedule) + " at " + fmt(region.strength));
-  }
-
-  function rangeLabel(region, schedule) {
-    // Within a stage of known length a slot is a step too, just of that stage.
-    var step = schedule && (schedule.coordinate_mode === "global_exact"
-      || schedule.coordinate_mode === "stage_exact");
-    if (region.start === region.end) { return (step ? "Step " : "Slot ") + region.start; }
-    return (step ? "Steps " : "Slots ") + region.start + "–" + region.end;
-  }
-
-  function selectRegion(row, phase, regionId) {
-    if (S.selectedRegionByKey[regionKey(row, phase)] === regionId) { return; }
-    S.selectedRegionByKey[regionKey(row, phase)] = regionId;
-    renderRows(true);
-  }
-
-  /* Pointer Events with capture, so a drag survives leaving the element and
-     works the same with a mouse, a pen or a thumb. Only the dragged region's
-     styles change until the pointer is released. */
-  function beginDrag(event, context) {
-    if (S.drag) { return; }
-    event.preventDefault();
-    event.stopPropagation();
-
-    var timeline = context.node.parentElement;
-    var rect = timeline.getBoundingClientRect();
-    var slotPx = rect.width / context.slots;
-    if (!isFinite(slotPx) || slotPx <= 0) { return; }
-
-    S.selectedRegionByKey[regionKey(context.row, context.phase)] = context.region.id;
-    context.node.classList.add("lb-on", "lb-dragging");
-
-    S.drag = {
-      mode: context.mode,
-      context: context,
-      startX: event.clientX,
-      slotPx: slotPx,
-      origin: { start: context.region.start, end: context.region.end },
-      current: { start: context.region.start, end: context.region.end },
-      moved: false,
-      pointerId: event.pointerId
-    };
-
-    try { context.node.setPointerCapture(event.pointerId); } catch (error) { /* mouse fallback */ }
-    context.node.addEventListener("pointermove", onDragMove);
-    context.node.addEventListener("pointerup", onDragEnd);
-    context.node.addEventListener("pointercancel", onDragCancel);
-  }
-
-  function onDragMove(event) {
-    var drag = S.drag;
-    if (!drag || drag.mode === "draw") { return; }
-    var delta = Math.round((event.clientX - drag.startX) / drag.slotPx);
-    var slots = drag.context.slots;
-    var origin = drag.origin;
-    var next;
-
-    if (drag.context.mode === "move") {
-      var width = origin.end - origin.start + 1;
-      var first = Math.max(1, Math.min(slots - width + 1, origin.start + delta));
-      next = { start: first, end: first + width - 1 };
-    } else if (drag.context.mode === "left") {
-      next = { start: Math.max(1, Math.min(origin.end, origin.start + delta)), end: origin.end };
+  /* The open editor's own row of actions: full screen, Inspect (or Ungroup
+     for a group), Remove. Full screen's own header has the first. */
+  function buildToolbar(row, inSheet) {
+    var bar = document.createElement("div");
+    bar.className = "lb-toolbar-row";
+    if (!inSheet) { bar.appendChild(fullScreenButton(row, true)); }
+    if (row.kind === "group") {
+      bar.appendChild(makeButton("Ungroup", "lb-btn lb-ungroup", function () {
+        send({ type: "ungroup", group: row.group });
+      }, "Make these separate LoRAs again; each keeps the group's strength and schedule"));
     } else {
-      next = { start: origin.start, end: Math.max(origin.start, Math.min(slots, origin.end + delta)) };
+      bar.appendChild(makeButton("Inspect", "lb-btn lb-inspect", function () { openInspect(sourceId(row)); },
+        (row.has_catalogue ? "Inspect " : "Inspect / fetch info for ") + (row.civitai_name || row.name)));
     }
-
-    if (next.start === drag.current.start && next.end === drag.current.end) { return; }
-    drag.current = next;
-    drag.moved = true;
-
-    // Preview only: the canonical bounds are whatever Python returns. The
-    // region's own label says where it is going.
-    var preview = { start: next.start, end: next.end, strength: drag.context.region.strength };
-    placeRegion(drag.context.node, preview, slots, drag.context.schedule);
+    bar.appendChild(makeButton("Remove", "lb-btn lb-remove", function () {
+      send(row.kind === "group" ? { type: "remove", id: row.id, group: row.group } : { type: "remove", id: row.id });
+    }, "Remove " + rowName(row) + (isOn(row) ? "" : " - and forget its settings")));
+    return bar;
   }
 
-  function onDragEnd() {
-    var drag = S.drag;
-    if (!drag || drag.mode === "draw") { return; }
-    var context = drag.context;
-    releaseDrag();
-
-    if (!drag.moved) { renderRows(true); return; }
-    send({
-      type: "schedule_commit_region",
-      id: context.row.id,
-      phase: context.phase,
-      region_id: context.region.id,
-      start: drag.current.start,
-      end: drag.current.end,
-      keep_width: context.mode === "move"
-    });
+  /* Done closes the editor: everything in it is applied as it changes. */
+  function doneBar(row) {
+    return makeButton("Done", "lb-btn lb-primary lb-done", function () {
+      var key = rowKey(row);
+      S.fullKey = "";
+      if (S.view === "list" && S.openRow === key) {
+        toggleOpenRow(key);
+        return;
+      }
+      renderRows(true);
+    }, "Close the editor - every change is already applied");
   }
 
-  /* An interrupted gesture is not an edit: go back to the committed state. */
-  function onDragCancel() {
-    if (!S.drag || S.drag.mode === "draw") { return; }
-    releaseDrag();
+  function toggleFull(row) {
+    var key = rowKey(row);
+    if (S.fullKey === key) {
+      S.fullKey = "";
+    } else {
+      S.fullKey = key;
+      // Back from full screen is back to this LoRA, open in the list.
+      if (S.view === "list") { S.openRow = key; }
+    }
     renderRows(true);
   }
 
-  function releaseDrag() {
-    var drag = S.drag;
-    if (!drag || drag.mode === "draw") { return; }
-    var node = drag.context.node;
-    node.removeEventListener("pointermove", onDragMove);
-    node.removeEventListener("pointerup", onDragEnd);
-    node.removeEventListener("pointercancel", onDragCancel);
-    try { node.releasePointerCapture(drag.pointerId); } catch (error) { /* already gone */ }
-    node.classList.remove("lb-dragging");
-    S.drag = null;
+  /* Full screen is a sheet over the page with the editor in it: the same
+     editor, given the room. Escape, the backdrop or Exit full screen put it
+     back in the panel; Done closes it. */
+  function paintSheet() {
+    var row = null;
+    if (S.fullKey) {
+      S.rows.forEach(function (each) { if (rowKey(each) === S.fullKey) { row = each; } });
+    }
+    if (!row) {
+      S.fullKey = "";
+      closeSheet();
+      return;
+    }
+    var scroll = 0;
+    var focused = null;
+    var opening = !S.sheet;
+    if (opening) {
+      S.sheet = document.createElement("div");
+      S.sheet.className = "lb-modal-overlay lb-sheet-overlay " + NS;
+      S.sheet.addEventListener("click", function (event) {
+        if (event.target === S.sheet) { S.fullKey = ""; renderRows(true); }
+      });
+      document.addEventListener("keydown", onSheetKey);
+      document.body.appendChild(S.sheet);
+    } else {
+      var old = S.sheet.querySelector(".lb-sheet-body");
+      scroll = old ? old.scrollTop : 0;
+      focused = S.sheet.contains(document.activeElement) ? focusPath(document.activeElement) : null;
+    }
+    S.sheet.innerHTML = "";
+    var sheet = document.createElement("div");
+    sheet.className = "lb-sheet";
+    sheet.setAttribute("role", "dialog");
+    sheet.setAttribute("aria-modal", "true");
+    sheet.setAttribute("aria-label", "Edit " + rowName(row));
+    var grab = span("lb-sheet-grab");
+    grab.setAttribute("aria-hidden", "true");
+    sheet.appendChild(grab);
+
+    var head = document.createElement("div");
+    head.className = "lb-sheet-head";
+    if (!row.system_managed) { head.appendChild(powerSwitch(row)); }
+    var title = document.createElement("div");
+    title.className = "lb-sheet-title";
+    title.appendChild(span("lb-sheet-name", rowName(row)));
+    var sub = sheetSubtitle(row);
+    if (sub) { title.appendChild(span("lb-sheet-sub", sub)); }
+    head.appendChild(title);
+    var actions = document.createElement("div");
+    actions.className = "lb-sheet-actions";
+    actions.appendChild(fullScreenButton(row, true));
+    actions.appendChild(doneBar(row));
+    head.appendChild(actions);
+    sheet.appendChild(head);
+
+    var body = document.createElement("div");
+    body.className = "lb-sheet-body";
+    body.appendChild(buildRow(row, { sheet: true }));
+    sheet.appendChild(body);
+    S.sheet.appendChild(sheet);
+    body.scrollTop = scroll;
+    // Focus stays where it was across a rebuild, and starts on the way out.
+    var back = focused ? focusFrom(sheet, focused) : null;
+    if (back) { back.focus(); } else if (opening) { actions.querySelector(".lb-full").focus(); }
   }
 
-  function pill(label) {
-    var span = document.createElement("span");
-    span.className = "lb-pill";
-    span.textContent = label;
-    return span;
+  /* Where the focus was, as a selector the rebuilt sheet can answer. */
+  function focusPath(node) {
+    var bar = node.closest && node.closest(".lb-bar");
+    if (bar) { return '.lb-bar[data-step="' + bar.dataset.step + '"]'; }
+    var classes = typeof node.className === "string" ? node.className.trim().split(/\s+/).filter(Boolean) : [];
+    return classes.length ? node.tagName.toLowerCase() + "." + classes.join(".") : null;
+  }
+
+  function focusFrom(sheet, path) {
+    try { return sheet.querySelector(path); } catch (error) { return null; }
+  }
+
+  function sheetSubtitle(row) {
+    if (row.kind === "group") {
+      return plural((row.members || []).length, "LoRA", "LoRAs") +
+        (row.separate ? ", picture and sound strengths" : ", one strength");
+    }
+    var streams = row.streams;
+    if (!streams) { return ""; }
+    var picture = streams.picture && streams.picture.tensors;
+    var sound = streams.sound && streams.sound.tensors;
+    var bytes = ["picture", "sound", "shared"].reduce(function (sum, side) {
+      return sum + ((streams[side] && streams[side].bytes) || 0);
+    }, 0);
+    var what = picture && sound ? "Picture and sound" : picture ? "Picture only" : sound ? "Sound only" : "";
+    return [what, bytes ? megabytes(bytes) : ""].filter(Boolean).join(" · ");
+  }
+
+  function onSheetKey(event) {
+    // Inspect or a dialog over the sheet closes first.
+    if (event.key !== "Escape" || !S.sheet || S.modal || S.dialog) { return; }
+    S.fullKey = "";
+    renderRows(true);
+  }
+
+  function closeSheet() {
+    if (!S.sheet) { return; }
+    document.removeEventListener("keydown", onSheetKey);
+    S.sheet.remove();
+    S.sheet = null;
   }
 
   function rowName(row) {
@@ -2768,14 +2627,14 @@
 
   function carryOne(was, row) {
     if (!was || was === row.id) { return; }
-    [S.scheduleOpenById, S.selectedPhaseById, S.linked].forEach(function (map) {
+    [S.selectedPhaseById, S.linked].forEach(function (map) {
       if (map[was] !== undefined && map[row.id] === undefined) { map[row.id] = map[was]; }
       delete map[was];
     });
-    Object.keys(S.selectedRegionByKey).forEach(function (key) {
-      if (key.indexOf(was + ":") !== 0) { return; }
-      S.selectedRegionByKey[row.id + key.slice(was.length)] = S.selectedRegionByKey[key];
-      delete S.selectedRegionByKey[key];
+    Object.keys(S.pickedSteps).forEach(function (key) {
+      if (key.indexOf(was + "#") !== 0) { return; }
+      S.pickedSteps[row.id + key.slice(was.length)] = S.pickedSteps[key];
+      delete S.pickedSteps[key];
     });
   }
 
@@ -4814,8 +4673,6 @@
     S.phaseSteps = payload.phase_steps || [];
     S.schedulingEnabled = payload.scheduling_enabled !== false;
     S.schedulingDisabledReason = payload.scheduling_disabled_reason || "";
-    // Leaving One Phase closes every timeline: there is nothing left to show.
-    if (!S.schedulingEnabled) { S.scheduleOpenById = {}; closeScheduleModal(); }
     S.defaultProfile = payload.default_profile || "";
     S.civitaiKeySet = !!payload.civitai_key_set;
     if (payload.sort_mode) { S.sortMode = payload.sort_mode; }
@@ -4834,13 +4691,13 @@
       S.pendingThumbs = [];
       S.linked = {};
       S.selectedPhaseById = {};
-      S.scheduleOpenById = {};
-      S.selectedRegionByKey = {};
+      S.pickedSteps = {};
+      S.fullKey = "";
       S.playingTile = null;
       S.openRow = "";
       S.selected = {};
       closeInspect();
-      closeScheduleModal();
+      closeSheet();
       closeDialog();
     }
 
@@ -4861,11 +4718,11 @@
     // has just set does not flicker back to the one before it.
     if (settleSync()) { S.localValues = {}; }
 
-    // The step counter moved: bring every timeline to the new length before
+    // The step counter moved: bring every phase's steps to the new count before
     // anything is drawn from it. Python decides what that means per schedule
     // and answers with a payload where nothing is out of sync any more, so this
     // settles after one round rather than looping.
-    if (payload.schedules_out_of_sync && !S.inFlight && !S.drag && !S.dragging) {
+    if (payload.schedules_out_of_sync && !S.inFlight && !S.dragging) {
       send({ type: "schedule_resync" });
     }
 
@@ -4874,7 +4731,6 @@
     // Not forced: the row key knows when structure changed, and rebuilding on a
     // value-only payload would take focus out of a field being typed into.
     renderRows();
-    paintScheduleModal();
     paintBulk();
     paintBuildBar();
     paintBuiltLink();

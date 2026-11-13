@@ -149,6 +149,9 @@ class InstanceState:
         #: of a scheduled multiplier; re-derived from the native token whenever
         #: the two disagree, so WanGP stays the truth.
         self.schedules: dict[tuple[str, int], Any] = {}
+        #: (lora id, phase) -> the per-step values a phase had before it went
+        #: back to one strength, so Per step brings them back.  Memory only.
+        self.parked_schedules: dict[tuple[str, int], Any] = {}
         #: What the last pasted stack did, line by line, for the paste box --
         #: carried by the next payload only, the one answering the paste.
         self.paste_report: dict | None = None
@@ -578,6 +581,13 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             rows = files.decorate(rows, stack, catalogue)
             for row in rows:
                 row["phase_summary"] = up.phase_summary(row.get("multiplier_raw", "1"), phases)
+                for track in [row] + ([row["sound_track"]] if row.get("sound_track") else []):
+                    parked = instance.parked_schedules
+                    track["parked"] = [
+                        (track["id"], index) in parked
+                        or (index == 0 and (track["id"], up.SHARED_PHASE) in parked)
+                        for index in range(phases.capacity)
+                    ]
                 if row.get("sound_track"):
                     row["sound_track"]["phase_summary"] = up.phase_summary(
                         row["sound_track"].get("multiplier_raw", "1"), phases
@@ -967,6 +977,17 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             if kind == "schedule_clear_phase":
                 return up.schedule_clear_phase(stack, lora_id, phase, *args)
 
+            if kind == "schedule_set_kind":
+                return up.schedule_set_kind(
+                    stack, lora_id, phase, bool(action.get("per_step")), *args,
+                    parked=instance.parked_schedules,
+                )
+
+            if kind == "schedule_set_steps":
+                return up.schedule_set_steps(
+                    stack, lora_id, phase, action.get("steps") or [], action.get("value"), *args
+                )
+
             if kind == "schedule_fill_stage_2":
                 # Described before it writes: afterwards stage 2 is drawn, and
                 # there is nothing left on offer to describe.
@@ -1066,14 +1087,15 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             for value in old:
                 memory.pop(value, None)
             memory.update(taken)
-        moved = {}
-        for value, source in sources.items():
-            for key in [key for key in instance.schedules if key[0] == source]:
-                # Each half edits a timeline of its own.
-                moved[(value, key[1])] = copy.deepcopy(instance.schedules[key])
-        for key in [key for key in instance.schedules if key[0] in old]:
-            del instance.schedules[key]
-        instance.schedules.update(moved)
+        for kept in (instance.schedules, instance.parked_schedules):
+            moved = {}
+            for value, source in sources.items():
+                for key in [key for key in kept if key[0] == source]:
+                    # Each half edits a timeline of its own.
+                    moved[(value, key[1])] = copy.deepcopy(kept[key])
+            for key in [key for key in kept if key[0] in old]:
+                del kept[key]
+            kept.update(moved)
 
     def _rename_mode(self, instance, stack, files: StackFiles, lora_id: str, mode: str) -> str:
         lora_id = normalize_id(lora_id)
