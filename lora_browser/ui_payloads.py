@@ -8,7 +8,7 @@ corruption would come from -- directly testable.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from . import multiplier_codec as codec
@@ -959,6 +959,8 @@ def schedule_payload(
             for region in shown
         ],
         "selected_region_id": selected,
+        # One value per step of the run: what the step bars show and edit.
+        "values": [round(float(value), VALUE_DECIMALS) for value in sch.step_values(schedule)],
         # The last step drawn on when that is past the end of the run, else 0.
         "drawn_past_end": last if last > sch.held_slots(schedule.slots) else 0,
         # Every slot no region covers is worth this. It is not a fill the base
@@ -2080,6 +2082,82 @@ def schedule_clear_phase(
     target = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=False)
     target.schedule.regions = []
     target.schedule.selected_region_id = None
+    changed = _commit(stack, lora_id, target, phases, memory)
+    schedules.pop(target.key, None)
+    return changed
+
+
+def schedule_set_steps(
+    stack: "Stack",
+    lora_id: str,
+    phase: Any,
+    steps: Any,
+    value: Any,
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None = None,
+) -> bool:
+    """Set some steps of a phase that runs per step, the others as they were.
+
+    ``steps`` are 1-based steps of the run.  The value is any strength WanGP
+    takes, inside the slider's 0..1 or not: -2 is as good as 0.5.
+    """
+    target = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=False)
+    if not target.schedule.regions:
+        raise sch.ScheduleError("This phase runs at one strength - switch it to Per step first.")
+    wanted = []
+    for step in steps if isinstance(steps, (list, tuple)) else [steps]:
+        try:
+            wanted.append(int(step))
+        except (TypeError, ValueError):
+            continue
+    if not wanted:
+        return False
+    number = sanitize_value(value, None)
+    if number is None:
+        raise sch.ScheduleError(f"A strength must be a number between {VALUE_MIN:g} and {VALUE_MAX:g}.")
+    sch.set_steps(target.schedule, wanted, number)
+    return _commit(stack, lora_id, target, phases, memory)
+
+
+def schedule_set_kind(
+    stack: "Stack",
+    lora_id: str,
+    phase: Any,
+    per_step: bool,
+    phases: PhaseConfig,
+    memory: dict[str, list[float]],
+    schedules: dict[tuple[str, int], sch.PhaseSchedule],
+    context: ScheduleContext | None = None,
+    parked: dict[tuple[str, int], sch.PhaseSchedule] | None = None,
+) -> bool:
+    """One strength or Per step: a phase is one or the other.
+
+    Per step starts from what the phase was worth -- every step at its one
+    strength, which changes nothing WanGP applies -- or from the per-step
+    values it had before it went back to one strength.  One strength puts
+    those values aside (``parked``) and the phase back at its strength.
+    """
+    parked = parked if parked is not None else {}
+    target = _resolve(stack, lora_id, phase, phases, memory, schedules, context, create=True)
+    schedule = target.schedule
+    if per_step:
+        if schedule.regions:
+            return False
+        kept = parked.pop(target.key, None)
+        if kept is not None and kept.regions:
+            schedule.regions = [replace(region) for region in kept.regions]
+            schedule.selected_region_id = None
+        else:
+            sch.uniform(schedule)
+        sch.validate_regions(schedule.regions, schedule.slots)
+        return _commit(stack, lora_id, target, phases, memory)
+    if not schedule.regions:
+        return False
+    parked[target.key] = schedule.snapshot()
+    schedule.regions = []
+    schedule.selected_region_id = None
     changed = _commit(stack, lora_id, target, phases, memory)
     schedules.pop(target.key, None)
     return changed

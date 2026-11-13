@@ -357,6 +357,38 @@ class TestScheduleStateModel:
         assert up.scheduling_allowed(up.resolve_phases(SWITCHED_MODEL_DEF, 1)) is True
         assert up.scheduling_allowed(up.resolve_phases(SWITCHED_MODEL_DEF, 2)) is False
 
+    def test_per_step_starts_where_the_phase_was_and_one_strength_puts_it_back(self):
+        stack = self._stack("0.6;0.9")
+        args = (self.phases, self.memory, self.schedules, self.context)
+        parked = {}
+        assert up.schedule_set_kind(stack, "a.safetensors", 0, True, *args, parked=parked)
+        assert stack.tokens[0] == ",".join(["0.6"] * 30) + ";0.9"
+        assert up.schedule_set_steps(stack, "a.safetensors", 0, [1, 2], -2, *args)
+        assert stack.tokens[0].startswith("-2,-2,0.6,")
+        # One strength: the per-step values are put aside, the strength is back.
+        assert up.schedule_set_kind(stack, "a.safetensors", 0, False, *args, parked=parked)
+        assert stack.tokens[0] == "0.6;0.9" and ("a.safetensors", 0) in parked
+        # Per step again: the values it had.
+        assert up.schedule_set_kind(stack, "a.safetensors", 0, True, *args, parked=parked)
+        assert stack.tokens[0].startswith("-2,-2,0.6,") and not parked
+        assert not up.schedule_set_kind(stack, "a.safetensors", 0, True, *args, parked=parked)
+
+    def test_steps_take_any_strength_but_only_per_step(self):
+        stack = self._stack("0.6;0.9")
+        args = (self.phases, self.memory, self.schedules, self.context)
+        with pytest.raises(sch.ScheduleError):
+            up.schedule_set_steps(stack, "a.safetensors", 0, [1], 0.5, *args)
+        up.schedule_set_kind(stack, "a.safetensors", 0, True, *args)
+        with pytest.raises(sch.ScheduleError):
+            up.schedule_set_steps(stack, "a.safetensors", 0, [1], 99, *args)
+        assert not up.schedule_set_steps(stack, "a.safetensors", 0, [], 0.5, *args)
+        assert up.schedule_set_steps(stack, "a.safetensors", 0, [30], 1.5, *args)
+        assert stack.tokens[0].split(";")[0].split(",")[-1] == "1.5"
+        payload = up.schedule_payload(
+            self.schedules[("a.safetensors", 0)], shared=False, phases=self.phases, context=self.context
+        )
+        assert payload["values"][-1] == 1.5 and len(payload["values"]) == 30
+
     def test_reopening_a_schedule_does_not_reset_it(self):
         stack = self._stack("0.6;0.9")
         up.schedule_enable(stack, "a.safetensors", 0, self.phases, self.memory, self.schedules, self.context)

@@ -561,6 +561,76 @@ def validate_regions(regions: list[Region], slots: int) -> None:
         previous = region
 
 
+# --------------------------------------------------------------- steps
+
+
+def step_values(schedule: PhaseSchedule) -> list[float]:
+    """One value per step of the run: what the step bars show."""
+    return compile_window(schedule, schedule.slots)
+
+
+def set_steps(schedule: PhaseSchedule, steps, value: float) -> None:
+    """Give ``steps`` (1-based, inside the run) ``value``, leave the rest of
+    the run as it was, and draw the regions again from the result.
+
+    The bars a phase is edited with are its steps, and the regions are what
+    they add up to: each run of equal non-zero values is one region and a zero
+    is a gap, exactly as ``reconstruct_schedule`` reads a list.  Whatever lies
+    past the end of the run is kept.  A run set to zero everywhere stays a
+    schedule -- one region at zero -- rather than turning back into the one
+    strength it started from.
+    """
+    slots = held_slots(schedule.slots)
+    values = compile_window(schedule, slots)
+    for step in steps:
+        index = int(step) - 1
+        if 0 <= index < slots:
+            values[index] = float(value)
+
+    regions: list[Region] = []
+    index = 0
+    while index < slots:
+        if _same(values[index], GAP_STRENGTH):
+            index += 1
+            continue
+        end = index
+        while end + 1 < slots and _same(values[end + 1], values[index]):
+            end += 1
+        regions.append(Region(id="", start=index + 1, end=end + 1, strength=values[index]))
+        index = end + 1
+
+    for region in sort_regions(schedule.regions):
+        if int(region.end) <= slots:
+            continue
+        if int(region.start) > slots:
+            regions.append(replace(region, id=""))
+            continue
+        # Crossing the end: it carries on past it if the last step still has
+        # its strength; otherwise only the part past the end is kept.
+        last = next((kept for kept in regions
+                     if kept.end == slots and _same(kept.strength, region.strength)), None)
+        if last is not None:
+            last.end = int(region.end)
+        else:
+            regions.append(Region(id="", start=slots + 1, end=int(region.end), strength=region.strength))
+
+    if not regions:
+        regions = [Region(id="", start=1, end=slots, strength=GAP_STRENGTH)]
+    for number, region in enumerate(sort_regions(regions), 1):
+        region.id = f"{_ID_PREFIX}{number}"
+    schedule.regions = sort_regions(regions)
+    schedule.selected_region_id = None
+    validate_regions(schedule.regions, schedule.slots)
+
+
+def uniform(schedule: PhaseSchedule) -> None:
+    """Every step of the run at the schedule's base: the one strength it had,
+    as a step schedule that means the same."""
+    slots = held_slots(schedule.slots)
+    schedule.regions = [Region(id=f"{_ID_PREFIX}1", start=1, end=slots, strength=float(schedule.base))]
+    schedule.selected_region_id = None
+
+
 # ------------------------------------------------------------ normalisation
 
 

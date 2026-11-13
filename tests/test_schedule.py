@@ -477,3 +477,46 @@ class TestImportFidelity:
             values = [rng.choice([0.0, 0.5, 1.0]) for _ in range(rng.randint(1, 20))]
             schedule = sch.reconstruct_schedule(values)
             sch.validate_regions(schedule.regions, schedule.slots)
+
+
+# ------------------------------------------------------------ step bars
+
+
+def spans(schedule):
+    return [(r.start, r.end) for r in schedule.regions]
+
+
+def test_setting_steps_redraws_the_regions_from_the_values():
+    schedule = sch.PhaseSchedule(base=0.7, slots=8)
+    sch.uniform(schedule)
+    assert sch.step_values(schedule) == [0.7] * 8
+    sch.set_steps(schedule, [8], -2)
+    assert sch.step_values(schedule) == [0.7] * 7 + [-2.0]
+    assert spans(schedule) == [(1, 7), (8, 8)]
+    # A zero is a gap, as in an imported list.
+    sch.set_steps(schedule, [3, 4], 0)
+    assert sch.step_values(schedule) == [0.7, 0.7, 0, 0, 0.7, 0.7, 0.7, -2.0]
+    assert spans(schedule) == [(1, 2), (5, 7), (8, 8)]
+    # Steps outside the run are ignored.
+    sch.set_steps(schedule, [0, 9, 20], 5)
+    assert sch.step_values(schedule) == [0.7, 0.7, 0, 0, 0.7, 0.7, 0.7, -2.0]
+
+
+def test_every_step_at_zero_is_still_a_schedule():
+    schedule = sch.PhaseSchedule(base=0.7, slots=4)
+    sch.uniform(schedule)
+    sch.set_steps(schedule, [1, 2, 3, 4], 0)
+    assert sch.is_materialized(schedule)
+    assert sch.native_values(schedule) == [0.0] * 4
+
+
+def test_setting_steps_keeps_what_lies_past_the_end_of_the_run():
+    schedule = sch.PhaseSchedule(base=1.0, slots=4, regions=[region("r1", 3, 8, 0.5)])
+    sch.set_steps(schedule, [1], 0.9)
+    assert sch.step_values(schedule) == [0.9, 0, 0.5, 0.5]
+    assert sch.last_drawn_step(schedule) == 8
+    # Changing the last step cuts the region there; the rest past the end stays.
+    sch.set_steps(schedule, [4], 0.2)
+    assert sch.step_values(schedule) == [0.9, 0, 0.5, 0.2]
+    assert sch.last_drawn_step(schedule) == 8
+    assert [(r.start, r.end, r.strength) for r in schedule.regions if r.start > 4] == [(5, 8, 0.5)]
