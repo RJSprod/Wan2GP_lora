@@ -6,6 +6,8 @@ from lora_browser import ui_payloads as up
 
 V = "_lora_browser/a.visual.safetensors"
 A = "_lora_browser/a.audio.safetensors"
+#: Another LoRA's visual-only copy: a group is two LoRAs or more.
+VB = "_lora_browser/b.visual.safetensors"
 BAKE = "_lora_browser/_bakes/abcdef123456.r8.safetensors"
 
 
@@ -184,18 +186,18 @@ def test_a_group_switched_off_by_hand_stays_off():
 
 
 def test_bake_and_unbake():
-    s = stack(["x.safetensors", "a.safetensors", V, "y.safetensors"],
-              f"1 0.5 0.5 1\n#lora_group A a.safetensors\n#lora_group A {V}")
+    s = stack(["x.safetensors", "a.safetensors", VB, "y.safetensors"],
+              f"1 0.5 0.5 1\n#lora_group A a.safetensors\n#lora_group A {VB}")
     assert sm.bake(s, "A", BAKE)
     values, text = native(s)
     assert values == ["x.safetensors", BAKE, "y.safetensors"]
-    assert text == f"1 0.5 1\n#lora_group A a.safetensors\n#lora_group A {V}\n#lora_group A {BAKE}"
+    assert text == f"1 0.5 1\n#lora_group A a.safetensors\n#lora_group A {VB}\n#lora_group A {BAKE}"
     group = sm.groups(s)["A"]
-    assert group.baked and group.members == ["a.safetensors", V] and sm.lead_of(s, group) == BAKE
+    assert group.baked and group.members == ["a.safetensors", VB] and sm.lead_of(s, group) == BAKE
 
     assert sm.unbake(s, "A")
-    assert native(s) == (["x.safetensors", "a.safetensors", V, "y.safetensors"],
-                         f"1 0.5 0.5 1\n#lora_group A a.safetensors\n#lora_group A {V}")
+    assert native(s) == (["x.safetensors", "a.safetensors", VB, "y.safetensors"],
+                         f"1 0.5 0.5 1\n#lora_group A a.safetensors\n#lora_group A {VB}")
 
 
 def test_a_mode_change_in_a_baked_group_changes_only_its_line():
@@ -247,11 +249,11 @@ def test_fold_rows():
 
 
 def test_fold_rows_of_a_baked_group_describes_its_members():
-    s = stack([BAKE], f"0.5\n#lora_group A a.safetensors\n#lora_group A {V}\n#lora_group A {BAKE}")
+    s = stack([BAKE], f"0.5\n#lora_group A a.safetensors\n#lora_group A {VB}\n#lora_group A {BAKE}")
     rows = [{"id": BAKE, "name": "bake", "enabled": True}]
     folded = sm.fold_rows(rows, s, describe=lambda lora_id: {"name": "described " + lora_id})
     assert folded[0]["baked"] and folded[0]["bake_id"] == BAKE
-    assert [member["name"] for member in folded[0]["members"]] == ["described a.safetensors", "described " + V]
+    assert [member["name"] for member in folded[0]["members"]] == ["described a.safetensors", "described " + VB]
 
 
 def test_phase_summary_counts_steps_not_strengths():
@@ -266,3 +268,183 @@ def test_phase_summary_counts_steps_not_strengths():
     assert up.phase_summary("1,1,0.5,0", one) == [
         {"kind": "steps", "steps": 3, "of": 4, "spans": [[1, 3]], "shared": True}]
     assert up.phase_summary("1,0,1,1,0,2", one)[0]["spans"] == [[1, 1], [3, 4], [6, 6]]
+
+
+# ----------------------------------------- separate picture and sound strengths
+
+KNOWN = ["p.safetensors", "q.safetensors", "r.safetensors"]
+PV, PS, PA = (f"_lora_browser/p.{mode}.safetensors" for mode in ("visual", "sound", "audio"))
+QV, QS = (f"_lora_browser/q.{mode}.safetensors" for mode in ("visual", "sound"))
+RS, RA = (f"_lora_browser/r.{mode}.safetensors" for mode in ("sound", "audio"))
+PICTURE_BAKE = "_lora_browser/_bakes/111111111111.r8.safetensors"
+SOUND_BAKE = "_lora_browser/_bakes/222222222222.r8.sound.safetensors"
+
+
+def separate_group():
+    """p (Normal, both halves), q (Normal), r (audio only): picture 0.8, sound 0.3."""
+    lines = "".join(f"\n#lora_group A {value}" for value in (PV, PS, QV, QS, RS))
+    return stack([PV, PS, QV, QS, RS], "0.8 0.3 0.8 0.3 0.3" + lines)
+
+
+def test_separate_selects_both_halves_at_the_strength_it_had():
+    s = stack(["x.safetensors", "p.safetensors", "y.safetensors"], "1 0.8;0.5 1")
+    assert sm.set_mode_entries(s, "p.safetensors", "separate", KNOWN) == [PV, PS]
+    assert native(s) == (["x.safetensors", PV, PS, "y.safetensors"], "1 0.8;0.5 0.8;0.5 1")
+    assert sm.mode_of(s, PS, KNOWN) == "separate" and sm.unit_of(s, PS, KNOWN) == [PV, PS]
+    assert sm.partner(s, PV, KNOWN) == PS
+    # Each half has a multiplier of its own; audio only keeps the sound's.
+    s.set_token(PS, "0.3;0")
+    assert sm.set_mode(s, PV, "audio", KNOWN) == PA
+    assert native(s) == (["x.safetensors", PA, "y.safetensors"], "1 0.3;0 1")
+
+
+def test_leaving_separate_for_normal_or_visual_keeps_the_picture_strength():
+    s = stack([PV, PS], "0.8 0.3")
+    assert sm.set_mode(s, PS, "normal", KNOWN) == "p.safetensors"
+    assert native(s) == (["p.safetensors"], "0.8")
+    s = stack([PV, PS], "0.8 0.3")
+    assert sm.set_mode_entries(s, PV, "separate", KNOWN) == []   # separate already
+    assert sm.set_mode(s, PS, "visual", KNOWN) == PV             # its sound half goes
+    assert native(s) == ([PV], "0.8")
+
+
+def test_separate_halves_switched_off_stay_one_lora():
+    s = stack([PV], f"0.8\n#lora_off 1 0.3 {PS}")
+    assert sm.mode_of(s, PV, KNOWN) == "separate" and sm.unit_of(s, PS, KNOWN) == [PV, PS]
+
+
+def test_a_sound_half_on_its_own_is_repaired_to_audio_only():
+    s = stack([PS, "x.safetensors"], "0.4 1")
+    assert sm.repair(s, KNOWN)
+    assert native(s) == ([PA, "x.safetensors"], "0.4 1")
+    assert not sm.repair(s, KNOWN)
+
+
+def test_two_halves_of_one_lora_are_no_group():
+    s = stack([PV, PS], f"1 1\n#lora_group A {PV}\n#lora_group A {PS}")
+    assert sm.groups(s) == {} and native(s)[1] == "1 1"
+
+
+def test_grouping_with_a_separate_lead_gives_the_group_both_strengths():
+    s = stack([PV, PS, "q.safetensors", RA], "0.8 0.3 1 0.5")
+    assert sm.create_group(s, [PV, "q.safetensors", RA], lead=PV, known_ids=KNOWN) == "A"
+    values, text = native(s)
+    assert values == [PV, PS, QV, QS, RS]
+    assert text.split("\n")[0] == "0.8 0.3 0.8 0.3 0.3"
+    group = sm.groups(s)["A"]
+    assert group.separate and group.tracks == ["picture", "sound"]
+    assert group.track_members("picture") == [PV, QV] and group.track_members("sound") == [PS, QS, RS]
+    assert sm.lead_of(s, group) == PV and sm.lead_of(s, group, "sound") == PS
+    # The sound side's lead moves the sound side only.
+    s.set_token(PS, "0.1")
+    assert sm.sync_tokens(s)
+    assert native(s)[1].split("\n")[0] == "0.8 0.1 0.8 0.1 0.1"
+
+
+def test_grouping_with_a_plain_lead_joins_a_separate_lora_back_into_one():
+    s = stack([PV, PS, "q.safetensors"], "0.8 0.3 1")
+    assert sm.create_group(s, [PV, "q.safetensors"], lead="q.safetensors", known_ids=KNOWN) == "A"
+    assert native(s) == (["q.safetensors", "p.safetensors"],
+                         "1 1\n#lora_group A q.safetensors\n#lora_group A p.safetensors")
+
+
+def test_separating_a_group_and_joining_it_again():
+    lines = "".join(f"\n#lora_group A {value}" for value in ("p.safetensors", QV, RA))
+    s = stack(["p.safetensors", QV, RA], "0.7 0.7 0.7" + lines)
+    assert sm.set_separate(s, "A", True, KNOWN)
+    assert native(s)[0] == [PV, PS, QV, RS]
+    assert sm.groups(s)["A"].separate
+    s.set_token(PS, "0.2")
+    sm.sync_tokens(s)
+    assert native(s)[1].split("\n")[0] == "0.7 0.2 0.7 0.2"
+    assert not sm.set_separate(s, "A", True, KNOWN)
+    # Joined, the group keeps the picture's strength.
+    assert sm.set_separate(s, "A", False, KNOWN)
+    assert native(s)[0] == ["p.safetensors", QV, RA]
+    assert native(s)[1].split("\n")[0] == "0.7 0.7 0.7"
+
+
+def test_a_members_mode_in_a_separate_group():
+    s = separate_group()
+    assert sm.set_mode_entries(s, QV, "audio", KNOWN) == [QS]
+    assert native(s)[0] == [PV, PS, QS, RS]
+    assert sm.set_mode_entries(s, QS, "normal", KNOWN) == [QV, QS]
+    values, text = native(s)
+    assert values == [PV, PS, QV, QS, RS] and text.split("\n")[0] == "0.8 0.3 0.8 0.3 0.3"
+
+
+def test_baking_a_separate_group_bakes_each_side_into_a_file():
+    s = separate_group()
+    assert sm.bake(s, "A", {"picture": PICTURE_BAKE, "sound": SOUND_BAKE})
+    values, text = native(s)
+    assert values == [PICTURE_BAKE, SOUND_BAKE] and text.split("\n")[0] == "0.8 0.3"
+    group = sm.groups(s)["A"]
+    assert group.bakes == {"picture": PICTURE_BAKE, "sound": SOUND_BAKE}
+    assert group.members == [PV, PS, QV, QS, RS] and group.files == [PICTURE_BAKE, SOUND_BAKE]
+    assert sm.lead_of(s, group, "sound") == SOUND_BAKE
+    assert sm.group_of(s, SOUND_BAKE).letter == "A"
+    assert sm.unbake(s, "A")
+    values, text = native(s)
+    assert sorted(values) == sorted([PV, PS, QV, QS, RS])
+    assert dict(zip(values, text.split("\n")[0].split())) == {PV: "0.8", QV: "0.8", PS: "0.3", QS: "0.3", RS: "0.3"}
+
+
+def test_a_side_with_one_member_is_not_baked():
+    lines = "".join(f"\n#lora_group A {value}" for value in (PV, PS, QV))
+    s = stack([PV, PS, QV], "0.8 0.3 0.8" + lines)
+    assert sm.bake(s, "A", {"picture": PICTURE_BAKE, "sound": SOUND_BAKE})
+    assert native(s)[0] == [PICTURE_BAKE, PS]
+    assert sm.groups(s)["A"].bakes == {"picture": PICTURE_BAKE}
+
+
+def test_a_baked_side_whose_members_bring_nothing_is_skipped():
+    s = separate_group()
+    sm.bake(s, "A", {"picture": PICTURE_BAKE, "sound": SOUND_BAKE})
+    sm.settle(s, lambda lora_id: lora_id in (PS, QS, RS))
+    assert native(s)[0] == [PICTURE_BAKE] and SOUND_BAKE in s.skipped()
+
+
+def test_leaving_a_separate_group():
+    s = separate_group()
+    # r was audio only: out of the group it is its audio-only copy again.
+    assert sm.leave_group(s, "A", RS, KNOWN)
+    assert native(s)[0] == [PV, PS, QV, QS, RA]
+    # Two LoRAs left: the group dissolves, each keeping both strengths.
+    assert sm.leave_group(s, "A", QV, KNOWN)
+    assert sm.groups(s) == {}
+    assert sm.mode_of(s, PV, KNOWN) == "separate" and sm.mode_of(s, QS, KNOWN) == "separate"
+
+
+def test_joining_a_separate_group_selects_the_halves_it_needs():
+    lines = "".join(f"\n#lora_group A {value}" for value in (PV, PS, QV, QS))
+    s = stack([PV, PS, QV, QS, "r.safetensors"], "0.8 0.3 0.8 0.3 1" + lines)
+    assert sm.add_to_group(s, "A", "r.safetensors", KNOWN)
+    values, text = native(s)
+    assert values == [PV, PS, QV, QS, _rv := "_lora_browser/r.visual.safetensors", RS]
+    assert text.split("\n")[0] == "0.8 0.3 0.8 0.3 0.8 0.3"
+
+
+def test_a_normal_member_in_a_separate_group_is_repaired_into_halves():
+    lines = "".join(f"\n#lora_group A {value}" for value in (PV, PS, "q.safetensors"))
+    s = stack([PV, PS, "q.safetensors"], "0.8 0.3 1" + lines)
+    assert sm.repair(s, KNOWN)
+    assert native(s)[0] == [PV, PS, QV, QS]
+    assert native(s)[1].split("\n")[0] == "0.8 0.3 0.8 0.3"
+
+
+def test_fold_rows_of_separate_strengths():
+    s = stack([PV, PS, "x.safetensors"], "0.8 0.3 1")
+    rows = [{"id": value, "name": value, "enabled": True} for value in (PV, PS, "x.safetensors")]
+    folded = sm.fold_rows(rows, s, describe=lambda lora_id: {"name": lora_id}, known_ids=KNOWN)
+    assert [row["id"] for row in folded] == [PV, "x.safetensors"]
+    assert folded[0]["mode"] == "separate" and folded[0]["sound_track"]["id"] == PS
+    assert folded[0]["sound_track"]["track"] == "sound"
+
+    s = separate_group()
+    rows = [{"id": value, "name": value, "enabled": True} for value in (PV, PS, QV, QS, RS)]
+    folded = sm.fold_rows(rows, s, describe=lambda lora_id: {"name": lora_id}, known_ids=KNOWN)
+    assert len(folded) == 1
+    group = folded[0]
+    assert group["separate"] and group["id"] == PV and group["sound_track"]["id"] == PS
+    assert [member["entries"] for member in group["members"]] == [[PV, PS], [QV, QS], [RS]]
+    assert [member["member_mode"] for member in group["members"]] == ["normal", "normal", "audio"]

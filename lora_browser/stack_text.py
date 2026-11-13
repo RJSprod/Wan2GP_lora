@@ -27,6 +27,12 @@ Tags in brackets after the name carry what the panel adds to a LoRA:
 ``visual``/``audio`` (or ``normal``) is the mode, ``group A`` the group it
 moves with, and ``baked r32`` that the group is baked at rank 32.  Brackets
 holding anything else are part of the name, as they always were.
+
+A LoRA whose picture and sound have strengths of their own is two lines, one
+per side:
+
+    Rain_Ambience [picture]: x1;1
+    Rain_Ambience [sound]: x0.4;0.2
 """
 
 from __future__ import annotations
@@ -55,7 +61,9 @@ _LOOSE = re.compile(r"[\W_]+")
 _TAGGED = re.compile(r"^(?P<name>.*?\S)\s*\[(?P<tags>[^\[\]]*)\]$")
 _GROUP_TAG = re.compile(r"^group\s+([a-z])$")
 _BAKED_TAG = re.compile(r"^baked\s+r?([1-9]\d{0,4})$")
-TAG_MODES = ("normal", "visual", "audio")
+#: ``picture`` and ``sound`` are the two sides of a LoRA with separate
+#: strengths; ``picture`` reads the same as ``visual``.
+TAG_MODES = ("normal", "visual", "audio", "picture", "sound")
 
 
 @dataclass(frozen=True)

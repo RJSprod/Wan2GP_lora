@@ -423,6 +423,14 @@ WHY IT TOOK FOUR ROUNDS
     #lora_group <letter> <lora> (one per member; a baked group also lists its
     file). The ids in loras_choices name the built file itself.
 
+    Separate picture and sound strengths need no marker at all: the LoRA is
+    selected as <name>.visual and <name>.sound, two entries with two
+    multipliers, and a sound half beside its visual half IS that LoRA with two
+    strengths. The sound half leaves out the layers both streams read (the
+    text projection in front of both connectors) because the visual half keeps
+    them; with both halves selected they must be applied exactly once. A
+    group's sound-side bake ends .sound.safetensors so its side is in its id.
+
 3.10 Noise you can ignore
     "Too many arguments provided for the endpoint." is a stock Gradio 5.29
     client-side warning emitted for ANY event that passes `inputs`. Reproducible

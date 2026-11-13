@@ -115,6 +115,9 @@ def test_keeps():
     assert lf.keeps(lf.SOUND, "audio") and not lf.keeps(lf.PICTURE, "audio")
     assert lf.keeps(lf.SHARED, "visual") and lf.keeps(lf.SHARED, "audio")
     assert all(lf.keeps(side, "normal") for side in lf.SIDES)
+    # The sound half sits beside the visual copy, which has the shared layers.
+    assert lf.keeps(lf.SOUND, "sound") and not lf.keeps(lf.SHARED, "sound")
+    assert not lf.keeps(lf.PICTURE, "sound")
 
 
 # ---------------------------------------------------------------- summary

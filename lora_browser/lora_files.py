@@ -184,11 +184,19 @@ def ltx2_side(name: str) -> str:
 
 
 def keeps(side: str, mode: str) -> bool:
-    """Whether a copy in ``mode`` keeps a tensor on ``side``."""
+    """Whether a copy in ``mode`` keeps a tensor on ``side``.
+
+    ``sound`` is the sound half of a LoRA whose picture and sound have
+    strengths of their own: it is selected beside the ``visual`` copy, which
+    keeps the shared layers, so it leaves them out -- applied twice, they
+    would take the sum of the two strengths.
+    """
     if mode == "visual":
         return side in (PICTURE, SHARED)
     if mode == "audio":
         return side in (SOUND, SHARED)
+    if mode == "sound":
+        return side == SOUND
     return True
 
 
@@ -225,7 +233,7 @@ class StreamSummary:
         """
         if mode == "visual":
             return self.picture.tensors > 0
-        if mode == "audio":
+        if mode in ("audio", "sound"):
             return self.sound.tensors > 0
         return self.picture.tensors + self.sound.tensors + self.shared.tensors > 0
 

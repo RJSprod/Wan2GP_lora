@@ -326,3 +326,159 @@ def test_build_status_is_polled(plugin, state):
 def test_view_preference(plugin, state):
     act(plugin, {"type": "view", "value": "cards"}, state, [], "")
     assert payload_of(plugin, state, [], "")["stack_view"] == "cards"
+
+
+# ---------------------------------------- separate picture and sound strengths
+
+S_BOTH = dv.split_id(BOTH, "sound")
+
+
+def separate(plugin, state, selected=(BOTH, PICTURE), multipliers="0.8;0.8 1;1"):
+    choices, mults, payload = act(plugin, {"type": "set_mode", "id": BOTH, "mode": "separate"},
+                                  state, list(selected), multipliers)
+    return native(choices, list(selected)), native(mults, multipliers), payload
+
+
+def test_separate_strengths_are_one_row_over_two_halves(plugin, state, loras):
+    selected, text, payload = separate(plugin, state)
+    assert selected == [V_BOTH, S_BOTH, PICTURE] and text == "0.8;0.8 0.8;0.8 1;1"
+    assert "picture strength and a sound strength" in payload["status"]
+    rows = payload["active"]
+    assert [row["id"] for row in rows] == [V_BOTH, PICTURE]
+    row = rows[0]
+    assert row["mode"] == "separate" and row["source_id"] == BOTH and row["name"] == BOTH
+    assert row["sound_track"]["id"] == S_BOTH and row["sound_track"]["track"] == "sound"
+    assert row["sound_track"]["phase_summary"] == [{"kind": "value", "value": 0.8}] * 2
+    assert row["build"]["state"] == "queued" and len(row["build"]["files"]) == 2
+    assert payload["builds"]["waiting"] == 2
+    assert "both [picture]: x0.8;0.8\nboth [sound]: x0.8;0.8" in payload["stack_text"]
+
+    build_all(plugin)
+    payload = payload_of(plugin, state, selected, text)
+    assert payload["active"][0]["build"]["state"] == "built"
+    # The halves hold every tensor once: the shared layers stay in the picture's.
+    _, _, picture = read_tensors(loras / V_BOTH)
+    _, _, sound = read_tensors(loras / S_BOTH)
+    _, _, original = read_tensors(loras / BOTH)
+    assert set(picture) | set(sound) == set(original) and not set(picture) & set(sound)
+    assert all("audio" in name or "video_to_audio" in name for name in sound)
+
+
+def test_each_side_is_edited_on_its_own(plugin, state):
+    selected, text, _ = separate(plugin, state)
+    choices, mults, payload = act(plugin, {"type": "set_strength", "id": S_BOTH, "phase": 0, "value": 0.3},
+                                  state, selected, text)
+    assert native(mults, None).split()[:2] == ["0.8;0.8", "0.3;0.8"]
+    row = payload["active"][0]
+    assert row["phase_summary"][0]["value"] == 0.8 and row["sound_track"]["phase_summary"][0]["value"] == 0.3
+
+
+def test_two_halves_switch_off_and_go_as_one(plugin, state):
+    selected, text, _ = separate(plugin, state)
+    choices, mults, payload = act(plugin, {"type": "set_enabled", "id": V_BOTH, "value": False}, state, selected, text)
+    assert native(choices, None) == [PICTURE]
+    assert f"#lora_off 0 0.8;0.8 {V_BOTH}" in native(mults, None) and f"#lora_off 1 0.8;0.8 {S_BOTH}" in native(mults, None)
+    row = payload["active"][0]
+    assert row["mode"] == "separate" and row["enabled"] is False
+    choices, mults, _ = act(plugin, {"type": "set_enabled", "id": V_BOTH, "value": True}, state, [PICTURE], native(mults, None))
+    assert native(choices, None) == [V_BOTH, S_BOTH, PICTURE]
+
+    choices, mults, _ = act(plugin, {"type": "remove", "id": V_BOTH}, state, selected, text)
+    assert native(choices, None) == [PICTURE] and native(mults, None) == "1;1"
+    # Its tile takes it out the same way.
+    choices, _, _ = act(plugin, {"type": "toggle", "id": BOTH, "enabled": False}, state, selected, text)
+    assert native(choices, None) == [PICTURE]
+
+
+def test_leaving_separate_strengths(plugin, state):
+    selected, text, _ = separate(plugin, state)
+    text = "0.8;0.8 0.3;0.3 1;1"
+    choices, mults, _ = act(plugin, {"type": "set_mode", "id": V_BOTH, "mode": "audio"}, state, selected, text)
+    assert native(choices, None) == [dv.split_id(BOTH, "audio"), PICTURE] and native(mults, None) == "0.3;0.3 1;1"
+    choices, mults, _ = act(plugin, {"type": "set_mode", "id": V_BOTH, "mode": "normal"}, state, selected, text)
+    assert native(choices, None) == [BOTH, PICTURE] and native(mults, None) == "0.8;0.8 1;1"
+
+
+def test_a_lora_with_one_side_has_no_second_strength(plugin, state):
+    choices, _, payload = act(plugin, {"type": "set_mode", "id": PICTURE, "mode": "separate"}, state, [PICTURE], "1;1")
+    assert choices == {} and "no second strength" in payload["status"]
+
+
+def test_profiles_and_stack_text_keep_both_strengths(plugin, state):
+    selected, text, _ = separate(plugin, state, multipliers="0.8;0.8 1;1")
+    text = "0.8;0.8 0.3;0.2 1;1"
+    instance = plugin._instance("t")
+    _, _, payload = act(plugin, {"type": "profile_save", "name": "split"}, state, selected, text)
+    choices, mults, payload = act(plugin, {"type": "profile_recall", "name": "split"}, state, [PICTURE], "1;1")
+    assert native(choices, None) == selected and native(mults, None) == text
+    assert payload["active"][0]["mode"] == "separate"
+    assert instance is plugin._instance("t")
+
+    paste = "both [picture]: x0.8;0.8\nboth [sound]: x0.3;0.2\npicture: x1;1"
+    choices, mults, payload = act(plugin, {"type": "stack_paste", "text": paste}, state, [PICTURE], "1;1")
+    assert native(choices, None) == selected and native(mults, None) == text
+    # A sound line on its own is the LoRA's audio-only copy.
+    choices, mults, _ = act(plugin, {"type": "stack_paste", "text": "both [sound]: x0.5;0.5"}, state, [PICTURE], "1;1")
+    assert native(choices, None) == [dv.split_id(BOTH, "audio")]
+
+
+def test_a_group_with_separate_strengths(plugin, state, loras):
+    big = "big.safetensors"
+    choices, mults, _ = act(plugin, {"type": "group_create", "ids": [BOTH, big], "lead": BOTH},
+                            state, [BOTH, big, PICTURE], "0.8;0.8 0.6;0.6 1;1")
+    selected, text = native(choices, None), native(mults, None)
+    choices, mults, payload = act(plugin, {"type": "group_separate", "group": "A", "value": True}, state, selected, text)
+    selected, text = native(choices, None), native(mults, None)
+    s_big, v_big = dv.split_id(big, "sound"), dv.split_id(big, "visual")
+    assert selected == [V_BOTH, S_BOTH, v_big, s_big, PICTURE]
+    group = payload["active"][0]
+    assert group["kind"] == "group" and group["separate"] and group["id"] == V_BOTH
+    assert group["sound_track"]["id"] == S_BOTH
+    assert [member["mode"] for member in group["members"]] == ["normal", "normal"]
+    assert [member["entries"] for member in group["members"]] == [[V_BOTH, S_BOTH], [v_big, s_big]]
+
+    # The sound side's lead moves every sound half, and only those.
+    choices, mults, _ = act(plugin, {"type": "set_strength", "id": S_BOTH, "phase": 0, "value": 0.25}, state, selected, text)
+    text = native(mults, None)
+    tokens = dict(zip(selected, text.split("\n")[0].split()))
+    assert tokens[S_BOTH] == tokens[s_big] == "0.25;0.8" and tokens[V_BOTH] == tokens[v_big] == "0.8;0.8"
+
+    # Baked, each side becomes a file of its own, with its own strength.
+    choices, mults, payload = act(plugin, {"type": "bake", "group": "A", "rank": 4}, state, selected, text)
+    baked, baked_text = native(choices, None), native(mults, None)
+    assert len([value for value in baked if "_bakes/" in value]) == 2
+    assert any(value.endswith(".sound.safetensors") and "_bakes/" in value for value in baked)
+    assert baked_text.split("\n")[0].split()[:2] == ["0.8;0.8", "0.25;0.8"]
+    build_all(plugin)
+    payload = payload_of(plugin, state, baked, baked_text)
+    group = payload["active"][0]
+    assert group["baked"] and group["bake"]["state"] == "built" and len(group["bake"]["files"]) == 2
+    assert group["sound_track"]["id"].endswith(".sound.safetensors")
+
+    # Joined again, the group keeps the picture's strength -- and stays baked.
+    choices, mults, payload = act(plugin, {"type": "group_separate", "group": "A", "value": False}, state, baked, baked_text)
+    joined = native(choices, None)
+    assert len([value for value in joined if "_bakes/" in value]) == 1 and PICTURE in joined
+    assert native(mults, None).split("\n")[0].split()[0] == "0.8;0.8"
+    assert not payload["active"][0]["separate"]
+
+
+def test_a_picture_only_member_brings_nothing_to_the_sound_side(plugin, state):
+    choices, mults, _ = act(plugin, {"type": "group_create", "ids": [BOTH, PICTURE], "lead": BOTH},
+                            state, [BOTH, PICTURE], "1;1 1;1")
+    choices, mults, payload = act(plugin, {"type": "group_separate", "group": "A", "value": True},
+                                  state, native(choices, None), native(mults, None))
+    s_picture = dv.split_id(PICTURE, "sound")
+    assert s_picture not in native(choices, None) and f"#lora_skip" in native(mults, None)
+    # Its empty sound half is not something Enable all can switch on.
+    assert payload["can_enable_all"] is False
+    selected, text = native(choices, None), native(mults, None)
+    choices, mults, payload = act(plugin, {"type": "enable_all"}, state, selected, text)
+    assert native(choices, selected) == selected and s_picture not in native(choices, selected)
+    assert "already on" in payload["status"]
+    # A group whose LoRAs only change the picture has nothing to separate.
+    v_big = dv.split_id("big.safetensors", "visual")
+    lines = f"\n#lora_group A {PICTURE}\n#lora_group A {v_big}"
+    choices, _, payload = act(plugin, {"type": "group_separate", "group": "A", "value": True},
+                              state, [PICTURE, v_big], "1;1 1;1" + lines)
+    assert choices == {} and "no second strength" in payload["status"]

@@ -1233,43 +1233,50 @@
 
   function rowsKey() {
     return S.rows.map(function (row) {
-      var phase = phaseOf(row);
-      var schedule = scheduleOf(row, phase);
-      var shape = schedule
-        ? schedule.slots + "/" + schedule.editable + "/" + (schedule.drawn_past_end || 0) + "/" +
-          (schedule.regions || []).map(function (region) {
-            return region.id + "@" + region.start + "-" + region.end;
-          }).join(",")
-        : "-";
-      // Shared is structure too: the chip strip differs, and a list with no
-      // ';' turning into one per stage keeps the same stage-1 shape.
-      // So is what "Fill from stage 1" offers: its tooltip names the values.
-      var fill = row.stage_2_fill;
-      // Which phases are scheduled: each one's pill wears a badge for it.
-      var scheduled = (row.phase_schedules || []).map(function (each) {
-        return each && each.active ? "1" : "0";
-      }).join("");
-      return [
-        row.id, rowName(row), row.multiplier_kind, (row.phase_values || []).length,
-        row.missing ? "m" : "", row.system_managed ? "s" : "",
-        isOn(row) ? "on" : "off:" + (row.summary || ""),
-        phase, S.scheduleOpenById[row.id] ? "open" : "shut", shape,
-        row.schedule_shared ? "shared" : "own", scheduled,
-        fill ? (fill.empty ? "fill-none" : "fill-" + fill.values.join(",")) : "",
-        // What a list cell is, though not the values it shows.
-        (row.phase_summary || []).map(function (cell) {
-          return cell.kind === "steps" ? "s" + cell.steps : cell.kind;
-        }).join(","),
-        row.kind || "", row.mode || "", buildState(row.build), row.skipped ? "sk" : "", row.empty ? "e" : "",
-        (row.members || []).map(function (member) {
-          return [member.id, member.mode, buildState(member.build), member.enabled === false ? 0 : 1, rowName(member)].join("/");
-        }).join(","),
-        row.bake ? [buildState(row.bake), row.bake.rank, row.bake.kept, row.bake.default_rank].join("/") : ""
-      ].join(":");
+      return rowKeyParts(row).concat(row.sound_track ? rowKeyParts(row.sound_track) : []).join(":");
     }).join("|") + "#" + S.phases.effective + "#" + S.nameMode + "#" + S.steps
       + "#" + S.phaseSteps.join(",") + "#" + (S.schedulingEnabled ? "sched" : "nosched")
       + "#" + S.view + "#" + S.openRow + "#" + (S.avSupported ? "av" : "")
       + "#" + (S.selecting ? "sel:" + Object.keys(S.selected).sort().join(",") : "");
+  }
+
+  /* What decides a row's structure -- its own, or one side's. */
+  function rowKeyParts(row) {
+    var phase = phaseOf(row);
+    var schedule = scheduleOf(row, phase);
+    var shape = schedule
+      ? schedule.slots + "/" + schedule.editable + "/" + (schedule.drawn_past_end || 0) + "/" +
+        (schedule.regions || []).map(function (region) {
+          return region.id + "@" + region.start + "-" + region.end;
+        }).join(",")
+      : "-";
+    // Shared is structure too: the chip strip differs, and a list with no
+    // ';' turning into one per stage keeps the same stage-1 shape.
+    // So is what "Fill from stage 1" offers: its tooltip names the values.
+    var fill = row.stage_2_fill;
+    // Which phases are scheduled: each one's pill wears a badge for it.
+    var scheduled = (row.phase_schedules || []).map(function (each) {
+      return each && each.active ? "1" : "0";
+    }).join("");
+    return [
+      row.id, rowName(row), row.multiplier_kind, (row.phase_values || []).length,
+      row.missing ? "m" : "", row.system_managed ? "s" : "",
+      isOn(row) ? "on" : "off:" + (row.summary || ""),
+      phase, S.scheduleOpenById[row.id] ? "open" : "shut", shape,
+      row.schedule_shared ? "shared" : "own", scheduled,
+      fill ? (fill.empty ? "fill-none" : "fill-" + fill.values.join(",")) : "",
+      // What a list cell is, though not the values it shows.
+      (row.phase_summary || []).map(function (cell) {
+        return cell.kind === "steps" ? "s" + cell.steps : cell.kind;
+      }).join(","),
+      row.kind || "", row.mode || "", buildState(row.build), row.skipped ? "sk" : "", row.empty ? "e" : "",
+      (row.members || []).map(function (member) {
+        return [member.id, member.mode, buildState(member.build), member.enabled === false ? 0 : 1, rowName(member)].join("/");
+      }).join(","),
+      row.bake ? [buildState(row.bake), row.bake.rank, row.bake.kept, row.bake.default_rank,
+        (row.bake.files || []).length].join("/") : "",
+      row.separate ? "sep" : "", row.track || ""
+    ];
   }
 
   function renderRows(force) {
@@ -1308,9 +1315,13 @@
   /* Rows whose Schedule menu is open right now. */
   function openScheduleCount() {
     if (!S.schedulingEnabled) { return 0; }
-    return S.rows.filter(function (row) {
-      return !!S.scheduleOpenById[row.id] && rowEditable(row);
-    }).length;
+    var count = 0;
+    S.rows.forEach(function (row) {
+      tracksOf(row).forEach(function (track) {
+        if (S.scheduleOpenById[track.id] && rowEditable(track)) { count += 1; }
+      });
+    });
+    return count;
   }
 
   /* Every open Schedule menu closed in one go. A view change, as each row's own
@@ -1344,6 +1355,8 @@
     if (!width) { return; }                  // a hidden tab measures nothing
     var rest = 0;
     el.rows.querySelectorAll(".lb-row").forEach(function (node) {
+      // A row with two strengths is taller at rest; it crops its picture.
+      if (node.querySelector(".lb-track")) { return; }
       if (node.querySelector(".lb-weight-main, .lb-sched-summary")) {
         var height = node.clientHeight;
         node.querySelectorAll(".lb-row-extra, .lb-members").forEach(function (part) { height -= part.offsetHeight; });
@@ -1373,10 +1386,10 @@
       (row.kind === "group" ? " lb-row-group" : "");
     node.dataset.id = row.id;
 
-    var phase = phaseOf(row);
-    var schedule = scheduleOf(row, phase);
+    var tracks = tracksOf(row);
+    var single = tracks.length === 1;
     var editable = rowEditable(row);
-    var open = editable && !!S.scheduleOpenById[row.id] && S.schedulingEnabled;
+    var open = single && editable && !!S.scheduleOpenById[row.id] && S.schedulingEnabled;
 
     // The picture first, then everything the row edits in a column of its own.
     node.appendChild(buildRowThumb(row));
@@ -1384,7 +1397,9 @@
     main.className = "lb-row-main";
     node.appendChild(main);
 
-    main.appendChild(buildRowTop(row, open, editable));
+    // With separate picture and sound strengths, each side has its own
+    // Schedule button, so the top line has none.
+    main.appendChild(buildRowTop(row, open, editable && single));
     if (row.kind === "group") { main.appendChild(buildMembers(row)); }
 
     if (!isOn(row)) {
@@ -1392,19 +1407,66 @@
       appendExtras(node, row);
       return node;
     }
+
+    var painters = [];
+    if (single) {
+      painters = buildStrengths(main, row, rowName(row));
+    } else {
+      // One LoRA, two strengths: each side gets the editor a LoRA has.
+      tracks.forEach(function (track, index) {
+        var side = track.track === "sound" ? "sound" : "picture";
+        var section = document.createElement("div");
+        section.className = "lb-track lb-track-" + side;
+        section.dataset.id = track.id;
+        var head = document.createElement("div");
+        head.className = "lb-track-head";
+        head.appendChild(icon(side));
+        head.appendChild(span("lb-track-name", side === "sound" ? "Sound" : "Picture"));
+        var trackEditable = rowEditable(track);
+        if (trackEditable && S.schedulingEnabled) {
+          head.appendChild(scheduleToggle(track, !!S.scheduleOpenById[track.id]));
+        }
+        section.appendChild(head);
+        buildStrengths(section, track, rowName(row) + " " + side).forEach(function (paint) {
+          painters.push(function (next) {
+            var current = index === 0 ? next : next.sound_track;
+            if (current) { paint(current); }
+          });
+        });
+        main.appendChild(section);
+      });
+    }
+
+    appendExtras(node, row);
+    node.__lbPaint = function (next) {
+      painters.forEach(function (paint) { paint(next); });
+    };
+    return node;
+  }
+
+  /* A LoRA's strengths: one set, or -- with separate picture and sound
+     strengths -- the picture's and the sound's, each an entry of its own. */
+  function tracksOf(row) {
+    return row.sound_track ? [row, row.sound_track] : [row];
+  }
+
+  /* Phase chips, then the timeline or the one strength control, for one
+     entry; returns what repaints it. */
+  function buildStrengths(main, row, label) {
+    var painters = [];
+    var phase = phaseOf(row);
+    var schedule = scheduleOf(row, phase);
+    var editable = rowEditable(row);
+    var open = editable && !!S.scheduleOpenById[row.id] && S.schedulingEnabled;
     if (row.multiplier_kind === "advanced") {
       main.appendChild(buildPreserved(row));
-      appendExtras(node, row);
-      return node;
+      return painters;
     }
     if (!editable) {
       // A schedule this guidance mode cannot show: kept as it is, read-only.
       main.appendChild(buildKeptSchedule(row));
-      appendExtras(node, row);
-      return node;
+      return painters;
     }
-
-    var painters = [];
     if ((row.phase_values || []).length > 1) {
       var strip = buildPhaseStrip(row, phase, open);
       main.appendChild(strip.node);
@@ -1423,7 +1485,7 @@
     } else {
       var weight = buildWeightLine({
         value: currentValue(row, phase, schedule),
-        label: (row.name + " " + (S.phaseLabels[phase] || "strength")).trim(),
+        label: (label + " " + (S.phaseLabels[phase] || "strength")).trim(),
         commit: function (value) { commitBase(row, phase, value); },
         settle: flushSync
       });
@@ -1434,12 +1496,7 @@
         weight.paint(currentValue(next, nextPhase, scheduleOf(next, nextPhase)));
       });
     }
-
-    appendExtras(node, row);
-    node.__lbPaint = function (next) {
-      painters.forEach(function (paint) { paint(next); });
-    };
-    return node;
+    return painters;
   }
 
   function currentValue(row, phase, schedule) {
@@ -1500,6 +1557,43 @@
     return cell;
   }
 
+  /* Schedule: shows or hides the timeline of one entry's selected phase. */
+  function scheduleToggle(row, open) {
+    var scheduled = hasActiveSchedule(row);
+    var toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "lb-btn lb-schedule-toggle" + (open ? " lb-on" : "") +
+      (scheduled ? " lb-scheduled" : "");
+    // The word gives way on a phone; the mark and the arrow do not.
+    [["lb-sched-mark", "\u223F"], ["lb-sched-word", "Schedule"], ["lb-sched-arrow", open ? "\u25B4" : "\u25BE"]]
+      .forEach(function (part) {
+        var mark = document.createElement("span");
+        mark.className = part[0];
+        mark.textContent = part[1];
+        toggle.appendChild(mark);
+      });
+    toggle.setAttribute("aria-label", scheduled ? "Schedule - this LoRA is scheduled" : "Schedule");
+    toggle.title = open
+      ? "Hide the timeline - the schedule is kept"
+      : scheduled
+        ? "Show this LoRA's schedule"
+        : "Schedule this phase over the steps instead of one strength";
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+    toggle.addEventListener("click", function () {
+      var next = !S.scheduleOpenById[row.id];
+      S.scheduleOpenById[row.id] = next;
+      // Opening a phase that has no schedule yet asks Python for one; it
+      // creates the timeline without writing anything to WanGP.
+      var phase = phaseOf(row);
+      if (next && !scheduleOf(row, phase)) {
+        send({ type: "schedule_enable", id: row.id, phase: phase });
+        return;
+      }
+      renderRows(true);
+    });
+    return toggle;
+  }
+
   function buildRowTop(row, open, editable) {
     var top = document.createElement("div");
     top.className = "lb-row-top";
@@ -1524,39 +1618,7 @@
     top.appendChild(name);
 
     if (editable && S.schedulingEnabled) {
-      var scheduled = hasActiveSchedule(row);
-      var toggle = document.createElement("button");
-      toggle.type = "button";
-      toggle.className = "lb-btn lb-schedule-toggle" + (open ? " lb-on" : "") +
-        (scheduled ? " lb-scheduled" : "");
-      // The word gives way on a phone; the mark and the arrow do not.
-      [["lb-sched-mark", "∿"], ["lb-sched-word", "Schedule"], ["lb-sched-arrow", open ? "▴" : "▾"]]
-        .forEach(function (part) {
-          var span = document.createElement("span");
-          span.className = part[0];
-          span.textContent = part[1];
-          toggle.appendChild(span);
-        });
-      toggle.setAttribute("aria-label", scheduled ? "Schedule - this LoRA is scheduled" : "Schedule");
-      toggle.title = open
-        ? "Hide the timeline - the schedule is kept"
-        : scheduled
-          ? "Show this LoRA's schedule"
-          : "Schedule this phase over the steps instead of one strength";
-      toggle.setAttribute("aria-expanded", open ? "true" : "false");
-      toggle.addEventListener("click", function () {
-        var next = !S.scheduleOpenById[row.id];
-        S.scheduleOpenById[row.id] = next;
-        // Opening a phase that has no schedule yet asks Python for one; it
-        // creates the timeline without writing anything to WanGP.
-        var phase = phaseOf(row);
-        if (next && !scheduleOf(row, phase)) {
-          send({ type: "schedule_enable", id: row.id, phase: phase });
-          return;
-        }
-        renderRows(true);
-      });
-      top.appendChild(toggle);
+      top.appendChild(scheduleToggle(row, open));
     }
 
     if (row.kind === "group") {
@@ -1639,8 +1701,16 @@
     line.appendChild(label);
     var text = document.createElement("span");
     text.className = "lb-off-text";
-    text.textContent = row.summary || row.multiplier_raw || "";
-    text.title = "Kept while it is off: " + (row.multiplier_raw || "");
+    if (row.sound_track) {
+      var sound = row.sound_track;
+      text.textContent = "Picture x" + (row.summary || row.multiplier_raw || "") +
+        "  \u00b7  Sound x" + (sound.summary || sound.multiplier_raw || "");
+      text.title = "Kept while it is off: picture x" + (row.multiplier_raw || "") +
+        ", sound x" + (sound.multiplier_raw || "");
+    } else {
+      text.textContent = row.summary || row.multiplier_raw || "";
+      text.title = "Kept while it is off: " + (row.multiplier_raw || "");
+    }
     line.appendChild(text);
     return line;
   }
@@ -2293,9 +2363,13 @@
     S.scheduleModal = null;
   }
 
+  /* A row, or the sound side of one with separate strengths: each is an
+     entry the schedule editor can be opened on. */
   function rowById(id) {
     var found = null;
-    S.rows.forEach(function (row) { if (row.id === id) { found = row; } });
+    S.rows.forEach(function (row) {
+      tracksOf(row).forEach(function (track) { if (track.id === id) { found = track; } });
+    });
     return found;
   }
 
@@ -2681,28 +2755,40 @@
      the row had open or chosen comes along to its new id. */
   function carryRowState(before, after) {
     var oldIds = {};
-    before.forEach(function (row) { oldIds[rowKey(row)] = row.id; });
-    after.forEach(function (row) {
-      var was = oldIds[rowKey(row)];
-      if (!was || was === row.id) { return; }
-      [S.scheduleOpenById, S.selectedPhaseById, S.linked].forEach(function (map) {
-        if (map[was] !== undefined && map[row.id] === undefined) { map[row.id] = map[was]; }
-        delete map[was];
-      });
-      Object.keys(S.selectedRegionByKey).forEach(function (key) {
-        if (key.indexOf(was + ":") !== 0) { return; }
-        S.selectedRegionByKey[row.id + key.slice(was.length)] = S.selectedRegionByKey[key];
-        delete S.selectedRegionByKey[key];
-      });
+    var sides = function (row) {
+      return [[rowKey(row), row]].concat(row.sound_track ? [[rowKey(row) + "|sound", row.sound_track]] : []);
+    };
+    before.forEach(function (row) {
+      sides(row).forEach(function (pair) { oldIds[pair[0]] = pair[1].id; });
+    });
+    after.forEach(function (outer) {
+      sides(outer).forEach(function (pair) { carryOne(oldIds[pair[0]], pair[1]); });
     });
   }
 
-  var MODE_LABEL = { normal: "Normal", visual: "Visual only", audio: "Audio only" };
-  var MODE_SHORT = { normal: "Normal", visual: "Visual", audio: "Audio" };
+  function carryOne(was, row) {
+    if (!was || was === row.id) { return; }
+    [S.scheduleOpenById, S.selectedPhaseById, S.linked].forEach(function (map) {
+      if (map[was] !== undefined && map[row.id] === undefined) { map[row.id] = map[was]; }
+      delete map[was];
+    });
+    Object.keys(S.selectedRegionByKey).forEach(function (key) {
+      if (key.indexOf(was + ":") !== 0) { return; }
+      S.selectedRegionByKey[row.id + key.slice(was.length)] = S.selectedRegionByKey[key];
+      delete S.selectedRegionByKey[key];
+    });
+  }
+
+  var MODE_LABEL = {
+    normal: "Normal", visual: "Visual only", audio: "Audio only", separate: "Separate",
+    sound: "Sound half"
+  };
+  var MODE_SHORT = { normal: "Normal", visual: "Visual", audio: "Audio", separate: "Separate" };
   var MODE_HINT = {
-    normal: "Apply everything this LoRA changes",
+    normal: "Apply everything this LoRA changes, at one strength",
     visual: "Apply only what this LoRA changes in the picture",
-    audio: "Apply only what this LoRA changes in the sound"
+    audio: "Apply only what this LoRA changes in the sound",
+    separate: "Apply picture and sound, each at a strength and schedule of its own"
   };
   var GENERATE_WARNING = "If you generate before this finishes, you may get an unexpected result: " +
     "WanGP reports any file not built yet as missing.";
@@ -2923,7 +3009,8 @@
     }
     name.appendChild(span("lb-li-label", rowName(row)));
     if (group) {
-      name.appendChild(span("lb-li-sub", plural((row.members || []).length, "LoRA", "LoRAs") + ", one strength"));
+      name.appendChild(span("lb-li-sub", plural((row.members || []).length, "LoRA", "LoRAs") +
+        (row.separate ? ", picture and sound strengths" : ", one strength")));
       var bake = bakePill(row);
       if (bake) { name.appendChild(bake); }
     } else {
@@ -3007,8 +3094,29 @@
      steps it runs on -- never each step's strength. Those are in the editor. */
   function paintPhaseCells(cells, row) {
     cells.innerHTML = "";
-    var summary = row.phase_summary || [];
     var count = listPhaseCount();
+    if (row.sound_track) {
+      // Two strengths: each phase shows the picture's above the sound's.
+      for (var phase = 0; phase < count; phase += 1) {
+        var pair = document.createElement("div");
+        pair.className = "lb-li-ph lb-li-pair";
+        if (count > 1) { pair.dataset.short = "P" + (phase + 1); }
+        tracksOf(row).forEach(function (track) {
+          var side = track.track === "sound" ? "sound" : "picture";
+          var summary = track.phase_summary || [];
+          var cell = summary.length === 1 && summary[0].kind === "raw" ? summary[0]
+            : summary[phase] || { kind: "value", value: 0 };
+          var part = phaseCell(cell, phase, 1);
+          part.className += " lb-li-side lb-li-" + side;
+          part.insertBefore(icon(side), part.firstChild);
+          part.title = (side === "sound" ? "Sound" : "Picture") + " \u00b7 " + part.title;
+          pair.appendChild(part);
+        });
+        cells.appendChild(pair);
+      }
+      return;
+    }
+    var summary = row.phase_summary || [];
     if (summary.length === 1 && summary[0].kind === "raw") {
       var raw = document.createElement("div");
       raw.className = "lb-li-ph lb-li-raw";
@@ -3027,6 +3135,11 @@
     var node = document.createElement("div");
     node.className = "lb-li-ph";
     if (count > 1) { node.dataset.short = "P" + (index + 1); }
+    if (cell.kind === "raw") {
+      node.appendChild(codeText(cell.text));
+      node.title = "Kept exactly as written: " + cell.text;
+      return node;
+    }
     if (cell.kind === "steps") {
       node.classList.add("lb-li-sched");
       var wave = span("lb-li-wave", "∿");
@@ -3054,7 +3167,13 @@
     var mode = row.mode || "normal";
     if (mode === "normal") { return []; }
     var node = span("lb-mode-pill lb-mode-" + mode);
-    node.appendChild(icon(mode === "visual" ? "picture" : "sound"));
+    if (mode === "separate") {
+      node.appendChild(icon("picture"));
+      node.appendChild(icon("sound"));
+      node.title = "Picture and sound have a strength of their own";
+    } else {
+      node.appendChild(icon(mode === "visual" ? "picture" : "sound"));
+    }
     node.appendChild(document.createTextNode(MODE_LABEL[mode]));
     var state = buildState(row.build);
     if (row.empty) {
@@ -3063,7 +3182,7 @@
     } else if (state === "building") {
       node.appendChild(document.createTextNode(" · building "));
       var pct = span("", (row.build.pct || 0) + "%");
-      pct.dataset.buildPct = row.id;
+      pct.dataset.buildPct = row.build.id || row.id;
       node.appendChild(pct);
     } else if (state === "queued") {
       node.appendChild(document.createTextNode(" · queued"));
@@ -3088,7 +3207,7 @@
     } else if (state === "building") {
       node.textContent = "Baking ";
       var pct = span("", (bake.pct || 0) + "%");
-      pct.dataset.buildPct = row.bake_id;
+      pct.dataset.buildPct = bake.id || row.bake_id;
       node.appendChild(pct);
     } else if (state === "queued") {
       node.textContent = "Bake queued";
@@ -3186,6 +3305,7 @@
     var box = document.createElement("div");
     box.className = "lb-row-extra";
     if (row.kind === "group") {
+      if (S.avSupported) { box.appendChild(strengthsLine(row)); }
       box.appendChild(bakeBlock(row));
       card.appendChild(box);
       return;
@@ -3212,21 +3332,33 @@
     card.appendChild(box);
   }
 
+  /* Normal, Visual only, Audio only -- and, for a LoRA of its own,
+     Separate: picture and sound each at a strength of their own. */
   function modeSeg(row, small) {
     var current = row.mode || "normal";
     var seg = document.createElement("div");
     seg.className = "lb-seg" + (small ? " lb-seg-sm" : "");
     seg.setAttribute("role", "radiogroup");
     seg.setAttribute("aria-label", rowName(row) + " applies to");
-    ["normal", "visual", "audio"].forEach(function (mode) {
+    var modes = small ? ["normal", "visual", "audio"] : ["normal", "visual", "audio", "separate"];
+    modes.forEach(function (mode) {
       var button = document.createElement("button");
       button.type = "button";
       button.setAttribute("role", "radio");
       button.className = "lb-seg-" + mode;
       button.setAttribute("aria-checked", current === mode ? "true" : "false");
-      if (mode !== "normal") { button.appendChild(icon(mode === "visual" ? "picture" : "sound")); }
-      button.appendChild(document.createTextNode(small ? MODE_SHORT[mode] : MODE_LABEL[mode]));
+      if (mode === "visual" || mode === "audio") { button.appendChild(icon(mode === "visual" ? "picture" : "sound")); }
+      if (mode === "separate") {
+        button.appendChild(icon("picture"));
+        button.appendChild(icon("sound"));
+      }
+      button.appendChild(document.createTextNode(MODE_SHORT[mode]));
+      if (!small && (mode === "visual" || mode === "audio")) { button.appendChild(span("lb-seg-long", " only")); }
       button.title = MODE_HINT[mode];
+      if (mode === "separate" && current !== mode && !changesBoth(row)) {
+        button.disabled = true;
+        button.title = "This LoRA changes only one of picture and sound, so there is no second strength to give it";
+      }
       button.addEventListener("click", function (event) {
         event.stopPropagation();
         if (current !== mode) { send({ type: "set_mode", id: row.id, mode: mode }); }
@@ -3234,6 +3366,65 @@
       seg.appendChild(button);
     });
     return seg;
+  }
+
+  function changesBoth(row) {
+    var streams = row.streams;
+    return !streams || !!(streams.picture && streams.picture.tensors && streams.sound && streams.sound.tensors);
+  }
+
+  /* Whether a group has something on each side to give its own strength. */
+  function groupHasBothSides(row) {
+    var picture = false;
+    var sound = false;
+    (row.members || []).forEach(function (member) {
+      var mode = member.mode || "normal";
+      var streams = member.streams;
+      var hasPicture = streams ? !!(streams.picture && streams.picture.tensors) : true;
+      var hasSound = streams ? !!(streams.sound && streams.sound.tensors) : true;
+      if (mode !== "audio" && hasPicture) { picture = true; }
+      if (mode !== "visual" && hasSound) { sound = true; }
+    });
+    return picture && sound;
+  }
+
+  /* A group's strengths: one for everything, or the picture's and the sound's. */
+  function strengthsLine(row) {
+    var line = document.createElement("div");
+    line.className = "lb-extra-line";
+    line.appendChild(span("lb-extra-label", "Strengths"));
+    var seg = document.createElement("div");
+    seg.className = "lb-seg";
+    seg.setAttribute("role", "radiogroup");
+    seg.setAttribute("aria-label", "Group " + row.group + " strengths");
+    var both = groupHasBothSides(row);
+    [[false, "One for both"], [true, "Picture and sound"]].forEach(function (option) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute("role", "radio");
+      button.className = option[0] ? "lb-seg-separate" : "lb-seg-normal";
+      var checked = !!row.separate === option[0];
+      button.setAttribute("aria-checked", checked ? "true" : "false");
+      if (option[0]) {
+        button.appendChild(icon("picture"));
+        button.appendChild(icon("sound"));
+      }
+      button.appendChild(document.createTextNode(option[1]));
+      button.title = option[0]
+        ? "Give the group's picture and sound a strength and schedule each"
+        : "One strength and schedule for everything the group changes; it keeps the picture's";
+      if (option[0] && !checked && !both) {
+        button.disabled = true;
+        button.title = "Every LoRA in this group changes only one of picture and sound";
+      }
+      button.addEventListener("click", function (event) {
+        event.stopPropagation();
+        if (!checked) { send({ type: "group_separate", group: row.group, value: option[0] }); }
+      });
+      seg.appendChild(button);
+    });
+    line.appendChild(seg);
+    return line;
   }
 
   /* How much of the LoRA changes the picture and how much the sound. */
@@ -3292,6 +3483,7 @@
      along its copy is. */
   function loadLine(row) {
     var mode = row.mode || "normal";
+    if (mode === "separate") { return halvesLine(row); }
     var build = row.build || {};
     var state = build.state || "";
     var side = mode === "visual" ? "picture" : "sound";
@@ -3350,6 +3542,50 @@
   }
 
   /* "Group with..." -- another LoRA, or a group to join. */
+  /* A LoRA with separate strengths loads as two files: its picture half,
+     which also holds the layers both sides share, and its sound half. */
+  function halvesLine(row) {
+    var box = document.createElement("div");
+    box.className = "lb-load";
+    var files = (row.build && row.build.files) || [];
+    var waiting = false;
+    files.forEach(function (file) {
+      var side = file.track === "sound" ? "sound" : "picture";
+      var line = document.createElement("div");
+      line.appendChild(span("lb-load-side lb-load-" + side, side === "sound" ? "Sound " : "Picture "));
+      line.appendChild(codeText(file.id));
+      var state = file.state || "";
+      if (state === "built") {
+        line.appendChild(document.createTextNode(" \u00b7 " + megabytes(file.bytes) +
+          (side === "picture" ? ", with the layers both sides share" : "")));
+      } else if (state === "building") {
+        waiting = true;
+        line.appendChild(document.createTextNode(" \u00b7 building "));
+        var pct = span("", (file.pct || 0) + "%");
+        pct.dataset.buildPct = file.id;
+        line.appendChild(pct);
+      } else if (state === "failed") {
+        waiting = true;
+        box.classList.add("lb-load-warn");
+        line.appendChild(document.createTextNode(" \u00b7 could not be built: " + (file.error || "unknown error") + " "));
+        line.appendChild(makeButton("Retry", "lb-btn", function () { send({ type: "build_retry", id: file.id }); }));
+      } else if (state === "missing") {
+        waiting = true;
+        box.classList.add("lb-load-warn");
+        line.appendChild(document.createTextNode(" \u00b7 its original is not here"));
+      } else if (state !== "original") {
+        waiting = true;
+        line.appendChild(document.createTextNode(state === "queued" ? " \u00b7 waiting to build" : " \u00b7 not built yet"));
+      }
+      box.appendChild(line);
+      if (state === "building") { box.appendChild(progressBar(file.id, file.pct)); }
+    });
+    if (waiting) {
+      box.appendChild(paragraph("If you generate before both are built, WanGP reports the missing one."));
+    }
+    return box;
+  }
+
   function groupPicker(row) {
     var others = S.rows.filter(function (other) { return other !== row && !other.system_managed; });
     if (!others.length) { return null; }
@@ -3483,6 +3719,12 @@
         : state === "building" ? "building its copy"
         : state === "failed" ? "its copy could not be built"
         : "waiting to build its copy");
+    } else if (group.separate) {
+      var hasPicture = !streams || (streams.picture && streams.picture.tensors);
+      var hasSound = !streams || (streams.sound && streams.sound.tensors);
+      parts.push(hasPicture && hasSound ? "its picture and its sound, at the group's two strengths"
+        : hasPicture ? "changes the picture only: the group's picture strength"
+        : "changes the sound only: the group's sound strength");
     } else if (streams) {
       var picture = streams.picture && streams.picture.tensors;
       var sound = streams.sound && streams.sound.tensors;
@@ -3523,8 +3765,9 @@
       head.appendChild(span("lb-muted", "Not baked"));
       head.appendChild(span("lb-grow"));
       head.appendChild(makeButton("Bake to save memory…", "lb-btn", function () { openBakeDialog(row); }));
-      line.textContent = "WanGP loads " + plural(count, "file", "files") + " for this group. Baking re-fits " +
-        "them into one file at the rank you choose; the originals stay, and Unbake goes back to them.";
+      line.textContent = "WanGP loads the group's " + plural(count, "LoRA", "LoRAs") + " side by side. Baking " +
+        "re-fits them into one file" + (row.separate ? " per side" : "") + " at the rank you choose; the originals " +
+        "stay, and Unbake goes back to them.";
       return box;
     }
     var state = buildState(bake);
@@ -3533,7 +3776,9 @@
       head.appendChild(span("lb-grow"));
       head.appendChild(makeButton("Change size…", "lb-btn", function () { openBakeDialog(row); }));
       head.appendChild(unbake());
-      line.textContent = "WanGP loads one file" + (bake.bytes ? " of " + megabytes(bake.bytes) : "") +
+      var several = (bake.files || []).length > 1;
+      line.textContent = (several ? "WanGP loads a file per side" : "WanGP loads one file") +
+        (bake.bytes ? (several ? ", " + megabytes(bake.bytes) + " in all," : " of " + megabytes(bake.bytes)) : "") +
         " instead of " + count + ". It keeps " + keptText(bake) + " of their combined change. " +
         "Strength and schedule still apply live.";
     } else if (state === "building" || state === "queued") {
@@ -3543,10 +3788,10 @@
       if (state === "building") {
         line.appendChild(document.createTextNode("Building one file from the members' current settings · "));
         var pct = span("", (bake.pct || 0) + "%");
-        pct.dataset.buildPct = row.bake_id;
+        pct.dataset.buildPct = bake.id || row.bake_id;
         line.appendChild(pct);
         line.appendChild(document.createTextNode(". If you generate before it is ready, WanGP reports it as missing."));
-        load.appendChild(progressBar(row.bake_id, bake.pct));
+        load.appendChild(progressBar(bake.id || row.bake_id, bake.pct));
       } else {
         line.textContent = "Waiting for the files ahead of it. If you generate before it is ready, " +
           "WanGP reports it as missing.";
@@ -3554,7 +3799,11 @@
     } else if (state === "failed") {
       head.appendChild(span("lb-mode-pill lb-bake-pill lb-pill-warn", "Bake failed"));
       head.appendChild(span("lb-grow"));
-      head.appendChild(makeButton("Retry", "lb-btn", function () { send({ type: "build_retry", id: row.bake_id }); }));
+      head.appendChild(makeButton("Retry", "lb-btn", function () {
+        var failed = (bake.files || []).filter(function (file) { return file.state === "failed"; });
+        var ids = failed.length ? failed.map(function (file) { return file.id; }) : [row.bake_id];
+        send({ type: "batch", actions: ids.map(function (id) { return { type: "build_retry", id: id }; }) });
+      }));
       head.appendChild(unbake());
       load.classList.add("lb-load-warn");
       line.textContent = (bake.error || "The bake did not finish") + ". Unbake to load the members separately.";
@@ -3644,7 +3893,10 @@
     body.appendChild(paragraph("Reading the LoRAs…", "lb-muted"));
     var dialog = openDialog((row.baked ? "Change the size of " : "Bake ") + "Group " + row.group, body,
       [{ label: "Cancel" }]);
-    var members = (row.members || []).map(function (member) { return member.id; });
+    var members = [];
+    (row.members || []).forEach(function (member) {
+      (member.entries || [member.id]).forEach(function (id) { members.push(id); });
+    });
     requestMedia({ kind: "bake_plan", members: members, group: row.group }, function (plan) {
       if (S.dialog !== dialog.overlay) { return; }
       renderBakePlan(dialog, row, plan);
@@ -3663,7 +3915,8 @@
     var ranks = plan.options.map(function (option) { return option.rank; });
     var current = row.baked && row.bake ? row.bake.rank : 0;
     var pick = ranks.indexOf(current) >= 0 ? current : plan.default_rank;
-    body.appendChild(paragraph("Builds one LoRA from " + listJoin(names) + ". It starts at the rank of the " +
+    body.appendChild(paragraph((plan.files > 1 ? "Builds one LoRA per side, picture and sound, from "
+      : "Builds one LoRA from ") + listJoin(names) + ". It starts at the rank of the " +
       "highest-rank LoRA in the group; pick another size if you want one. The originals are not touched, and " +
       "Unbake goes back to them."));
     body.appendChild(paragraph("Now: WanGP loads " + plural(names.length, "file", "files") + ", " +
@@ -3702,8 +3955,11 @@
     var ids = [];
     S.rows.forEach(function (row) {
       ids.push(row.id);
-      if (row.bake_id) { ids.push(row.bake_id); }
-      (row.members || []).forEach(function (member) { ids.push(member.id); });
+      if (row.sound_track) { ids.push(row.sound_track.id); }
+      (row.bake_ids || (row.bake_id ? [row.bake_id] : [])).forEach(function (id) { ids.push(id); });
+      (row.members || []).forEach(function (member) {
+        (member.entries || [member.id]).forEach(function (id) { ids.push(id); });
+      });
     });
     return ids;
   }
@@ -3767,7 +4023,8 @@
         name.title = file.id;
         var from = line.insertCell();
         from.textContent = file.kind === "bake"
-          ? "Group bake, rank " + file.rank + ": " + listJoin(file.members || []) +
+          ? "Group bake" + (/\.sound\.safetensors$/.test(file.id) ? " (sound side)" : "") +
+            ", rank " + file.rank + ": " + listJoin(file.members || []) +
             (file.kept !== null && file.kept !== undefined ? " · keeps " + keptText(file) : "")
           : (file.label || "") + " · " + (MODE_LABEL[file.mode] || file.mode || "");
         var size = line.insertCell();
@@ -4590,7 +4847,9 @@
     S.byId = {};
     S.items.forEach(function (item) { S.byId[item.id] = item; });
     S.rows.forEach(function (row) {
-      if (S.linked[row.id] === undefined && row.linked) { S.linked[row.id] = true; }
+      tracksOf(row).forEach(function (track) {
+        if (S.linked[track.id] === undefined && track.linked) { S.linked[track.id] = true; }
+      });
     });
 
     if (payload.zoom_px && !S.ready) { S.applyZoom(payload.zoom_px, false); }
