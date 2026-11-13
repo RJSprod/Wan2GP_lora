@@ -36,7 +36,9 @@ MAX_NAME_LENGTH = 64
 _UNSAFE_NAME = re.compile(r"[\\/:*?\"<>|\x00-\x1f]")
 
 
-MODES = ("normal", "visual", "audio")
+#: ``sound`` is the sound half of a LoRA whose picture and sound have strengths
+#: of their own: such a LoRA is two entries, ``visual`` and ``sound``.
+MODES = ("normal", "visual", "audio", "sound")
 
 
 @dataclass

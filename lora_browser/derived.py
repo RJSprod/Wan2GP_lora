@@ -16,8 +16,14 @@ A built file is addressed the way WanGP addresses every LoRA, by its path
 relative to the LoRA folder, so a stack that uses one -- in a preset, the
 queue, a generated video's settings -- names it like any other:
 
-    _lora_browser/<original without its extension>.<visual|audio>.safetensors
-    _lora_browser/_bakes/<hash of the members>.r<rank>.safetensors
+    _lora_browser/<original without its extension>.<visual|audio|sound>.safetensors
+    _lora_browser/_bakes/<hash of the members>.r<rank>[.sound].safetensors
+
+``visual`` and ``audio`` are the visual-only and audio-only copies.  A LoRA
+whose picture and sound have strengths of their own is selected as two
+halves, its ``visual`` copy and its ``sound`` copy -- the sound side alone,
+since the visual copy already holds the layers both sides share.  A group
+like that bakes each side into a file of its own; the sound one says so.
 
 A copy keeps its original's file name, with the mode added, because WanGP
 recognises some LoRAs by name (LTX-2's IC-LoRAs).
@@ -44,10 +50,14 @@ from .utils import is_within, normalize_id
 LINK_NAME = "_lora_browser"
 BAKES = "_bakes"
 MANIFEST = "manifest.json"
-MODES = ("visual", "audio")
+MODES = ("visual", "audio", "sound")
+#: The track a group's sound-side bake carries.
+SOUND_TRACK = "sound"
 
-_SPLIT = re.compile(r"^_lora_browser/(?!_bakes/)(?P<stem>.+)\.(?P<mode>visual|audio)\.safetensors$")
-_BAKE = re.compile(r"^_lora_browser/_bakes/(?P<hash>[0-9a-f]{6,64})\.r(?P<rank>[1-9]\d{0,4})\.safetensors$")
+_SPLIT = re.compile(r"^_lora_browser/(?!_bakes/)(?P<stem>.+)\.(?P<mode>visual|audio|sound)\.safetensors$")
+_BAKE = re.compile(
+    r"^_lora_browser/_bakes/(?P<hash>[0-9a-f]{6,64})\.r(?P<rank>[1-9]\d{0,4})(?:\.(?P<track>sound))?\.safetensors$"
+)
 _ORIGINAL_EXTENSIONS = (".safetensors", ".sft")
 
 
@@ -60,9 +70,11 @@ class Derived:
     #: Split: the original's id without its extension, and the mode.
     stem: str = ""
     mode: str = ""
-    #: Bake: the members' hash and the rank.
+    #: Bake: the members' hash and the rank, and ``sound`` for the sound side
+    #: of a group whose picture and sound have strengths of their own.
     hash: str = ""
     rank: int = 0
+    track: str = ""
 
 
 def is_derived(lora_id: str) -> bool:
@@ -76,8 +88,22 @@ def parse(lora_id: str) -> Derived | None:
         return Derived("split", value, stem=match.group("stem"), mode=match.group("mode"))
     match = _BAKE.match(value)
     if match:
-        return Derived("bake", value, hash=match.group("hash"), rank=int(match.group("rank")))
+        return Derived(
+            "bake", value, hash=match.group("hash"), rank=int(match.group("rank")),
+            track=match.group("track") or "",
+        )
     return None
+
+
+def stem_of(lora_id: str) -> str:
+    """One key per original LoRA, whichever copy of it ``lora_id`` names: a
+    LoRA and its visual, audio and sound copies share it.  A bake is its own."""
+    value = normalize_id(lora_id)
+    parsed = parse(value)
+    if parsed is not None:
+        return parsed.stem if parsed.kind == "split" else parsed.id
+    stem, extension = os.path.splitext(value)
+    return stem if extension.lower() in _ORIGINAL_EXTENSIONS else value
 
 
 def split_id(original_id: str, mode: str) -> str:
@@ -112,8 +138,9 @@ def bake_hash(members: list[tuple[str, str]]) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 
 
-def bake_id(members: list[tuple[str, str]], rank: int) -> str:
-    return f"{LINK_NAME}/{BAKES}/{bake_hash(members)}.r{int(rank)}.safetensors"
+def bake_id(members: list[tuple[str, str]], rank: int, track: str = "") -> str:
+    suffix = f".{SOUND_TRACK}" if track == SOUND_TRACK else ""
+    return f"{LINK_NAME}/{BAKES}/{bake_hash(members)}.r{int(rank)}{suffix}.safetensors"
 
 
 def folder_key(lora_dir: str) -> str:

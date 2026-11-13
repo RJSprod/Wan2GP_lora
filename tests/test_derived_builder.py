@@ -25,6 +25,36 @@ def test_split_ids_round_trip():
     assert dv.split_id("a.safetensors", "normal") == "a.safetensors"
 
 
+def test_sound_halves_and_sound_bakes():
+    value = dv.split_id("styles/detail.safetensors", "sound")
+    assert value == "_lora_browser/styles/detail.sound.safetensors"
+    assert dv.parse(value).mode == "sound"
+    members = [("a.safetensors", "s"), ("b.safetensors", "s")]
+    sound = dv.bake_id(members, 16, track="sound")
+    assert sound.endswith(".r16.sound.safetensors")
+    parsed = dv.parse(sound)
+    assert parsed.kind == "bake" and parsed.rank == 16 and parsed.track == "sound"
+    assert dv.parse(dv.bake_id(members, 16)).track == ""
+    assert dv.stem_of(value) == dv.stem_of("styles/detail.safetensors") == "styles/detail"
+    assert dv.stem_of("_lora_browser/styles/detail.visual.safetensors") == "styles/detail"
+
+
+def test_a_sound_half_leaves_the_shared_layers_to_the_visual_copy(dirs):
+    plugin, loras = dirs
+    source = os.path.join(loras, "s.safetensors")
+    _lora(source, sides=("attn1", "audio_attn1", "text_embedding_projection"))
+    store = dv.Store(plugin, loras)
+    for mode in ("visual", "sound"):
+        bd.split_job(store, dv.split_id("s.safetensors", mode), "s.safetensors", source, mode, "s").work(lambda f: None)
+    _, _, visual = read_tensors(store.path(dv.split_id("s.safetensors", "visual")))
+    _, _, sound = read_tensors(store.path(dv.split_id("s.safetensors", "sound")))
+    assert all("audio_attn1" in name for name in sound)
+    assert any("text_embedding_projection" in name for name in visual)
+    # Every tensor of the original is in exactly one half.
+    _, _, everything = read_tensors(source)
+    assert set(visual) | set(sound) == set(everything) and not set(visual) & set(sound)
+
+
 def test_ids_keep_an_ic_lora_recognisable():
     assert "ic-lora" in dv.split_id("ltx-2-ic-lora-canny.safetensors", "audio")
 

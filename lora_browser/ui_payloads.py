@@ -593,20 +593,21 @@ class Stack:
     def live_groups(self) -> dict[str, list[str]]:
         """The groups worth writing: those with two LoRAs still in the stack,
         or a baked file in it.  A group a preset or a hand edit took apart
-        simply stops being written."""
+        simply stops being written.  LoRAs are counted, not entries: one with
+        separate picture and sound strengths is two entries, its halves."""
         from . import derived  # noqa: PLC0415 - pure module, avoids a cycle at import
 
         live: dict[str, list[str]] = {}
         for letter, members in self.groups.items():
             bakes = [value for value in members if (derived.parse(value) or derived.Derived("", "")).kind == "bake"]
-            present_bake = [value for value in bakes if self.has_entry(value)]
-            if present_bake:
-                others = [value for value in members if value not in bakes]
-                if len(others) >= 2:
-                    live[letter] = others + present_bake[:1]
+            present_bakes = [value for value in bakes if self.has_entry(value)]
+            others = [value for value in members if value not in bakes]
+            if present_bakes:
+                if len({derived.stem_of(value) for value in others}) >= 2:
+                    live[letter] = others + present_bakes
                 continue
-            present = [value for value in members if value not in bakes and self.has_entry(value)]
-            if len(present) >= 2:
+            present = [value for value in others if self.has_entry(value)]
+            if len({derived.stem_of(value) for value in present}) >= 2:
                 live[letter] = present
         return live
 
