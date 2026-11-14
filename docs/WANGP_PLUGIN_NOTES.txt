@@ -530,6 +530,8 @@ ALWAYS RUN THE NEGATIVE TEST
     builder.py               background build queue (one worker thread)
     stack_modes.py           modes, groups, bakes and auto-off, as native text
     stack_files.py           what a stack needs built, and each file's state
+    compare.py               two recipes side by side: settings -> entries per
+                             LoRA and strength, edits -> native text
   assets/lora_browser.css    panel styling, from Gradio theme tokens
   assets/lora_browser.js     panel frontend (mount, render, bridges, diagnose)
   tests/                     no WanGP, GPU or network required
@@ -547,6 +549,16 @@ ALWAYS RUN THE NEGATIVE TEST
   like the three-row cap and the editor at phone width, and gesture rules like
   selecting steps by dragging across them, can only be checked there - such
   rules were wrong in ways no unit test could see.
+
+  The compare view reads WanGP's image/video gallery from the state it hands
+  every handler: gen["file_list"] and gen["file_settings_list"] side by side,
+  and the selected index as wgp.gallery_choice works it out (the newest while
+  gen["last_selected"] is set, else gen["selected"]). A gallery file plays from
+  /gradio_api/file=<path>, which Gradio serves because WanGP's output folders
+  are allowed paths. A dropped file's settings are read in the browser: the
+  ©cmt tag of an MP4/MOV (moov > udta > meta > ilst), the COMMENT tag of a
+  Matroska file (found by its name, as video_metadata.py finds it), or a JSON
+  file -- and a "_wangp_metadata_reserved" placeholder is no recipe.
 
   The open editor is laid out with container queries on .lb-rows (and on the
   full-screen sheet's body), never media queries: the panel is one column of

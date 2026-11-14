@@ -21,6 +21,7 @@ import mimetypes
 import os
 import traceback
 from typing import Any
+from urllib.parse import quote
 
 import gradio as gr
 
@@ -29,6 +30,7 @@ from shared.utils.plugins import WAN2GPPlugin
 from .lora_browser import builder as bd
 from .lora_browser import catalogue as cat
 from .lora_browser import civitai
+from .lora_browser import compare as cmp
 from .lora_browser import derived as dv
 from .lora_browser import lora_files as lf
 from .lora_browser import schedule as sch
@@ -157,6 +159,10 @@ class InstanceState:
         self.paste_report: dict | None = None
         #: LTX-2: the model's LoRAs have a picture side and a sound side.
         self.sided = False
+        #: The compare view, while it is open: which video each side shows.
+        #: The right side's settings are a copy taken when it opened, so a
+        #: video finishing meanwhile does not swap the recipe being edited.
+        self.compare: dict | None = None
 
     def next_revision(self) -> int:
         self.revision += 1
@@ -669,6 +675,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 ),
                 # Set only on the payload answering a pasted stack.
                 "paste_report": instance.take_paste_report(),
+                # Two recipes side by side, while the compare view is open.
+                "compare": self._compare_view(instance, state_value, inventory, model_type),
                 "signature": signature,
                 "status": status,
                 "status_warn": warn,
@@ -678,6 +686,164 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             traceback.print_exc()
             # The frontend shows the native controls again when it sees this.
             return json.dumps({"error": f"LoRA Browser could not render: {error}"})
+
+    # ------------------------------------------------------------ compare
+
+    @staticmethod
+    def _gallery(state_value) -> tuple[list, list, int]:
+        """WanGP's image and video gallery: its files, the settings each was
+        made with, and the one selected."""
+        gen = state_value.get("gen") if isinstance(state_value, dict) else None
+        if not isinstance(gen, dict):
+            return [], [], -1
+        files = list(gen.get("file_list") or [])
+        settings = list(gen.get("file_settings_list") or [])
+        if not files:
+            return files, settings, -1
+        # WanGP follows its newest file for as long as that one is selected.
+        if gen.get("last_selected", True):
+            return files, settings, len(files) - 1
+        try:
+            chosen = int(gen.get("selected", 0))
+        except (TypeError, ValueError):
+            chosen = 0
+        return files, settings, max(0, min(chosen, len(files) - 1))
+
+    @staticmethod
+    def _file_url(path: Any) -> str:
+        """Where the browser fetches a gallery file: Gradio serves WanGP's
+        output folders, the gallery's own files with them."""
+        if not isinstance(path, str) or not path:
+            return ""
+        return "/gradio_api/file=" + quote(os.path.abspath(path).replace("\\", "/"), safe="/:")
+
+    @staticmethod
+    def _media_kind(path: Any) -> str:
+        extension = os.path.splitext(str(path or ""))[1].lower()
+        return "image" if extension in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif") else "video"
+
+    def _compare_action(self, instance, action, state_value, stack, inventory, phases, model_type, live) -> bool:
+        """Open, steer and apply the compare view. Only Apply moves native state."""
+        kind = str(action.get("type", ""))
+        files, settings, chosen = self._gallery(state_value)
+        if kind == "compare_close":
+            instance.compare = None
+            return False
+        if kind == "compare_open":
+            if files:
+                newest = settings[-1] if len(settings) == len(files) else None
+                right = {
+                    "source": "gallery", "index": len(files) - 1, "path": files[-1],
+                    "settings": copy.deepcopy(newest) if isinstance(newest, dict) else None,
+                }
+                left = {"source": "gallery", "index": chosen}
+            else:
+                # No video yet: the right side is what WanGP has now.
+                selected, multipliers, guidance, steps, sampler, steps2 = live
+                right = {"source": "current", "settings": {
+                    "activated_loras": list(selected or []), "loras_multipliers": multipliers or "",
+                    "guidance_phases": guidance, "num_inference_steps": steps, "sample_solver": sampler or "",
+                    "num_inference_steps2": steps2, "model_type": model_type,
+                }}
+                left = {"source": "none"}
+            instance.compare = {"left": left, "right": right}
+            return False
+        if instance.compare is None:
+            return False
+        if kind == "compare_left":
+            if not files:
+                return False
+            try:
+                index = int(action.get("index", 0))
+            except (TypeError, ValueError):
+                return False
+            instance.compare["left"] = {"source": "gallery", "index": max(0, min(index, len(files) - 1))}
+            return False
+        if kind == "compare_left_clear":
+            instance.compare["left"] = {"source": "none"}
+            return False
+        if kind == "compare_left_file":
+            found = action.get("settings")
+            if not isinstance(found, dict) or len(json.dumps(found)) > cmp.MAX_SETTINGS_BYTES:
+                instance.note("That file has no settings the panel can read.", True)
+                return False
+            instance.compare["left"] = {"source": "file", "name": display_name(action.get("name") or "")[:200],
+                                        "settings": found}
+            return False
+        if kind == "compare_apply":
+            return self._compare_apply(instance, action, stack, inventory, phases)
+        return False
+
+    def _compare_apply(self, instance, action, stack, inventory, phases) -> bool:
+        """The right side, edits and all, as WanGP's LoRAs and multipliers."""
+        right = instance.compare.get("right") or {}
+        found = right.get("settings")
+        if not isinstance(found, dict):
+            instance.note("The newest video has no settings to apply.", True)
+            return False
+        model_type = str(found.get("model_type") or "")
+        model_def = self._model_def(model_type) if model_type else {}
+        recipe = cmp.from_settings(found, model_def, inventory.ids)
+        own_phases = up.resolve_phases(model_def, found.get("guidance_phases", 1))
+        result = cmp.apply_edits(
+            recipe["selected"], recipe["multipliers"], own_phases,
+            action.get("changes"), action.get("added"), recipe["steps"], inventory.ids,
+        )
+        # Into the guidance mode WanGP is in now.
+        up.fit_phase_structure(result, phases, {})
+        stack.ids, stack.tokens = result.ids, result.tokens
+        stack.separator_index, stack.disabled, stack.groups = result.separator_index, result.disabled, result.groups
+        missing = [
+            lora_id for lora_id, _, _ in stack.user_entries()
+            if inventory.get(lora_id) is None and not dv.is_derived(lora_id)
+        ]
+        if missing:
+            names = ", ".join(display_name(lora_id) for lora_id in missing[:3])
+            instance.note(f"Applied. {len(missing)} of its LoRAs are not in this model's list: {names}", True)
+        else:
+            instance.note("Applied the right side to your settings.")
+        return True
+
+    def _compare_view(self, instance, state_value, inventory, model_type) -> dict | None:
+        """Both sides of the compare view, as the browser draws them."""
+        if instance.compare is None:
+            return None
+        files, settings, chosen = self._gallery(state_value)
+
+        def side(spec: dict) -> dict:
+            source = spec.get("source", "none")
+            path, found, name = "", None, ""
+            if source == "gallery":
+                index = int(spec.get("index", 0))
+                path = spec.get("path") or (files[index] if 0 <= index < len(files) else "")
+                if "settings" in spec:
+                    found = spec.get("settings")
+                elif 0 <= index < len(settings):
+                    found = settings[index]
+                name = display_name(path)
+            elif source in ("file", "current"):
+                found, name = spec.get("settings"), spec.get("name", "")
+            own_type = str(found.get("model_type") or "") if isinstance(found, dict) else ""
+            recipe = cmp.from_settings(found, self._model_def(own_type or model_type), inventory.ids)
+            if recipe is not None:
+                recipe.pop("multipliers", None)
+            return {
+                "source": source,
+                "index": spec.get("index", -1),
+                "name": name,
+                "url": self._file_url(path) if source == "gallery" else "",
+                "kind": self._media_kind(path or name),
+                "recipe": recipe,
+                "model_type": own_type,
+            }
+
+        return {
+            "count": len(files),
+            "selected": chosen,
+            "model_type": model_type,
+            "left": side(instance.compare.get("left") or {}),
+            "right": side(instance.compare.get("right") or {}),
+        }
 
     def _profile_entries(self, stack: up.Stack, files: StackFiles) -> tuple[list[ProfileEntry], dict[str, int]]:
         """User-editable part of the stack, switched-off LoRAs included where
@@ -773,7 +939,13 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             model_type, inventory, stack, phases, context = self._context(
                 instance, state_value, selected, multipliers, *native
             )
-            changed = self._dispatch(instance, action, stack, inventory, phases, model_type, context)
+            if isinstance(action, dict) and str(action.get("type", "")).startswith("compare_"):
+                changed = self._compare_action(
+                    instance, action, state_value, stack, inventory, phases, model_type,
+                    (selected, multipliers) + native,
+                )
+            else:
+                changed = self._dispatch(instance, action, stack, inventory, phases, model_type, context)
             # Shapes a hand edit or a preset may have broken, then every
             # member of a group carrying its lead's multiplier.
             changed = sm.repair(stack, self._stack_files(instance, inventory).known) or changed
