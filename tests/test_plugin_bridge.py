@@ -1974,10 +1974,11 @@ class TestCompare:
             "file_list": [str(tmp_path / "out" / "one.mp4"), str(tmp_path / "out" / "two.mp4")],
             "file_settings_list": [
                 {"activated_loras": ["a.safetensors", "b.safetensors"], "loras_multipliers": "0.7 1,1,0.8,0.8",
-                 "num_inference_steps": 4, "guidance_phases": 1, "model_type": "minimax_h3"},
+                 "num_inference_steps": 4, "guidance_phases": 1, "model_type": "minimax_h3",
+                 "prompt": "a red fox in the snow"},
                 {"activated_loras": ["a.safetensors", "https://hf.co/x/c.safetensors|sub"],
                  "loras_multipliers": "0.85 0.5", "num_inference_steps": 4, "guidance_phases": 1,
-                 "model_type": "minimax_h3"},
+                 "model_type": "minimax_h3", "prompt": "a grey fox in the snow, at dusk"},
             ],
             "selected": selected,
             "last_selected": last,
@@ -2006,46 +2007,165 @@ class TestCompare:
         view = self._open(plugin, self._state(state, tmp_path, selected=0, last=True))[2]["compare"]
         assert view["left"]["index"] == 1
 
-    def test_the_left_steps_through_the_gallery_and_takes_a_file(self, plugin, state, tmp_path):
+    def _act(self, plugin, action, state):
+        return act(plugin, action, state, ["a.safetensors"], "1", guidance=1, steps=4)
+
+    @pytest.mark.parametrize("side", ["left", "right"])
+    def test_either_side_steps_through_the_gallery_and_takes_a_file(self, plugin, state, tmp_path, side):
         state = self._state(state, tmp_path)
         self._open(plugin, state)
-        view = act(plugin, {"type": "compare_left", "index": 7}, state, ["a.safetensors"], "1", guidance=1)[2]["compare"]
-        assert view["left"]["index"] == 1
-        view = act(plugin, {"type": "compare_left_clear"}, state, ["a.safetensors"], "1", guidance=1)[2]["compare"]
-        assert view["left"]["source"] == "none" and view["left"]["recipe"] is None
+        other = "right" if side == "left" else "left"
+        before = self._open(plugin, state)[2]["compare"][other]
+        view = self._act(plugin, {"type": "compare_pick", "side": side, "index": 7}, state)[2]["compare"]
+        assert view[side]["index"] == 1
+        view = self._act(plugin, {"type": "compare_pick", "side": side, "index": -3}, state)[2]["compare"]
+        assert view[side]["index"] == 0
+        view = self._act(plugin, {"type": "compare_clear", "side": side}, state)[2]["compare"]
+        assert view[side]["source"] == "none" and view[side]["recipe"] is None
         dropped = {"activated_loras": ["b.safetensors"], "loras_multipliers": "0.3", "num_inference_steps": 4,
-                   "guidance_phases": 1, "model_type": "minimax_h3"}
-        view = act(plugin, {"type": "compare_left_file", "name": "C:\\clips\\mine.mp4", "settings": dropped},
-                   state, ["a.safetensors"], "1", guidance=1)[2]["compare"]
-        assert (view["left"]["source"], view["left"]["name"], view["left"]["url"]) == ("file", "mine.mp4", "")
-        assert [e["key"] for e in view["left"]["recipe"]["entries"]] == ["b.safetensors"]
-        payload = act(plugin, {"type": "compare_left_file", "settings": "not a recipe"}, state,
-                      ["a.safetensors"], "1", guidance=1)[2]
-        assert payload["status_warn"] and payload["compare"]["left"]["source"] == "file"
+                   "guidance_phases": 1, "model_type": "minimax_h3", "prompt": "from a file"}
+        view = self._act(plugin, {"type": "compare_file", "side": side, "name": "C:\\clips\\mine.mp4",
+                                  "settings": dropped}, state)[2]["compare"]
+        assert (view[side]["source"], view[side]["name"], view[side]["url"]) == ("file", "mine.mp4", "")
+        assert [e["key"] for e in view[side]["recipe"]["entries"]] == ["b.safetensors"]
+        assert view[side]["recipe"]["prompt"] == "from a file"
+        payload = self._act(plugin, {"type": "compare_file", "side": side, "settings": "not a recipe"}, state)[2]
+        assert payload["status_warn"] and payload["compare"][side]["source"] == "file"
+        # The other side stayed where it was all along.
+        assert payload["compare"][other] == before
 
-    def test_the_right_is_the_newest_when_it_opened(self, plugin, state, tmp_path):
+    def test_a_side_must_be_named(self, plugin, state, tmp_path):
+        state = self._state(state, tmp_path)
+        before = self._open(plugin, state)[2]["compare"]
+        for action in ({"type": "compare_pick", "index": 0}, {"type": "compare_clear", "side": "middle"},
+                       {"type": "compare_file", "side": None, "settings": {}}):
+            assert self._act(plugin, action, state)[2]["compare"] == before
+
+    def test_the_sides_keep_the_settings_they_were_picked_with(self, plugin, state, tmp_path):
         state = self._state(state, tmp_path)
         self._open(plugin, state)
         state["gen"]["file_list"].append(str(tmp_path / "out" / "three.mp4"))
         state["gen"]["file_settings_list"].append({"activated_loras": [], "loras_multipliers": ""})
-        view = act(plugin, {"type": "compare_left", "index": 2}, state, ["a.safetensors"], "1", guidance=1)[2]["compare"]
+        view = self._act(plugin, {"type": "compare_pick", "side": "left", "index": 2}, state)[2]["compare"]
         assert view["right"]["index"] == 1 and len(view["right"]["recipe"]["entries"]) == 2
         assert view["count"] == 3 and view["left"]["recipe"]["entries"] == []
+
+    def test_the_view_carries_both_prompts(self, plugin, state, tmp_path):
+        view = self._open(plugin, self._state(state, tmp_path))[2]["compare"]
+        assert view["left"]["recipe"]["prompt"] == "a red fox in the snow"
+        assert view["right"]["recipe"]["prompt"] == "a grey fox in the snow, at dusk"
+        # The test plugin was never given WanGP's prompt box.
+        assert view["prompt_writable"] is False and view["result"] is None
 
     def test_apply_makes_the_right_the_settings(self, plugin, state, tmp_path):
         state = self._state(state, tmp_path)
         self._open(plugin, state)
-        choices, mults, payload = act(plugin, {
+        choices, mults, payload = self._act(plugin, {
             "type": "compare_apply",
             "changes": {"a.safetensors": {"phases": [[0.6]]}, "sub/c.safetensors": {"on": False}},
             "added": [{"id": "b.safetensors", "phases": [[1, 1, 0.5, 0.5]]}],
-        }, state, ["a.safetensors"], "1", guidance=1, steps=4)
+            "ticket": 3,
+        }, state)
         assert choices["value"] == ["a.safetensors", "b.safetensors"]
         # H3 keeps its phase 2 through One Phase.
         assert mults["value"] == "0.6;0.85 1,1,0.5,0.5;1\n#lora_off 1 0.5 sub/c.safetensors"
-        assert payload["status"] == "Applied the right side to your settings."
-        # Still open: Apply is not Done.
-        assert payload["compare"] is not None
+        assert payload["status"] == "Applied the right side's LoRA values to your settings."
+        # Still open: Apply is not Done. It says what it did, to the Apply that asked.
+        assert payload["compare"]["result"] == {
+            "ticket": 3, "text": "Applied the right side's LoRA values to your settings.", "warn": False,
+        }
+        # LoRA values only: the prompt is left alone.
+        assert plugin._instance("test").pending_prompt is None
+
+    def test_a_second_apply_keeps_nothing_of_the_first(self, plugin, state, tmp_path):
+        """What one recipe set in a phase the mode does not run is not padded
+        into the next: each Apply is the right side's values, every phase."""
+        plugin.get_model_def = lambda model_type: {"guidance_max_phases": 2, "lora_multiplier_phases": 2}
+        state = self._state(state, tmp_path)
+        self._open(plugin, state)
+        choices, mults, _ = act(plugin, {"type": "compare_apply"}, state, ["a.safetensors"], "1", guidance=1, steps=4)
+        assert mults["value"] == "0.85;0.85 0.5;0.5"
+        dropped = {"activated_loras": ["a.safetensors"], "loras_multipliers": "0.3", "num_inference_steps": 4,
+                   "guidance_phases": 1, "model_type": "minimax_h3"}
+        live = (choices["value"], mults["value"])
+        act(plugin, {"type": "compare_file", "side": "right", "name": "f.mp4", "settings": dropped}, state, *live,
+            guidance=1, steps=4)
+        choices, mults, _ = act(plugin, {"type": "compare_apply"}, state, *live, guidance=1, steps=4)
+        assert (choices["value"], mults["value"]) == (["a.safetensors"], "0.3;0.3")
+
+    def test_apply_takes_a_file_dropped_on_the_right(self, plugin, state, tmp_path):
+        state = self._state(state, tmp_path)
+        self._open(plugin, state)
+        dropped = {"activated_loras": ["b.safetensors"], "loras_multipliers": "0.3", "num_inference_steps": 4,
+                   "guidance_phases": 1, "model_type": "minimax_h3"}
+        self._act(plugin, {"type": "compare_file", "side": "right", "name": "mine.mp4", "settings": dropped}, state)
+        choices, mults, payload = self._act(plugin, {"type": "compare_apply", "what": "loras"}, state)
+        assert choices["value"] == ["b.safetensors"]
+        # Its one value runs H3's phase 2 as well.
+        assert mults["value"] == "0.3;0.3"
+
+    def test_apply_the_prompt_alone(self, plugin, state, tmp_path):
+        state = self._state(state, tmp_path)
+        instance = plugin._instance("test")
+        instance.prompt_writable = True
+        self._open(plugin, state)
+        choices, mults, payload = self._act(plugin, {"type": "compare_apply", "what": "prompt", "ticket": 1}, state)
+        # The LoRAs are left as they are.
+        assert "value" not in choices and "value" not in mults
+        assert payload["status"] == "Applied the right side's prompt to your settings."
+        assert not payload["status_warn"]
+        # The prompt goes out the way WanGP's presets set one: the prompt box,
+        # and a new value on the trigger its prompt wizard re-reads it on.
+        updates = plugin._prompt_updates(instance, state, 2)
+        assert updates[0] == {"value": "a grey fox in the snow, at dusk"}
+        assert updates[1]["value"].startswith("lora-browser-")
+        assert state["apply_success"] == 1
+        # Once.
+        assert plugin._prompt_updates(instance, state, 2) == ({}, {})
+
+    def test_apply_both(self, plugin, state, tmp_path):
+        state = self._state(state, tmp_path)
+        instance = plugin._instance("test")
+        instance.prompt_writable = True
+        self._open(plugin, state)
+        choices, mults, payload = self._act(plugin, {
+            "type": "compare_apply", "what": "both", "changes": {"a.safetensors": {"phases": [[0.4]]}},
+        }, state)
+        assert choices["value"] == ["a.safetensors", "sub/c.safetensors"]
+        assert mults["value"] == "0.4;0.85 0.5;0.5"
+        assert payload["status"] == "Applied the right side's prompt and LoRA values to your settings."
+        # Without WanGP's wizard trigger, the prompt box alone.
+        assert plugin._prompt_updates(instance, state, 1) == ({"value": "a grey fox in the snow, at dusk"},)
+
+    def test_a_prompt_is_not_applied_where_it_cannot_be(self, plugin, state, tmp_path):
+        state = self._state(state, tmp_path)
+        instance = plugin._instance("test")
+        self._open(plugin, state)
+        # This WanGP gave the panel no prompt box.
+        choices, mults, payload = self._act(plugin, {"type": "compare_apply", "what": "both", "ticket": 2}, state)
+        assert "value" not in choices and "value" not in mults
+        assert payload["status_warn"] and "does not let the panel set the prompt" in payload["status"]
+        assert payload["compare"]["result"]["ticket"] == 2 and payload["compare"]["result"]["warn"]
+        assert instance.pending_prompt is None
+        # The right side has no prompt.
+        instance.prompt_writable = True
+        state["gen"]["file_settings_list"][1]["prompt"] = "  "
+        self._act(plugin, {"type": "compare_open"}, state)
+        choices, mults, payload = self._act(plugin, {"type": "compare_apply", "what": "prompt"}, state)
+        assert payload["status"] == "The right side has no prompt to apply." and payload["status_warn"]
+        assert instance.pending_prompt is None
+        assert plugin._prompt_updates(instance, state, 2) == ({}, {})
+        assert "apply_success" not in state
+
+    def test_apply_needs_something_to_apply(self, plugin, state, tmp_path):
+        state = self._state(state, tmp_path)
+        self._open(plugin, state)
+        payload = self._act(plugin, {"type": "compare_apply", "what": "everything"}, state)[2]
+        assert payload["status_warn"]
+        self._act(plugin, {"type": "compare_clear", "side": "right"}, state)
+        choices, mults, payload = self._act(plugin, {"type": "compare_apply"}, state)
+        assert "value" not in mults
+        assert payload["status"] == "The right side has no settings to apply."
 
     def test_with_no_video_the_right_is_the_settings_now(self, plugin, state):
         view = act(plugin, {"type": "compare_open"}, state, ["a.safetensors"], "0.7", guidance=1, steps=4)[2]["compare"]

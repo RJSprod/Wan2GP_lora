@@ -159,10 +159,18 @@ class InstanceState:
         self.paste_report: dict | None = None
         #: LTX-2: the model's LoRAs have a picture side and a sound side.
         self.sided = False
-        #: The compare view, while it is open: which video each side shows.
-        #: The right side's settings are a copy taken when it opened, so a
-        #: video finishing meanwhile does not swap the recipe being edited.
+        #: The compare view, while it is open: which video each side shows,
+        #: each with the settings it had when it was picked, so a video
+        #: finishing meanwhile does not swap the recipe being compared.
         self.compare: dict | None = None
+        #: A prompt the compare view applied, for the action's prompt output;
+        #: and whether this WanGP gave the panel that output at all.
+        self.pending_prompt: str | None = None
+        self.prompt_writable = False
+
+    def take_prompt(self) -> str | None:
+        prompt, self.pending_prompt = self.pending_prompt, None
+        return prompt
 
     def next_revision(self) -> int:
         self.revision += 1
@@ -218,7 +226,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         for component in (
             "loras_choices", "loras_multipliers", "guidance_phases", "state",
             "lset_name", "main", "num_inference_steps", "sample_solver",
-            "num_inference_steps2",
+            "num_inference_steps2", "prompt", "fill_wizard_prompt_trigger",
         ):
             self.request_component(component)
 
@@ -345,9 +353,16 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         num_inference_steps = components.get("num_inference_steps")
         sample_solver = components.get("sample_solver")
         num_inference_steps2 = components.get("num_inference_steps2")
+        # The prompt box, for the compare view's Apply; and the trigger WanGP's
+        # presets fire so its prompt wizard re-reads a prompt they set.
+        prompt_box = components.get("prompt")
+        wizard_trigger = components.get("fill_wizard_prompt_trigger")
+        prompt_outputs = [prompt_box] + ([wizard_trigger] if wizard_trigger is not None else []) \
+            if prompt_box is not None else []
 
         instance_id = getattr(loras_multipliers, "_id", id(loras_multipliers))
         instance = self._instance(instance_id)
+        instance.prompt_writable = prompt_box is not None
 
         namespace = f"wgp-lora-browser-{instance_id}"
         ids = {
@@ -408,7 +423,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         def act(action_json, state_value, selected, multipliers, *extra):
             return self._apply_action(
                 instance, action_json, state_value, selected, multipliers, *unpack(extra)
-            )
+            ) + self._prompt_updates(instance, state_value, len(prompt_outputs))
 
         def serve_media(request_json, state_value):
             return self._serve_media(instance, request_json, state_value)
@@ -464,7 +479,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         action_btn.click(
             fn=act,
             inputs=[action_box] + sync_inputs,
-            outputs=[loras_choices, loras_multipliers, payload_box],
+            outputs=[loras_choices, loras_multipliers, payload_box] + prompt_outputs,
             show_progress="hidden",
         )
 
@@ -722,8 +737,22 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         extension = os.path.splitext(str(path or ""))[1].lower()
         return "image" if extension in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif") else "video"
 
+    @staticmethod
+    def _compare_pick(files, settings, index) -> dict:
+        """One of the gallery's files for a side, with the settings it was made
+        with as they are now: a side does not change under the person
+        comparing it."""
+        index = max(0, min(int(index), len(files) - 1))
+        found = settings[index] if index < len(settings) else None
+        return {"source": "gallery", "index": index, "path": files[index],
+                "settings": copy.deepcopy(found) if isinstance(found, dict) else None}
+
     def _compare_action(self, instance, action, state_value, stack, inventory, phases, model_type, live) -> bool:
-        """Open, steer and apply the compare view. Only Apply moves native state."""
+        """Open, steer and apply the compare view. Only Apply moves native state.
+
+        Either side shows any of the gallery's videos, or a file dropped on it;
+        the right one is the one edited and applied.
+        """
         kind = str(action.get("type", ""))
         files, settings, chosen = self._gallery(state_value)
         if kind == "compare_close":
@@ -731,12 +760,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             return False
         if kind == "compare_open":
             if files:
-                newest = settings[-1] if len(settings) == len(files) else None
-                right = {
-                    "source": "gallery", "index": len(files) - 1, "path": files[-1],
-                    "settings": copy.deepcopy(newest) if isinstance(newest, dict) else None,
-                }
-                left = {"source": "gallery", "index": chosen}
+                left = self._compare_pick(files, settings, chosen)
+                right = self._compare_pick(files, settings, len(files) - 1)
             else:
                 # No video yet: the right side is what WanGP has now.
                 selected, multipliers, guidance, steps, sampler, steps2 = live
@@ -750,59 +775,115 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             return False
         if instance.compare is None:
             return False
-        if kind == "compare_left":
+        if kind == "compare_apply":
+            return self._compare_apply(instance, action, stack, inventory, phases)
+        side = str(action.get("side", ""))
+        if side not in ("left", "right"):
+            return False
+        if kind == "compare_pick":
             if not files:
                 return False
             try:
                 index = int(action.get("index", 0))
             except (TypeError, ValueError):
                 return False
-            instance.compare["left"] = {"source": "gallery", "index": max(0, min(index, len(files) - 1))}
-            return False
-        if kind == "compare_left_clear":
-            instance.compare["left"] = {"source": "none"}
-            return False
-        if kind == "compare_left_file":
+            instance.compare[side] = self._compare_pick(files, settings, index)
+        elif kind == "compare_clear":
+            instance.compare[side] = {"source": "none"}
+        elif kind == "compare_file":
             found = action.get("settings")
             if not isinstance(found, dict) or len(json.dumps(found)) > cmp.MAX_SETTINGS_BYTES:
                 instance.note("That file has no settings the panel can read.", True)
                 return False
-            instance.compare["left"] = {"source": "file", "name": display_name(action.get("name") or "")[:200],
-                                        "settings": found}
-            return False
-        if kind == "compare_apply":
-            return self._compare_apply(instance, action, stack, inventory, phases)
+            instance.compare[side] = {"source": "file", "name": display_name(action.get("name") or "")[:200],
+                                      "settings": found}
         return False
 
     def _compare_apply(self, instance, action, stack, inventory, phases) -> bool:
-        """The right side, edits and all, as WanGP's LoRAs and multipliers."""
+        """The right side's LoRA values, edits and all, its prompt, or both, as
+        WanGP's settings. Returns whether the LoRAs moved; a prompt goes out
+        through its own component (``take_prompt``).
+
+        What it did is the status, and the view's ``result`` too -- with the
+        ticket the browser sent, so the pop-up shows the answer to its own
+        Apply and not an older one.
+        """
+        ticket = action.get("ticket")
+        ticket = ticket if isinstance(ticket, int) and not isinstance(ticket, bool) else None
+
+        def answer(text: str, warn: bool) -> None:
+            instance.note(text, warn)
+            instance.compare["result"] = {"ticket": ticket, "text": text, "warn": warn}
+
         right = instance.compare.get("right") or {}
         found = right.get("settings")
-        if not isinstance(found, dict):
-            instance.note("The newest video has no settings to apply.", True)
+        what = str(action.get("what") or "loras")
+        if what not in ("loras", "prompt", "both"):
+            answer("Nothing was applied.", True)
             return False
-        model_type = str(found.get("model_type") or "")
-        model_def = self._model_def(model_type) if model_type else {}
-        recipe = cmp.from_settings(found, model_def, inventory.ids)
-        own_phases = up.resolve_phases(model_def, found.get("guidance_phases", 1))
-        result = cmp.apply_edits(
-            recipe["selected"], recipe["multipliers"], own_phases,
-            action.get("changes"), action.get("added"), recipe["steps"], inventory.ids,
-        )
-        # Into the guidance mode WanGP is in now.
-        up.fit_phase_structure(result, phases, {})
-        stack.ids, stack.tokens = result.ids, result.tokens
-        stack.separator_index, stack.disabled, stack.groups = result.separator_index, result.disabled, result.groups
-        missing = [
-            lora_id for lora_id, _, _ in stack.user_entries()
-            if inventory.get(lora_id) is None and not dv.is_derived(lora_id)
-        ]
-        if missing:
-            names = ", ".join(display_name(lora_id) for lora_id in missing[:3])
-            instance.note(f"Applied. {len(missing)} of its LoRAs are not in this model's list: {names}", True)
-        else:
-            instance.note("Applied the right side to your settings.")
-        return True
+        if not isinstance(found, dict):
+            answer("The right side has no settings to apply.", True)
+            return False
+        parts = []
+        warn = ""
+        if what in ("prompt", "both"):
+            prompt = found.get("prompt")
+            if not isinstance(prompt, str) or not prompt.strip():
+                answer("The right side has no prompt to apply.", True)
+                return False
+            if not instance.prompt_writable:
+                answer("This WanGP build does not let the panel set the prompt.", True)
+                return False
+            instance.pending_prompt = prompt
+            parts.append("prompt")
+        changed = False
+        if what in ("loras", "both"):
+            model_type = str(found.get("model_type") or "")
+            model_def = self._model_def(model_type) if model_type else {}
+            recipe = cmp.from_settings(found, model_def, inventory.ids)
+            own_phases = up.resolve_phases(model_def, found.get("guidance_phases", 1))
+            result = cmp.apply_edits(
+                recipe["selected"], recipe["multipliers"], own_phases,
+                action.get("changes"), action.get("added"), recipe["steps"], inventory.ids,
+            )
+            # The right side is the truth for these now, as a paste is: nothing
+            # remembered about how they were set before -- a phase 2 of the
+            # last recipe, a timeline -- may fill in what this one says.
+            for lora_id in set(result.ids) | {lora_id for lora_id, _, _ in result.user_entries()}:
+                instance.phase_memory.pop(lora_id, None)
+                instance.hidden_phases.pop(lora_id, None)
+                for key in [key for key in instance.schedules if key[0] == lora_id]:
+                    del instance.schedules[key]
+            # Into the guidance mode WanGP is in now, keeping what a narrower
+            # mode cuts for when it widens again.
+            up.fit_phase_structure(result, phases, instance.hidden_phases)
+            stack.ids, stack.tokens = result.ids, result.tokens
+            stack.separator_index, stack.disabled, stack.groups = result.separator_index, result.disabled, result.groups
+            missing = [
+                lora_id for lora_id, _, _ in stack.user_entries()
+                if inventory.get(lora_id) is None and not dv.is_derived(lora_id)
+            ]
+            if missing:
+                names = ", ".join(display_name(lora_id) for lora_id in missing[:3])
+                warn = f" {len(missing)} of its LoRAs are not in this model's list: {names}"
+            parts.append("LoRA values")
+            changed = True
+        answer(f"Applied the right side's {' and '.join(parts)} to your settings.{warn}", bool(warn))
+        return changed
+
+    def _prompt_updates(self, instance, state_value, outputs: int) -> tuple:
+        """What the prompt components are given after an action: nothing, or
+        the prompt Apply chose -- set the way WanGP's own presets set it, so
+        its prompt wizard reads the new prompt rather than keep its own."""
+        prompt = instance.take_prompt()
+        if prompt is None or outputs <= 0:
+            return tuple(gr.update() for _ in range(max(0, outputs)))
+        if isinstance(state_value, dict):
+            state_value["apply_success"] = 1
+        updates = [gr.update(value=prompt)]
+        if outputs > 1:
+            updates.append(gr.update(value=f"lora-browser-{instance.next_revision()}"))
+        return tuple(updates)
 
     def _compare_view(self, instance, state_value, inventory, model_type) -> dict | None:
         """Both sides of the compare view, as the browser draws them."""
@@ -843,6 +924,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             "model_type": model_type,
             "left": side(instance.compare.get("left") or {}),
             "right": side(instance.compare.get("right") or {}),
+            # What the last Apply did, and whether Apply can set the prompt.
+            "result": instance.compare.get("result"),
+            "prompt_writable": instance.prompt_writable,
         }
 
     def _profile_entries(self, stack: up.Stack, files: StackFiles) -> tuple[list[ProfileEntry], dict[str, int]]:

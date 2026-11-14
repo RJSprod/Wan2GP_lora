@@ -150,6 +150,8 @@ class _Host:
         self.selected = list(START["selected"])
         self.multipliers = START["multipliers"]
         self.steps = STEPS
+        #: WanGP's prompt, as the compare view's Apply sets it.
+        self.prompt = ""
         #: Guidance phases, as WanGP's own dropdown would report them. Step
         #: schedules exist only at 1, so that is where this starts; the tests
         #: about more phases switch and switch back.
@@ -162,14 +164,19 @@ class _Host:
         )
 
     def act(self, action_json):
+        instance = self.plugin._instance(INSTANCE)
         choices, mults, text = self.plugin._apply_action(
-            self.plugin._instance(INSTANCE), action_json, self.state, self.selected,
+            instance, action_json, self.state, self.selected,
             self.multipliers, self.guidance, self.steps,
         )
         if isinstance(choices, dict) and "value" in choices:
             self.selected = list(choices["value"])
         if isinstance(mults, dict) and "value" in mults:
             self.multipliers = mults["value"]
+        # WanGP's prompt box and its wizard's trigger, as the action's outputs.
+        prompt = self.plugin._prompt_updates(instance, self.state, 2)[0]
+        if "value" in prompt:
+            self.prompt = prompt["value"]
         return text
 
     def media(self, request_json):
@@ -1992,6 +1999,12 @@ COMPARE_GALLERY = [
     ("three.webm", ["lora_01", "lora_02", "lora_03", "lora_04", "lora_05", "lora_07"],
      "0.85 1,1,0.95,0.95,0.4,0.25,0,0 0.8,0.8,0.6,0.5,0.5,0.3,0.2,0.2 0.6 -2 0.5"),
 ]
+#: The prompt each was made with: the newest reworded, the second none.
+COMPARE_PROMPTS = {
+    "one.webm": "a red fox runs through the snow",
+    "two.webm": "",
+    "three.webm": "a grey fox runs through the snow at dusk",
+}
 
 
 def _video(path):
@@ -2011,9 +2024,9 @@ def _video(path):
     return False
 
 
-def _settings(names, multipliers):
+def _settings(names, multipliers, prompt=""):
     return {"activated_loras": [name + ".safetensors" for name in names], "loras_multipliers": multipliers,
-            "num_inference_steps": 8, "guidance_phases": 1, "model_type": "browser_model"}
+            "num_inference_steps": 8, "guidance_phases": 1, "model_type": "browser_model", "prompt": prompt}
 
 
 @pytest.fixture(scope="module")
@@ -2022,13 +2035,15 @@ def compare_panel(chromium, tmp_path_factory):
     state = dict(STATE)
     state["gen"] = {
         "file_list": [str(root / "out" / name) for name, _, _ in COMPARE_GALLERY],
-        "file_settings_list": [_settings(names, text) for _, names, text in COMPARE_GALLERY],
+        "file_settings_list": [_settings(names, text, COMPARE_PROMPTS[name]) for name, names, text in COMPARE_GALLERY],
         "selected": 0,
         "last_selected": False,
     }
     host = _Host(root, view="list", state=state)
     host.steps = 8
     host.served_root = str(root)
+    # This WanGP gave the panel its prompt box.
+    host.plugin._instance(INSTANCE).prompt_writable = True
     host.real_videos = all([_video(root / "out" / name) for name, _, _ in COMPARE_GALLERY])
     with _open_panel(chromium, host) as opened:
         yield opened + (root,)
@@ -2042,13 +2057,41 @@ def open_compare(page):
 
 
 def close_compare(page):
-    if page.locator(".lb-cmp").count():
+    # The first Escape may only put Apply's choice away.
+    for _ in range(3):
+        if not page.locator(".lb-cmp").count():
+            return
         page.keyboard.press("Escape")
         settle(page, 400)
 
 
 def cmp_row(page, name):
     return page.locator(".lb-cmp-row", has=page.locator(".lb-cmp-name", has_text=name))
+
+
+def cmp_sub(page, side, text):
+    """Wait for a side to show the video its caption starts with."""
+    page.wait_for_function(
+        "([side, text]) => (document.querySelector('.lb-cmp-' + side + ' .lb-cmp-sub') || {}).textContent"
+        "?.startsWith(text)", arg=[side, text], timeout=5000)
+
+
+def cmp_apply(page, what):
+    """Apply, then which part of the right side: LoRA values, Prompt or Both."""
+    page.locator(".lb-cmp-apply").click()
+    page.locator(".lb-cmp-choices button", has_text=what).click()
+
+
+def drop_on(page, side, name, data, kind):
+    """A file dropped on a side, the way a desktop drag delivers it."""
+    page.evaluate("""([side, name, bytes, kind]) => {
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([new Uint8Array(bytes)], name, { type: kind }));
+      const column = document.querySelector('.lb-cmp-' + side);
+      for (const type of ['dragover', 'drop']) {
+        column.dispatchEvent(new DragEvent(type, { dataTransfer: transfer, bubbles: true, cancelable: true }));
+      }
+    }""", [side, name, list(data), kind])
 
 
 def cell_class(row, side):
@@ -2073,11 +2116,11 @@ class TestCompareInTheBrowser:
             # A pop-up with WanGP still showing round it.
             box = dialog.bounding_box()
             assert box["x"] >= 15 and box["y"] >= 15
-            assert page.locator(".lb-cmp-left .lb-cmp-sub").inner_text() == "1 of 3"
-            assert page.locator(".lb-cmp-right .lb-cmp-sub").inner_text() == "three.webm"
+            assert page.locator(".lb-cmp-left .lb-cmp-sub").inner_text() == "1 of 3 · one.webm"
+            assert page.locator(".lb-cmp-right .lb-cmp-sub").inner_text() == "3 of 3 · three.webm"
             assert page.locator(".lb-cmp-left video").get_attribute("src").endswith("/out/one.webm")
             names = page.locator(".lb-cmp-row .lb-cmp-name").all_inner_texts()
-            assert names == [f"lora_0{i}.safetensors" for i in (1, 2, 3, 4, 5, 6, 7)]
+            assert names == ["Prompt"] + [f"lora_0{i}.safetensors" for i in (1, 2, 3, 4, 5, 6, 7)]
             # Looking changes nothing.
             assert native(page) == before
         finally:
@@ -2109,7 +2152,7 @@ class TestCompareInTheBrowser:
             # A LoRA one side does not have counts as 0 there.
             six = cmp_row(page, "lora_06")
             assert (cell_class(six, "left"), cell_class(six, "right")) == ("lb-c-more", "lb-c-less")
-            assert six.locator(".lb-cmp-cell-right").inner_text() == "Not in this recipe"
+            assert six.locator(".lb-cmp-cell-right").inner_text() == "Not in this video"
             seven = cmp_row(page, "lora_07")
             assert seven.locator(".lb-cmp-cell-left").inner_text() == "Not in this video"
             assert cell_class(seven, "right") == "lb-c-more"
@@ -2141,7 +2184,7 @@ class TestCompareInTheBrowser:
             page.locator(".lb-cmp-foot button", has_text="Reset").click()
             settle(page, 200)
             assert cell_class(four, "right") == "lb-c-same"
-            assert six.locator(".lb-cmp-cell-right").inner_text() == "Not in this recipe"
+            assert six.locator(".lb-cmp-cell-right").inner_text() == "Not in this video"
             assert page.locator(".lb-cmp-right .lb-cmp-badge").count() == 0
         finally:
             close_compare(page)
@@ -2170,29 +2213,135 @@ class TestCompareInTheBrowser:
         finally:
             close_compare(page)
 
-    def test_apply_makes_the_right_side_the_settings(self, compare_panel):
+    def test_apply_makes_the_right_side_s_lora_values_the_settings(self, compare_panel):
         page, host, _, _ = compare_panel
+        prompt = host.prompt
         try:
             open_compare(page)
             cmp_row(page, "lora_01").locator(".lb-cmp-cell-right button.lb-cmp-nudge").first.click()
             settle(page, 200)
-            page.locator(".lb-cmp-apply").click()
-            settle(page, 1500)
+            assert page.locator(".lb-cmp-choices").is_hidden()
+            cmp_apply(page, "LoRA values")
+            page.wait_for_function("() => document.querySelector('.lb-cmp-status').textContent.startsWith('Applied')")
+            assert page.locator(".lb-cmp-status").inner_text() == "Applied the right side's LoRA values to your settings."
+            assert page.locator(".lb-cmp-choices").is_hidden()
             assert host.selected[:2] == ["lora_01.safetensors", "lora_02.safetensors"]
             assert native(page).split()[0].startswith("0.84")
-            assert page.locator(".lb-cmp-status").inner_text() == "Applied to your settings."
+            # LoRA values only.
+            assert host.prompt == prompt
         finally:
             close_compare(page)
 
-    def test_the_left_steps_through_the_gallery(self, compare_panel):
+    def test_apply_takes_the_prompt_the_loras_or_both(self, compare_panel):
+        page, host, _, _ = compare_panel
+        selected, multipliers = list(host.selected), host.multipliers
+        try:
+            open_compare(page)
+            # Escape puts the choice away before it closes anything.
+            page.locator(".lb-cmp-apply").click()
+            assert page.locator(".lb-cmp-choices").is_visible()
+            assert page.locator(".lb-cmp-apply").get_attribute("aria-expanded") == "true"
+            page.keyboard.press("Escape")
+            assert page.locator(".lb-cmp-choices").is_hidden()
+            assert page.locator(".lb-cmp").count() == 1
+            cmp_apply(page, "Prompt")
+            page.wait_for_function("() => document.querySelector('.lb-cmp-status').textContent.startsWith('Applied')")
+            assert page.locator(".lb-cmp-status").inner_text() == "Applied the right side's prompt to your settings."
+            assert host.prompt == COMPARE_PROMPTS["three.webm"]
+            assert host.state.get("apply_success") == 1
+            # The prompt alone: the LoRAs are as they were.
+            assert (host.selected, host.multipliers) == (selected, multipliers)
+            # A right side with no prompt has none to give.
+            page.locator('.lb-cmp-right button[aria-label="Previous video in the gallery"]').click()
+            cmp_sub(page, "right", "2 of 3")
+            page.locator(".lb-cmp-apply").click()
+            buttons = page.locator(".lb-cmp-choices button")
+            assert [button.is_disabled() for button in buttons.all()] == [False, True, True]
+            assert page.locator(".lb-cmp-choices button", has_text="Prompt").get_attribute("title") == \
+                "The right side has no prompt"
+            page.locator(".lb-cmp-apply").click()
+            # Both, from a side that has a prompt.
+            page.locator('.lb-cmp-right button[aria-label="Next video in the gallery"]').click()
+            cmp_sub(page, "right", "3 of 3")
+            host.prompt = ""
+            cmp_apply(page, "Both")
+            page.wait_for_function("() => document.querySelector('.lb-cmp-status').textContent.startsWith('Applied')")
+            assert page.locator(".lb-cmp-status").inner_text() == \
+                "Applied the right side's prompt and LoRA values to your settings."
+            assert host.prompt == COMPARE_PROMPTS["three.webm"]
+            assert host.selected[:2] == ["lora_01.safetensors", "lora_02.safetensors"]
+        finally:
+            close_compare(page)
+
+    def test_the_prompts_show_side_by_side_with_their_differences_marked(self, compare_panel):
+        page, _, _, _ = compare_panel
+        try:
+            open_compare(page)
+            row = page.locator(".lb-cmp-prompt-row")
+            assert row.locator(".lb-cmp-name").inner_text() == "Prompt"
+            assert row.locator(".lb-cmp-note").inner_text() == "Differs"
+            assert row.locator(".lb-cmp-cell-left").inner_text() == COMPARE_PROMPTS["one.webm"]
+            assert row.locator(".lb-cmp-cell-right").inner_text() == COMPARE_PROMPTS["three.webm"]
+            assert row.locator(".lb-cmp-cell-left mark").all_inner_texts() == ["red"]
+            assert row.locator(".lb-cmp-cell-right mark").all_inner_texts() == ["grey", "at", "dusk"]
+            # Short prompts are shown whole: nothing to open.
+            assert row.locator("button.lb-cmp-more").is_hidden()
+            # The same prompt on both sides: from the first, back round to the newest.
+            page.locator('.lb-cmp-left button[aria-label="Previous video in the gallery"]').click()
+            cmp_sub(page, "left", "3 of 3")
+            assert row.locator(".lb-cmp-note").inner_text() == "The same"
+            assert row.locator("mark").count() == 0
+            # No prompt on one side.
+            page.locator('.lb-cmp-left button[aria-label="Previous video in the gallery"]').click()
+            cmp_sub(page, "left", "2 of 3")
+            assert row.locator(".lb-cmp-note").inner_text() == "Only on the right"
+            assert row.locator(".lb-cmp-cell-left").inner_text() == "No prompt"
+        finally:
+            close_compare(page)
+
+    def test_a_long_prompt_opens_and_closes(self, compare_panel):
+        page, host, _, _ = compare_panel
+        settings = host.state["gen"]["file_settings_list"]
+        original = settings[2]["prompt"]
+        settings[2]["prompt"] = " ".join(["a grey fox runs through the snow at dusk, slow and careful."] * 20)
+        try:
+            open_compare(page)
+            row = page.locator(".lb-cmp-prompt-row")
+            text = row.locator(".lb-cmp-cell-right .lb-cmp-prompt-text")
+            closed = text.bounding_box()["height"]
+            more = row.locator("button.lb-cmp-more")
+            assert more.is_visible() and more.inner_text() == "Show all"
+            more.click()
+            assert text.bounding_box()["height"] > closed * 2
+            assert row.locator("button.lb-cmp-more").inner_text() == "Show less"
+            assert row.locator("button.lb-cmp-more").get_attribute("aria-expanded") == "true"
+            # A tap on the text closes it again.
+            text.click()
+            assert text.bounding_box()["height"] == closed
+        finally:
+            close_compare(page)
+            settings[2]["prompt"] = original
+
+    def test_either_side_steps_through_the_gallery(self, compare_panel):
         page, _, _, _ = compare_panel
         try:
             open_compare(page)
             page.locator('.lb-cmp-left button[aria-label="Next video in the gallery"]').click()
-            page.wait_for_function(
-                "() => document.querySelector('.lb-cmp-left .lb-cmp-sub').textContent === '2 of 3'")
+            cmp_sub(page, "left", "2 of 3")
             assert page.locator(".lb-cmp-left video").get_attribute("src").endswith("/out/two.webm")
             assert cmp_row(page, "lora_02").locator(".lb-cmp-cell-left").inner_text() == "Not in this video"
+            # The right too: from the newest, round to the first.
+            cmp_row(page, "lora_01").locator(".lb-cmp-cell-right button.lb-cmp-nudge").first.click()
+            settle(page, 200)
+            assert page.locator(".lb-cmp-right .lb-cmp-badge").inner_text() == "Edited"
+            page.locator('.lb-cmp-right button[aria-label="Next video in the gallery"]').click()
+            cmp_sub(page, "right", "1 of 3")
+            assert page.locator(".lb-cmp-right .lb-cmp-words strong").inner_text() == "Gallery video"
+            assert page.locator(".lb-cmp-right video").get_attribute("src").endswith("/out/one.webm")
+            # Another video on the right is another recipe: the edits were the other one's.
+            assert page.locator(".lb-cmp-right .lb-cmp-badge").count() == 0
+            assert page.locator(".lb-cmp-status").inner_text() == "Edit the right side, then apply it"
+            assert cmp_row(page, "lora_01").locator(".lb-cmp-cell-right .lb-cmp-val").inner_text().startswith("0.7")
         finally:
             close_compare(page)
 
@@ -2247,8 +2396,52 @@ class TestCompareInTheBrowser:
                 "() => document.querySelector('.lb-cmp-drop-note').textContent.includes('No saved settings')")
             # Back to the gallery's video.
             page.locator('.lb-cmp-left button[aria-label="Back to the video selected in the gallery"]').click()
-            page.wait_for_function(
-                "() => document.querySelector('.lb-cmp-left .lb-cmp-sub').textContent === '1 of 3'")
+            cmp_sub(page, "left", "1 of 3")
+        finally:
+            close_compare(page)
+
+    def test_the_right_takes_a_dropped_file_and_applies_it(self, compare_panel):
+        page, host, _, _ = compare_panel
+        dropped = _settings(["lora_01", "lora_06"], "0.3 0.4", "a fox from a file")
+        try:
+            open_compare(page)
+            # A file with no recipe in it leaves the side as it was, and says so.
+            blank = _box(b"ftyp", b"isom\0\0\2\0isom") + _box(b"mdat", b"\0" * 512)
+            drop_on(page, "right", "blank.mp4", blank, "video/mp4")
+            cmp_sub(page, "right", "No saved settings found in blank.mp4")
+            assert page.locator(".lb-cmp-right .lb-cmp-words strong").inner_text() == "Newest video"
+            assert page.locator(".lb-cmp-right video").get_attribute("src").endswith("/out/three.webm")
+            # A drop lands on a side showing a video too: it takes its place.
+            drop_on(page, "right", "mine.mp4", mp4_with_settings(dropped), "video/mp4")
+            cmp_sub(page, "right", "mine.mp4")
+            settle(page, 300)
+            assert page.locator(".lb-cmp-right .lb-cmp-words strong").inner_text() == "Your file"
+            assert page.locator(".lb-cmp-right video").get_attribute("src").startswith("blob:")
+            assert cmp_row(page, "lora_01").locator(".lb-cmp-cell-right .lb-cmp-val").inner_text().startswith("0.3")
+            assert page.locator(".lb-cmp-prompt-row .lb-cmp-cell-right").inner_text() == "a fox from a file"
+            # From a file, back to the gallery's newest.
+            assert page.locator('.lb-cmp-right button[aria-label="Back to the newest video"]').is_visible()
+            # A recipe on its own, on the cleared left.
+            page.locator(".lb-cmp-left button.lb-cmp-clear").click()
+            page.wait_for_selector(".lb-cmp-left .lb-cmp-drop", timeout=3000)
+            assert cmp_row(page, "lora_01").locator(".lb-cmp-cell-left").inner_text() == "No video yet"
+            assert page.locator(".lb-cmp-prompt-row .lb-cmp-cell-left").inner_text() == "No settings"
+            assert page.locator(".lb-cmp-prompt-row .lb-cmp-note").inner_text() == "Only on the right"
+            drop_on(page, "left", "recipe.json", json.dumps(_settings(["lora_01"], "0.3")).encode("utf-8"),
+                    "application/json")
+            cmp_sub(page, "left", "recipe.json")
+            settle(page, 300)
+            assert page.locator(".lb-cmp-left .lb-cmp-blank").inner_text() == "Settings only, no video"
+            assert cell_class(cmp_row(page, "lora_01"), "right") == "lb-c-same"
+            # What Apply takes is the file's.
+            cmp_apply(page, "Both")
+            page.wait_for_function("() => document.querySelector('.lb-cmp-status').textContent.startsWith('Applied')")
+            assert host.selected == ["lora_01.safetensors", "lora_06.safetensors"]
+            # Every phase the file's: nothing of the recipe applied before it.
+            assert host.multipliers == "0.3;0.3 0.4;0.4"
+            assert host.prompt == "a fox from a file"
+            page.locator('.lb-cmp-right button[aria-label="Back to the newest video"]').click()
+            cmp_sub(page, "right", "3 of 3")
         finally:
             close_compare(page)
 
@@ -2341,8 +2534,12 @@ class TestCompareInTheBrowser:
               const rows = document.querySelector('.lb-cmp-rows');
               return rows.scrollWidth <= rows.clientWidth + 1;
             }""")
-            for button in page.locator(".lb-cmp-controls button, .lb-cmp-foot button, .lb-cmp-nudge").all():
+            page.locator(".lb-cmp-apply").click()
+            for button in page.locator(".lb-cmp-controls button, .lb-cmp-foot button, .lb-cmp-nudge, "
+                                       ".lb-cmp-choices button").all():
                 assert button.bounding_box()["height"] >= 44
+            choices = page.locator(".lb-cmp-choices").bounding_box()
+            assert choices["x"] + choices["width"] <= 385
         finally:
             close_compare(page)
             page.set_viewport_size({"width": 1100, "height": 1000})

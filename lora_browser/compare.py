@@ -282,6 +282,8 @@ def from_settings(settings: dict | None, model_def: dict | None, known_ids=()) -
     )
     found["model_type"] = str(settings.get("model_type") or settings.get("base_model_type") or "")
     found["listed"] = isinstance(loras, (list, tuple, str))
+    prompt = settings.get("prompt")
+    found["prompt"] = prompt if isinstance(prompt, str) else ""
     return found
 
 

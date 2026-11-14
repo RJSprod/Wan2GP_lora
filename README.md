@@ -46,12 +46,13 @@ thumbnail browser and a real-time strength editor.
   `name: x multiplier` line per LoRA, press Enter, and that is the stack —
   schedules and all. *Copy current stack* writes the same format back out. See
   [Pasting a stack as text](#pasting-a-stack-as-text).
-- **Compare two videos' recipes.** *Compare* opens the video selected in
-  WanGP's gallery beside the newest one, both playing together, with their
-  LoRAs lined up underneath: grey where both apply the same, green where a
-  side applies more, red where it applies less — per LoRA, and step by step.
-  Tune the newest one's weights right there and *Apply* them. See
-  [Comparing two videos](#comparing-two-videos).
+- **Compare any two videos' recipes.** *Compare* opens the video selected in
+  WanGP's gallery beside the newest one — or any two from the gallery, or
+  files dropped on either side — both playing together, with their prompts
+  and LoRAs lined up underneath: grey where both apply the same, green where
+  a side applies more, red where it applies less — per LoRA, and step by
+  step. Tune the right one's weights right there and *Apply* its LoRA values,
+  its prompt, or both. See [Comparing two videos](#comparing-two-videos).
 - **A list view for long stacks.** One line per LoRA — picture, name, what each
   phase applies and its switch — with a scheduled phase shown as how many steps
   it runs on. Click a line to open that LoRA's full editor under it; one is
@@ -404,14 +405,17 @@ Tuning a recipe means rendering variants and looking for what changed.
 window, with WanGP dimmed round its edges — that puts two recipes side by side:
 
 ```
- Gallery video  1 of 12   [×]   Newest video  three.mp4   Edited
+ Gallery video             [×]   Newest video     Edited [×]
+ 1 of 12 · one.mp4               12 of 12 · three.mp4
  ┌───────────────────────┐      ┌───────────────────────┐
  │        video          │      │        video          │
  └───────────────────────┘      └───────────────────────┘
- [‹] [›]             [mute]                         [mute]
+ [‹] [›]             [mute]     [‹] [›]             [mute]
  [        Play both         ]  [⟲]
  Both 8 steps, One Phase   ▲ more weight   ▼ less weight   grey: the same
 
+ Prompt                                      Differs  [Show all]
+ ┌ a [red] fox in the snow ┐      ┌ a [grey] fox in the snow [at] [dusk] ┐
  Detail_Enhancer                                        Per step
  ┌ ▆ ▆ ▅ ▅ ▂ ▂ _ _ ──────┐      ┌ ● ▆ ▆ ▆ ▆ ▃ ▂ _ _ ────┐
  └ red where it is less ─┘      └ green where it is more┘
@@ -419,16 +423,25 @@ window, with WanGP dimmed round its edges — that puts two recipes side by side
  [ −1 ▲         →  ]            [ ● [−] −2 ▼ [+] ]
 ```
 
-- **The left is the video selected in the gallery**, read-only. ‹ › step
-  through the gallery without closing the pop-up. × clears it: drop a video
-  there, or *Browse…* for one — MP4, MOV, M4V, MKV or WebM, or a settings
-  JSON. The settings WanGP saved in the file are read in the browser, from the
-  bytes that hold them, and the video plays from the file itself.
-- **The right is the newest video in the gallery** — taken as it was when
-  the pop-up opened, so a render finishing meanwhile does not swap it — and
-  it is yours to edit. With no video yet, it is your settings as they are.
+- **It opens on the video selected in the gallery, left, and the newest,
+  right** — each taken as it was when it was picked, so a render finishing
+  meanwhile does not swap it. With no video yet, the right is your settings
+  as they are.
+- **Either side can be any video.** ‹ › step a side through the gallery
+  without closing the pop-up. × clears a side: drop a video there, or
+  *Browse…* for one — MP4, MOV, M4V, MKV or WebM, or a settings JSON — and a
+  file dropped on a side that shows a video takes its place. The settings
+  WanGP saved in the file are read in the browser, from the bytes that hold
+  them, and the video plays from the file itself. ⟲ takes a side from a file
+  back to the gallery.
+- **The left is read-only; the right is yours to edit.** Another video on
+  the right is another recipe, so edits made to the last one are dropped.
 - **Both videos play together**: *Play both*, *Restart*, and each its own
   mute. They loop, so a difference has time to show.
+- **The prompts come first**, side by side: a few lines each until *Show
+  all* (or a tap on one) opens them, with the words one has and the other
+  does not marked — in the accent colour, since green and red are about
+  weight. Prompts are not edited here.
 - **One row per LoRA**, its name once across both sides, both sides
   scrolling as one. A LoRA is the file you know, whatever carried it: a
   visual-only copy, a sound half, a group or a bake line up with the LoRA
@@ -449,11 +462,18 @@ window, with WanGP dimmed round its edges — that puts two recipes side by side
   a LoRA off. → on a left row puts that LoRA's value on the right, adding the
   LoRA if the right does not have it. Every edit recolours both sides at once;
   a group's members move as one.
-- **Apply** makes the right side, edits and all, your LoRAs and multipliers —
-  fitted to the guidance mode WanGP is in. Nothing changes before that:
-  looking, stepping through the gallery and editing are the pop-up's own.
-  *Reset* goes back to the newest video's recipe. Escape, × or a tap outside
-  closes it.
+- **Apply…** asks what to take from the right side:
+  - *LoRA values* — its LoRAs and multipliers, edits and all, fitted to the
+    guidance mode WanGP is in. Every phase is the right side's: nothing of
+    what was set before carries into a phase it does not spell out.
+  - *Prompt* — its prompt, into WanGP's prompt box (and its prompt wizard, the
+    way WanGP's own presets set one). Off when the right side has none.
+  - *Both*.
+
+  The line beside it says what was applied, or why not. Nothing changes
+  before that: looking, stepping through the gallery and editing are the
+  pop-up's own. *Reset* goes back to the right side's own recipe. Escape puts
+  the choice away; Escape again, × or a tap outside closes the pop-up.
 
 ### The list view
 
@@ -638,10 +658,11 @@ model can apply in full are listed first.
 - The frontend addresses LoRAs by stable ID only; paths are resolved server-side
   and validated against the current model's LoRA root.
 - No LoRA's absolute path reaches the browser, and all display text is
-  inserted as text nodes rather than HTML. The compare view plays gallery
-  videos from the Gradio file URLs WanGP's own gallery uses, for the files
-  WanGP lists in it; a dropped file is read in the browser and only the
-  settings found in it, and its name, are sent.
+  inserted as text nodes rather than HTML — prompts in the compare view
+  included. The compare view plays gallery videos from the Gradio file URLs
+  WanGP's own gallery uses, for the files WanGP lists in it; a dropped file is
+  read in the browser and only the settings found in it, and its name, are
+  sent.
 
 ## The Civitai catalogue
 

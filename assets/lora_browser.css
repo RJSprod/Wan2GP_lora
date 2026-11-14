@@ -1978,17 +1978,25 @@
 }
 .lb-cmp-overlay .lb-cmp-drop-note { color: var(--lb-muted); font-size: 11.5px; }
 .lb-cmp-overlay .lb-cmp-controls { display: flex; align-items: center; gap: 4px; }
+/* A label, so a tap opens the file picker: dressed as the buttons are. */
 .lb-cmp-overlay label.lb-btn.lb-cmp-browse {
   position: relative;
   flex: 1 1 auto;
   min-width: 0;
   min-height: 44px;
+  box-sizing: border-box;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  padding: 4px 12px;
+  border: 1px solid var(--button-secondary-border-color, var(--border-color-primary));
+  border-radius: var(--radius-sm, 6px);
+  background: var(--button-secondary-background-fill, var(--input-background-fill));
+  color: var(--button-secondary-text-color, var(--body-text-color));
   font-weight: 600;
   cursor: pointer;
 }
+.lb-cmp-overlay label.lb-btn.lb-cmp-browse:hover { background: var(--button-secondary-background-fill-hover, var(--button-secondary-background-fill)); }
 .lb-cmp-overlay .lb-cmp-browse:focus-within { outline: 2px solid var(--color-accent, Highlight); outline-offset: 2px; }
 .lb-cmp-overlay input.lb-cmp-file { position: absolute; inset: 0; width: 100%; opacity: 0; cursor: pointer; }
 
@@ -2162,6 +2170,49 @@
 }
 .lb-cmp-overlay .lb-cmp-status { flex: 1 1 auto; min-width: 0; color: var(--lb-muted); font-size: 12px; }
 .lb-cmp-overlay .lb-cmp-foot button.lb-btn { min-height: 44px; padding: 0 16px; }
+.lb-cmp-overlay .lb-cmp-status.lb-warn { color: var(--color-accent, inherit); font-weight: 600; }
+
+/* What Apply takes from the right: its LoRA values, its prompt, or both. */
+.lb-cmp-overlay .lb-cmp-choices {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 0;
+  border-top: 1px solid var(--border-color-primary);
+}
+.lb-cmp-overlay .lb-cmp-choices[hidden] { display: none; }
+.lb-cmp-overlay .lb-cmp-choices-label { flex: 1 1 100%; color: var(--lb-muted); font-size: 12px; }
+.lb-cmp-overlay button.lb-btn.lb-cmp-choice { flex: 1 1 0; min-width: 6.5em; min-height: 44px; padding: 0 12px; }
+.lb-cmp-overlay .lb-cmp-choices + .lb-cmp-foot { border-top: 0; }
+
+/* The prompts: read only, a few lines each until opened, the words one
+   has and the other does not marked -- in the accent, not in more/less. */
+.lb-cmp-overlay .lb-cmp-cell.lb-cmp-prompt { gap: 0; }
+.lb-cmp-overlay .lb-cmp-prompt-text {
+  font-size: 12.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.lb-cmp-overlay .lb-cmp-prompt-row:not(.lb-cmp-open) .lb-cmp-prompt-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+  line-clamp: 4;
+  overflow: hidden;
+}
+.lb-cmp-overlay .lb-cmp-prompt-row.lb-cmp-cut .lb-cmp-prompt-text,
+.lb-cmp-overlay .lb-cmp-prompt-row.lb-cmp-open .lb-cmp-prompt-text { cursor: pointer; }
+.lb-cmp-overlay mark.lb-cmp-word {
+  padding: 0 1px;
+  border-radius: 3px;
+  color: inherit;
+  background: color-mix(in srgb, var(--color-accent, #2563eb) 28%, transparent);
+  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--color-accent, #2563eb) 70%, transparent);
+}
+.lb-cmp-overlay .lb-cmp-row-head button.lb-btn.lb-cmp-more { flex: 0 0 auto; min-height: 36px; padding: 0 12px; font-size: 12px; }
+.lb-cmp-overlay .lb-cmp-row-head button.lb-btn.lb-cmp-more[hidden] { display: none; }
 
 /* Room to spare: taller bars, and the tray's control on one line. */
 @media (min-width: 760px) {
