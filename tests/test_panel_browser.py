@@ -212,6 +212,38 @@ def _serve(host):
             if self.path == "/payload":
                 self._send(json.dumps({"payload": host.payload(), "multipliers": host.multipliers}))
                 return
+            if self.path.startswith("/gradio_api/file="):
+                # Gradio's file route: a file inside an allowed folder, or 403.
+                wanted = os.path.realpath(unquote(self.path.split("=", 1)[1].split("?")[0]))
+                allowed = getattr(host, "served_root", "")
+                if allowed and wanted.startswith(os.path.realpath(allowed) + os.sep) and os.path.isfile(wanted):
+                    with open(wanted, "rb") as handle:
+                        data = handle.read()
+                    # Byte ranges, as Gradio's FileResponse serves them: what
+                    # lets a video seek before it has all been read.
+                    first, last = 0, len(data) - 1
+                    asked = self.headers.get("Range", "")
+                    if asked.startswith("bytes=") and "-" in asked:
+                        start, _, end = asked[6:].partition("-")
+                        first = int(start or 0)
+                        last = min(last, int(end)) if end else last
+                    self.send_response(206 if asked else 200)
+                    self.send_header("Content-Type", "video/webm" if wanted.endswith(".webm") else "application/octet-stream")
+                    self.send_header("Accept-Ranges", "bytes")
+                    # Each test sees the files as they are now.
+                    self.send_header("Cache-Control", "no-store")
+                    if asked:
+                        self.send_header("Content-Range", f"bytes {first}-{last}/{len(data)}")
+                    self.send_header("Content-Length", str(last - first + 1))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(data[first:last + 1])
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
+                self.send_response(403)
+                self.end_headers()
+                return
             self.send_response(404)
             self.end_headers()
 
@@ -702,6 +734,8 @@ class TestPanelInTheBrowser:
             assert sheet.count() == 1
             assert sheet.get_attribute("aria-modal") == "true"
             assert native(page) == before        # opening it is a view change
+            # The page behind keeps still while it is open.
+            assert page.evaluate("document.documentElement.classList.contains('lb-scroll-locked')")
             # The panel keeps the LoRA's place, and says where it went.
             assert row.locator(".lb-full-note").count() == 1
             assert row.locator(".lb-bars").count() == 0
@@ -730,6 +764,7 @@ class TestPanelInTheBrowser:
             settle(page, 400)
 
         assert page.locator(".lb-sheet").count() == 0
+        assert not page.evaluate("document.documentElement.classList.contains('lb-scroll-locked')")
         # Back in the panel, with the edit, and the same step selected.
         assert bars(row).count() == STEPS
         assert bar_values(row)[1] == "0.44"
@@ -1951,12 +1986,29 @@ def mkv_with_settings(settings):
 
 #: A gallery of three: the one selected first, an older one, the newest.
 COMPARE_GALLERY = [
-    ("one.mp4", ["lora_01", "lora_02", "lora_03", "lora_04", "lora_05", "lora_06"],
+    ("one.webm", ["lora_01", "lora_02", "lora_03", "lora_04", "lora_05", "lora_06"],
      "0.7 1,1,0.875,0.875,0.25,0.25,0,0 0.5 0.6 -1 0.4"),
-    ("two.mp4", ["lora_01"], "1"),
-    ("three.mp4", ["lora_01", "lora_02", "lora_03", "lora_04", "lora_05", "lora_07"],
+    ("two.webm", ["lora_01"], "1"),
+    ("three.webm", ["lora_01", "lora_02", "lora_03", "lora_04", "lora_05", "lora_07"],
      "0.85 1,1,0.95,0.95,0.4,0.25,0,0 0.8,0.8,0.6,0.5,0.5,0.3,0.2,0.2 0.6 -2 0.5"),
 ]
+
+
+def _video(path):
+    """A real second of video where ffmpeg can make one; else bytes."""
+    import shutil
+    import subprocess
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if shutil.which("ffmpeg"):
+        made = subprocess.run(
+            ["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=8",
+             "-t", "1", "-c:v", "libvpx", "-b:v", "200k", str(path)],
+            check=False,
+        )
+        if made.returncode == 0:
+            return True
+    path.write_bytes(b"\0" * 512)
+    return False
 
 
 def _settings(names, multipliers):
@@ -1976,6 +2028,8 @@ def compare_panel(chromium, tmp_path_factory):
     }
     host = _Host(root, view="list", state=state)
     host.steps = 8
+    host.served_root = str(root)
+    host.real_videos = all([_video(root / "out" / name) for name, _, _ in COMPARE_GALLERY])
     with _open_panel(chromium, host) as opened:
         yield opened + (root,)
 
@@ -2020,8 +2074,8 @@ class TestCompareInTheBrowser:
             box = dialog.bounding_box()
             assert box["x"] >= 15 and box["y"] >= 15
             assert page.locator(".lb-cmp-left .lb-cmp-sub").inner_text() == "1 of 3"
-            assert page.locator(".lb-cmp-right .lb-cmp-sub").inner_text() == "three.mp4"
-            assert page.locator(".lb-cmp-left video").get_attribute("src").endswith("/out/one.mp4")
+            assert page.locator(".lb-cmp-right .lb-cmp-sub").inner_text() == "three.webm"
+            assert page.locator(".lb-cmp-left video").get_attribute("src").endswith("/out/one.webm")
             names = page.locator(".lb-cmp-row .lb-cmp-name").all_inner_texts()
             assert names == [f"lora_0{i}.safetensors" for i in (1, 2, 3, 4, 5, 6, 7)]
             # Looking changes nothing.
@@ -2137,7 +2191,7 @@ class TestCompareInTheBrowser:
             page.locator('.lb-cmp-left button[aria-label="Next video in the gallery"]').click()
             page.wait_for_function(
                 "() => document.querySelector('.lb-cmp-left .lb-cmp-sub').textContent === '2 of 3'")
-            assert page.locator(".lb-cmp-left video").get_attribute("src").endswith("/out/two.mp4")
+            assert page.locator(".lb-cmp-left video").get_attribute("src").endswith("/out/two.webm")
             assert cmp_row(page, "lora_02").locator(".lb-cmp-cell-left").inner_text() == "Not in this video"
         finally:
             close_compare(page)
@@ -2206,6 +2260,74 @@ class TestCompareInTheBrowser:
         assert page.locator(".lb-cmp").count() == 0
         assert host.plugin._instance(INSTANCE).compare is None
         assert problems == []
+
+    def test_videos_play_from_the_links_wangp_s_gallery_shows(self, compare_panel):
+        """WanGP's gallery plays Gradio's cached copy of each file: that link
+        works wherever the gallery does, so it comes first."""
+        page, host, _, root = compare_panel
+        cache = root / "cache" / "0123abcd"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "one.webm").write_bytes((root / "out" / "one.webm").read_bytes())
+        cached = "/gradio_api/file=" + str(cache / "one.webm")
+        page.evaluate("""(src) => {
+          const gallery = document.createElement('div');
+          gallery.id = 'gallery';
+          gallery.innerHTML = '<video src="' + src + '"></video><video src="/gradio_api/file=/elsewhere/missing.webm"></video>';
+          document.body.appendChild(gallery);
+        }""", cached)
+        try:
+            open_compare(page)
+            assert page.locator(".lb-cmp-left video").get_attribute("src").endswith(cached)
+            # Not in WanGP's gallery: the plugin's own link to the file.
+            assert page.locator(".lb-cmp-right video").get_attribute("src").endswith("/out/three.webm")
+            if host.real_videos:
+                page.wait_for_function("""() => [...document.querySelectorAll('.lb-cmp video')]
+                    .every(video => video.readyState >= 2)""", timeout=8000)
+                # A frame in, so there is a picture before anything plays.
+                assert page.evaluate("document.querySelector('.lb-cmp-left video').currentTime") > 0
+                assert page.evaluate("document.querySelector('.lb-cmp-left video').videoWidth") == 160
+        finally:
+            close_compare(page)
+            page.evaluate("() => document.getElementById('gallery').remove()")
+
+    def test_a_video_that_cannot_load_says_so_after_trying_both_links(self, compare_panel):
+        page, host, _, root = compare_panel
+        # Addresses the page has never loaded: a browser reuses what it has.
+        files = host.state["gen"]["file_list"]
+        original = files[0]
+        files[0] = str(root / "out" / "gone.webm")
+        page.evaluate("""() => {
+          const gallery = document.createElement('div');
+          gallery.id = 'gallery';
+          gallery.innerHTML = '<video src="/gradio_api/file=/nowhere/gone.webm"></video>';
+          document.body.appendChild(gallery);
+        }""")
+        try:
+            open_compare(page)
+            page.wait_for_selector(".lb-cmp-left .lb-cmp-failed", timeout=8000)
+            assert "could not be loaded" in page.locator(".lb-cmp-left .lb-cmp-failed").inner_text()
+            # It tried WanGP's link first, then the plugin's own.
+            assert page.locator(".lb-cmp-left video").get_attribute("src").endswith("/out/gone.webm")
+            assert page.locator(".lb-cmp-right .lb-cmp-failed").count() == 0
+        finally:
+            close_compare(page)
+            files[0] = original
+            page.evaluate("() => document.getElementById('gallery').remove()")
+
+    def test_the_page_behind_stays_put(self, compare_panel):
+        page, _, _, _ = compare_panel
+        locked = "() => document.documentElement.classList.contains('lb-scroll-locked')"
+        assert not page.evaluate(locked)
+        try:
+            open_compare(page)
+            assert page.evaluate(locked)
+            assert page.evaluate("getComputedStyle(document.documentElement).overflow") == "hidden"
+            # One finger moves nothing behind; pinching still zooms.
+            assert page.evaluate("getComputedStyle(document.querySelector('.lb-cmp-overlay')).touchAction") == "pinch-zoom"
+            assert page.evaluate("getComputedStyle(document.querySelector('.lb-cmp-rows')).touchAction") == "pan-y pinch-zoom"
+        finally:
+            close_compare(page)
+        assert not page.evaluate(locked)
 
     def test_it_fits_a_phone(self, compare_panel):
         page, _, _, _ = compare_panel

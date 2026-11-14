@@ -554,8 +554,16 @@ ALWAYS RUN THE NEGATIVE TEST
   every handler: gen["file_list"] and gen["file_settings_list"] side by side,
   and the selected index as wgp.gallery_choice works it out (the newest while
   gen["last_selected"] is set, else gen["selected"]). A gallery file plays from
-  /gradio_api/file=<path>, which Gradio serves because WanGP's output folders
-  are allowed paths. A dropped file's settings are read in the browser: the
+  the link WanGP's own gallery (#gallery) shows for it, matched by file name:
+  Gradio's cached copy, /gradio_api/file=<cache>/<hash>/<name>, which works
+  wherever the gallery does. /gradio_api/file=<path> -- served while WanGP's
+  output folders are allowed paths -- is the fallback, and a video neither
+  loads says so. A phone shows no frame of a video it has not played, so the
+  view seeks one in once the metadata is there; that needs byte ranges, which
+  Gradio's FileResponse serves. While the pop-up (or the full-screen sheet) is
+  open, html and body stop scrolling, and the overlay takes no one-finger pan
+  (touch-action: pinch-zoom), so a drag on it never moves WanGP's page.
+  A dropped file's settings are read in the browser: the
   ©cmt tag of an MP4/MOV (moov > udta > meta > ilst), the COMMENT tag of a
   Matroska file (found by its name, as video_metadata.py finds it), or a JSON
   file -- and a "_wangp_metadata_reserved" placeholder is no recipe.

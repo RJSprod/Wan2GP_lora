@@ -2182,3 +2182,21 @@
   .lb-cmp-overlay .lb-cmp-weight button.lb-step,
   .lb-cmp-overlay .lb-cmp-weight input.lb-number { min-height: 46px; }
 }
+
+/* A pop-up is open: WanGP's page keeps still behind it. Not namespaced: the
+   page is not the panel's. */
+html.lb-scroll-locked,
+body.lb-scroll-locked {
+  overflow: hidden !important;
+  overscroll-behavior: none;
+}
+/* What does not scroll inside a pop-up takes no one-finger swipe, so none
+   reaches the page -- pinching still zooms; what does scrolls up and down,
+   and stops at its ends. */
+.lb-modal-overlay.lb-cmp-overlay,
+.lb-modal-overlay.lb-sheet-overlay {
+  touch-action: pinch-zoom;
+  overscroll-behavior: contain;
+}
+.lb-cmp-overlay .lb-cmp-rows,
+.lb-sheet-overlay .lb-sheet-body { touch-action: pan-y pinch-zoom; }
