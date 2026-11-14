@@ -2483,6 +2483,7 @@
       });
       document.addEventListener("keydown", onSheetKey);
       document.body.appendChild(S.sheet);
+      lockScroll(true);
     } else {
       var old = S.sheet.querySelector(".lb-sheet-body");
       scroll = old ? old.scrollTop : 0;
@@ -2553,6 +2554,17 @@
     return [what, bytes ? megabytes(bytes) : ""].filter(Boolean).join(" · ");
   }
 
+  /* While a pop-up is open the page behind it stays where it is: a swipe or
+     a drag on the pop-up never scrolls WanGP. Counted, so two pop-ups can
+     overlap. */
+  var scrollLocks = 0;
+  function lockScroll(on) {
+    scrollLocks = Math.max(0, scrollLocks + (on ? 1 : -1));
+    var locked = scrollLocks > 0;
+    document.documentElement.classList.toggle("lb-scroll-locked", locked);
+    document.body.classList.toggle("lb-scroll-locked", locked);
+  }
+
   function onSheetKey(event) {
     // Inspect or a dialog over the sheet closes first.
     if (event.key !== "Escape" || !S.sheet || S.modal || S.dialog) { return; }
@@ -2565,6 +2577,7 @@
     document.removeEventListener("keydown", onSheetKey);
     S.sheet.remove();
     S.sheet = null;
+    lockScroll(false);
   }
 
   function rowName(row) {
@@ -4332,7 +4345,10 @@
       if (video) { video.pause(); }
     });
     if (cmp.file && cmp.file.url) { URL.revokeObjectURL(cmp.file.url); }
-    if (cmp.node) { cmp.node.remove(); }
+    if (cmp.node) {
+      cmp.node.remove();
+      lockScroll(false);
+    }
     if (!silent) { send({ type: "compare_close" }); }
     if (el.compare && document.body.contains(el.compare)) { el.compare.focus(); }
   }
@@ -4443,6 +4459,7 @@
     overlay.appendChild(box);
     document.body.appendChild(overlay);
     document.addEventListener("keydown", onCompareKey);
+    lockScroll(true);
     cmp.node = overlay;
     cmp.parts = {
       left: left, right: right, play: play, legend: legend, rows: rows, tray: tray,
@@ -4508,16 +4525,51 @@
     return col;
   }
 
+  /* Where a gallery file plays from: the copy WanGP's own gallery shows --
+     Gradio serves it, whatever WanGP's folders are -- found by its name. */
+  function galleryUrl(name) {
+    var wanted = String(name || "");
+    var found = "";
+    if (!wanted) { return ""; }
+    document.querySelectorAll("#gallery video, #gallery img, #gallery source").forEach(function (node) {
+      if (found || node.closest(".lb-cmp-overlay")) { return; }
+      var source = node.currentSrc || node.src || node.getAttribute("src") || "";
+      var tail = source.split("?")[0].split("#")[0].split("/").pop();
+      try { tail = decodeURIComponent(tail); } catch (error) { /* left as it is */ }
+      if (source && tail === wanted) { found = source; }
+    });
+    return found;
+  }
+
   function cmpMedia(view, which) {
     var side = view[which];
     var cmp = S.cmp;
     if (which === "left" && side.source === "file" && cmp.file) {
-      return { key: "file:" + cmp.file.name, url: cmp.file.url, kind: cmp.file.url ? "video" : "none" };
+      return { key: "file:" + cmp.file.name, urls: cmp.file.url ? [cmp.file.url] : [], kind: cmp.file.url ? "video" : "none" };
     }
     if (side.source === "gallery" && side.url) {
-      return { key: "gallery:" + side.index + ":" + side.url, url: side.url, kind: side.kind };
+      var urls = [galleryUrl(side.name), side.url].filter(function (url, index, all) {
+        return url && all.indexOf(url) === index;
+      });
+      return { key: "gallery:" + side.index + ":" + side.url, urls: urls, kind: side.kind };
     }
-    return { key: side.source + ":none", url: "", kind: "none" };
+    return { key: side.source + ":none", urls: [], kind: "none" };
+  }
+
+  /* Play from the first address that works; say so when none does. */
+  function cmpLoad(node, urls, screen) {
+    var at = 0;
+    node.addEventListener("error", function () {
+      at += 1;
+      if (at < urls.length) {
+        node.src = urls[at];
+        return;
+      }
+      if (!screen.querySelector(".lb-cmp-blank")) {
+        screen.appendChild(span("lb-cmp-blank lb-cmp-failed", "This video could not be loaded here."));
+      }
+    });
+    node.src = urls[0];
   }
 
   function paintCmpMedia(view) {
@@ -4557,25 +4609,31 @@
         screen.dataset.key = media.key;
         screen.innerHTML = "";
         cmp.videos[which] = null;
-        if (media.kind === "video" && media.url) {
+        if (media.kind === "video" && media.urls.length) {
           var video = document.createElement("video");
-          video.src = media.url;
           video.loop = true;
           video.playsInline = true;
           video.preload = "metadata";
           video.muted = !!cmp.muted[which];
           video.setAttribute("aria-label", heading);
+          // A phone shows nothing of a video it has not played: a frame in,
+          // there is a picture to compare before anything plays.
+          video.addEventListener("loadedmetadata", function () {
+            if (!S.cmp || S.cmp.playing || video.currentTime > 0) { return; }
+            try { video.currentTime = Math.min(0.05, (video.duration || 0.1) / 2); } catch (error) { /* not seekable */ }
+          });
           screen.appendChild(video);
+          cmpLoad(video, media.urls, screen);
           cmp.videos[which] = video;
           if (cmp.playing) {
             var started = video.play();
             if (started && started.catch) { started.catch(function () {}); }
           }
-        } else if (media.kind === "image" && media.url) {
+        } else if (media.kind === "image" && media.urls.length) {
           var image = document.createElement("img");
-          image.src = media.url;
           image.alt = heading;
           screen.appendChild(image);
+          cmpLoad(image, media.urls, screen);
         } else if (which === "left" && side.source === "none") {
           screen.appendChild(cmpDropZone());
         } else {
