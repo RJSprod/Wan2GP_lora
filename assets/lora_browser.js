@@ -133,7 +133,11 @@
     buildTimer: null,
     built: { count: 0, bytes: 0 },
     dialog: null,
-    dialogReturn: null
+    dialogReturn: null,
+    //: The compare view while it is open (see openCompare), and the two
+    //  recipes it shows, from the payload.
+    cmp: null,
+    compareView: null
   };
 
   var el = {};
@@ -329,6 +333,8 @@
             'title="Pick several LoRAs to change or group together">Select</button>' +
           '<button type="button" class="lb-btn" data-lb="av" aria-haspopup="menu" hidden ' +
             'title="Make every LoRA visual only, audio only, or normal again">Audio / visual \u25BE</button>' +
+          '<button type="button" class="lb-btn" data-lb="compare" aria-haspopup="dialog" ' +
+            'title="Compare the LoRAs of the video selected in the gallery with the newest video\'s">Compare</button>' +
           '<button type="button" class="lb-btn" data-lb="collapse-all" disabled ' +
             'title="Close the open LoRA - nothing in it changes">Collapse all</button>' +
           '<button type="button" class="lb-btn" data-lb="paste" aria-haspopup="dialog" aria-expanded="false" ' +
@@ -358,7 +364,7 @@
       search: pick("search"), zoom: pick("zoom"), zoomValue: pick("zoom-value"),
       zoomIn: pick("zoom-in"), zoomOut: pick("zoom-out"),
       gridWrap: pick("grid-wrap"), grid: pick("grid"),
-      activeTitle: pick("active-title"), collapseAll: pick("collapse-all"),
+      activeTitle: pick("active-title"), collapseAll: pick("collapse-all"), compare: pick("compare"),
       paste: pick("paste"), disableAll: pick("disable-all"),
       enableAll: pick("enable-all"), rows: pick("rows"), status: pick("status"),
       nativeToggle: pick("native"),
@@ -486,6 +492,7 @@
     });
 
     el.collapseAll.addEventListener("click", collapseAll);
+    el.compare.addEventListener("click", openCompare);
     el.paste.addEventListener("click", togglePaste);
     el.disableAll.addEventListener("click", function () { send({ type: "disable_all" }); });
     el.enableAll.addEventListener("click", function () { send({ type: "enable_all" }); });
@@ -4289,6 +4296,1200 @@
     positionPaste();
   }
 
+  /* ----------------------------------------------------------- compare */
+
+  /* Two recipes side by side: the video picked in WanGP's gallery on the
+   * left, read-only, and the newest video's on the right, to edit and apply.
+   * Each LoRA is one row across both, its name once, and each side says
+   * whether it applies more (the "more" colour), less (the "less" colour) or
+   * the same -- for one strength, or step by step where either side runs per
+   * step, one strength counting as that value at every step. A LoRA a side
+   * does not have, or has switched off, counts as 0 there.
+   *
+   * Edits stay in the browser until Apply: then the right side, as edited,
+   * becomes WanGP's LoRAs and multipliers. */
+
+  var CMP_ACCEPT = ".mp4,.mov,.m4v,.mkv,.webm,.json";
+  var CMP_VIDEO = /\.(mp4|mov|m4v|mkv|webm)$/i;
+
+  function openCompare() {
+    if (S.cmp) { return; }
+    S.cmp = {
+      changes: {}, added: {}, picked: {}, target: null, playing: false,
+      muted: { left: false, right: true }, file: null, note: "", applied: false,
+      opened: false, node: null, parts: null, videos: {}, trayPaint: null
+    };
+    send({ type: "compare_open" });
+  }
+
+  function closeCompare(silent) {
+    var cmp = S.cmp;
+    if (!cmp) { return; }
+    S.cmp = null;
+    document.removeEventListener("keydown", onCompareKey);
+    Object.keys(cmp.videos).forEach(function (which) {
+      var video = cmp.videos[which];
+      if (video) { video.pause(); }
+    });
+    if (cmp.file && cmp.file.url) { URL.revokeObjectURL(cmp.file.url); }
+    if (cmp.node) { cmp.node.remove(); }
+    if (!silent) { send({ type: "compare_close" }); }
+    if (el.compare && document.body.contains(el.compare)) { el.compare.focus(); }
+  }
+
+  function onCompareKey(event) {
+    if (event.key !== "Escape" || !S.cmp || S.modal || S.dialog) { return; }
+    closeCompare();
+  }
+
+  function paintCompare() {
+    var cmp = S.cmp;
+    if (!cmp) { return; }
+    var view = S.compareView;
+    if (!view) {
+      // Asked for, not answered yet -- or closed on the other side.
+      if (cmp.opened) { closeCompare(true); }
+      return;
+    }
+    cmp.opened = true;
+    if (!cmp.node) { buildCompare(); }
+    paintCmpMedia(view);
+    paintCmpLegend(view);
+    paintCmpRows();
+    paintCmpTray();
+    paintCmpFoot();
+  }
+
+  function buildCompare() {
+    var cmp = S.cmp;
+    var overlay = document.createElement("div");
+    overlay.className = "lb-modal-overlay lb-cmp-overlay " + NS;
+    overlay.addEventListener("click", function (event) {
+      if (event.target === overlay) { closeCompare(); }
+    });
+    var box = document.createElement("section");
+    box.className = "lb-cmp";
+    box.setAttribute("role", "dialog");
+    box.setAttribute("aria-modal", "true");
+    box.setAttribute("aria-label", "Compare LoRAs");
+
+    var head = document.createElement("div");
+    head.className = "lb-cmp-head";
+    var title = document.createElement("h2");
+    title.textContent = "Compare";
+    head.appendChild(title);
+    var close = makeButton("×", "lb-btn lb-cmp-close", function () { closeCompare(); }, "Close compare");
+    close.setAttribute("aria-label", "Close compare");
+    head.appendChild(close);
+    box.appendChild(head);
+
+    var media = document.createElement("div");
+    media.className = "lb-cmp-media";
+    var left = cmpColumn("left");
+    var right = cmpColumn("right");
+    media.appendChild(left);
+    media.appendChild(right);
+    box.appendChild(media);
+
+    var transport = document.createElement("div");
+    transport.className = "lb-cmp-transport";
+    var play = makeButton("Play both", "lb-btn lb-cmp-play", function () { cmpPlay(false); });
+    var restart = makeButton("", "lb-btn lb-cmp-restart", function () { cmpPlay(true); }, "Restart both");
+    restart.setAttribute("aria-label", "Restart both from the start");
+    restart.appendChild(cmpIcon("restart"));
+    transport.appendChild(play);
+    transport.appendChild(restart);
+    box.appendChild(transport);
+
+    var legend = document.createElement("div");
+    legend.className = "lb-cmp-legend";
+    box.appendChild(legend);
+
+    var rows = document.createElement("div");
+    rows.className = "lb-cmp-rows";
+    box.appendChild(rows);
+
+    var tray = document.createElement("div");
+    tray.className = "lb-cmp-tray";
+    tray.hidden = true;
+    box.appendChild(tray);
+
+    var foot = document.createElement("div");
+    foot.className = "lb-cmp-foot";
+    var status = span("lb-cmp-status");
+    status.setAttribute("role", "status");
+    var reset = makeButton("Reset", "lb-btn", function () {
+      cmp.changes = {};
+      cmp.added = {};
+      cmp.picked = {};
+      cmp.target = null;
+      cmp.applied = false;
+      paintCompare();
+    }, "Back to the newest video's recipe");
+    var apply = makeButton("Apply", "lb-btn lb-primary lb-cmp-apply", function () {
+      var added = Object.keys(cmp.added).map(function (key) {
+        var entry = cmp.added[key];
+        return { id: entry.add_id || entry.source, phases: entry.phases, on: entry.on };
+      });
+      send({ type: "compare_apply", changes: cmp.changes, added: added });
+      cmp.applied = true;
+      paintCmpFoot();
+    }, "Make the right side your settings, edits and all");
+    foot.appendChild(status);
+    foot.appendChild(reset);
+    foot.appendChild(apply);
+    box.appendChild(foot);
+
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    document.addEventListener("keydown", onCompareKey);
+    cmp.node = overlay;
+    cmp.parts = {
+      left: left, right: right, play: play, legend: legend, rows: rows, tray: tray,
+      status: status, reset: reset, apply: apply
+    };
+    close.focus();
+  }
+
+  var CMP_ICONS = {
+    prev: '<path d="M10 3 L5 8 L10 13"/>',
+    next: '<path d="M6 3 L11 8 L6 13"/>',
+    sound: '<path d="M2.5 6 H5 L8 3.5 V12.5 L5 10 H2.5 Z"/><path d="M10.5 5.5 A3 3 0 0 1 10.5 10.5 M12.5 3.5 A6 6 0 0 1 12.5 12.5"/>',
+    muted: '<path d="M2.5 6 H5 L8 3.5 V12.5 L5 10 H2.5 Z"/><path d="M10.5 6 L14 9.5 M14 6 L10.5 9.5"/>',
+    restart: '<path d="M3.5 8 A4.5 4.5 0 1 0 5 4.6 M3.5 2.5 V5.5 H6.5"/>',
+    use: '<path d="M3 8 H13 M9 4 L13 8 L9 12"/>'
+  };
+
+  function cmpIcon(name) {
+    var holder = span("lb-ic lb-cmp-ic");
+    holder.setAttribute("aria-hidden", "true");
+    holder.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" ' +
+      'stroke-linecap="round" stroke-linejoin="round">' + (CMP_ICONS[name] || "") + "</svg>";
+    return holder;
+  }
+
+  function cmpIconButton(name, label, onClick) {
+    var button = makeButton("", "lb-btn lb-cmp-icon", onClick, label);
+    button.setAttribute("aria-label", label);
+    button.appendChild(cmpIcon(name));
+    return button;
+  }
+
+  /* A side's column: what it is, its video, and its controls. The video is
+     rebuilt only when the side shows another one, so playback carries on
+     through every edit. */
+  function cmpColumn(which) {
+    var col = document.createElement("div");
+    col.className = "lb-cmp-col lb-cmp-" + which;
+    var label = document.createElement("div");
+    label.className = "lb-cmp-label";
+    var screen = document.createElement("div");
+    screen.className = "lb-cmp-screen";
+    var controls = document.createElement("div");
+    controls.className = "lb-cmp-controls";
+    col.appendChild(label);
+    col.appendChild(screen);
+    col.appendChild(controls);
+    if (which === "left") {
+      col.addEventListener("dragover", function (event) {
+        event.preventDefault();
+        col.classList.add("lb-cmp-over");
+      });
+      col.addEventListener("dragleave", function (event) {
+        if (!col.contains(event.relatedTarget)) { col.classList.remove("lb-cmp-over"); }
+      });
+      col.addEventListener("drop", function (event) {
+        event.preventDefault();
+        col.classList.remove("lb-cmp-over");
+        var files = event.dataTransfer && event.dataTransfer.files;
+        if (files && files.length) { cmpLoadFile(files[0]); }
+      });
+    }
+    return col;
+  }
+
+  function cmpMedia(view, which) {
+    var side = view[which];
+    var cmp = S.cmp;
+    if (which === "left" && side.source === "file" && cmp.file) {
+      return { key: "file:" + cmp.file.name, url: cmp.file.url, kind: cmp.file.url ? "video" : "none" };
+    }
+    if (side.source === "gallery" && side.url) {
+      return { key: "gallery:" + side.index + ":" + side.url, url: side.url, kind: side.kind };
+    }
+    return { key: side.source + ":none", url: "", kind: "none" };
+  }
+
+  function paintCmpMedia(view) {
+    ["left", "right"].forEach(function (which) {
+      var cmp = S.cmp;
+      var side = view[which];
+      var col = cmp.parts[which];
+      var label = col.querySelector(".lb-cmp-label");
+      var screen = col.querySelector(".lb-cmp-screen");
+      var controls = col.querySelector(".lb-cmp-controls");
+      var media = cmpMedia(view, which);
+
+      // What the side is.
+      label.innerHTML = "";
+      var words = document.createElement("div");
+      words.className = "lb-cmp-words";
+      var heading = which === "left"
+        ? (side.source === "file" ? "Your file" : "Gallery video")
+        : (side.source === "current" ? "Your settings now" : "Newest video");
+      words.appendChild(document.createElement("strong")).textContent = heading;
+      var sub = which === "left"
+        ? (side.source === "gallery" ? (side.index + 1) + " of " + view.count
+          : side.source === "file" ? side.name : "Drop or browse a video")
+        : (side.source === "gallery" ? side.name : "No video yet");
+      words.appendChild(span("lb-cmp-sub", sub));
+      label.appendChild(words);
+      if (which === "right" && cmpEdits() > 0) { label.appendChild(span("lb-cmp-badge", "Edited")); }
+      if (which === "left" && side.source !== "none") {
+        var clear = makeButton("×", "lb-btn lb-cmp-icon lb-cmp-clear", cmpClearLeft,
+          "Clear this video, to drop or browse another");
+        clear.setAttribute("aria-label", clear.title);
+        label.appendChild(clear);
+      }
+
+      // Its video, rebuilt only when it is another one.
+      if (screen.dataset.key !== media.key) {
+        screen.dataset.key = media.key;
+        screen.innerHTML = "";
+        cmp.videos[which] = null;
+        if (media.kind === "video" && media.url) {
+          var video = document.createElement("video");
+          video.src = media.url;
+          video.loop = true;
+          video.playsInline = true;
+          video.preload = "metadata";
+          video.muted = !!cmp.muted[which];
+          video.setAttribute("aria-label", heading);
+          screen.appendChild(video);
+          cmp.videos[which] = video;
+          if (cmp.playing) {
+            var started = video.play();
+            if (started && started.catch) { started.catch(function () {}); }
+          }
+        } else if (media.kind === "image" && media.url) {
+          var image = document.createElement("img");
+          image.src = media.url;
+          image.alt = heading;
+          screen.appendChild(image);
+        } else if (which === "left" && side.source === "none") {
+          screen.appendChild(cmpDropZone());
+        } else {
+          screen.appendChild(span("lb-cmp-blank", which === "right" ? "Your settings as WanGP has them" : "No video"));
+        }
+      }
+      if (which === "left" && side.source === "none") {
+        var note = screen.querySelector(".lb-cmp-drop-note");
+        if (note) { note.textContent = cmp.note || "MP4, MOV, MKV or WebM, or a settings JSON"; }
+      }
+
+      // Its controls.
+      controls.innerHTML = "";
+      if (which === "left") {
+        if (side.source === "none") {
+          var browse = document.createElement("label");
+          browse.className = "lb-btn lb-cmp-browse";
+          browse.textContent = "Browse…";
+          var input = document.createElement("input");
+          input.type = "file";
+          input.accept = CMP_ACCEPT;
+          input.className = "lb-cmp-file";
+          input.addEventListener("change", function () {
+            if (input.files && input.files[0]) { cmpLoadFile(input.files[0]); }
+          });
+          browse.appendChild(input);
+          controls.appendChild(browse);
+          if (view.count) {
+            controls.appendChild(cmpIconButton("restart", "Back to the video selected in the gallery", function () {
+              send({ type: "compare_left", index: view.selected });
+            }));
+          }
+        } else if (view.count) {
+          var at = side.source === "gallery" ? side.index : view.selected;
+          controls.appendChild(cmpIconButton("prev", "Previous video in the gallery", function () {
+            send({ type: "compare_left", index: (at - 1 + view.count) % view.count });
+          }));
+          controls.appendChild(cmpIconButton("next", "Next video in the gallery", function () {
+            send({ type: "compare_left", index: (at + 1) % view.count });
+          }));
+        }
+      }
+      controls.appendChild(span("lb-grow"));
+      if (cmp.videos[which]) {
+        var muted = !!cmp.muted[which];
+        var mute = cmpIconButton(muted ? "muted" : "sound",
+          (muted ? "Unmute " : "Mute ") + (which === "left" ? "the left video" : "the right video"), function () {
+            cmp.muted[which] = !cmp.muted[which];
+            if (cmp.videos[which]) { cmp.videos[which].muted = cmp.muted[which]; }
+            paintCmpMedia(S.compareView);
+          });
+        mute.setAttribute("aria-pressed", muted ? "true" : "false");
+        controls.appendChild(mute);
+      }
+    });
+    var anyVideo = !!(S.cmp.videos.left || S.cmp.videos.right);
+    S.cmp.parts.play.disabled = !anyVideo;
+    S.cmp.parts.play.textContent = S.cmp.playing ? "Pause both" : "Play both";
+  }
+
+  function cmpDropZone() {
+    var zone = document.createElement("div");
+    zone.className = "lb-cmp-drop";
+    zone.appendChild(document.createElement("strong")).textContent = "Drop a video here";
+    zone.appendChild(span("lb-cmp-drop-note", S.cmp.note || "MP4, MOV, MKV or WebM, or a settings JSON"));
+    return zone;
+  }
+
+  function cmpClearLeft() {
+    var cmp = S.cmp;
+    if (cmp.videos.left) { cmp.videos.left.pause(); }
+    if (cmp.file && cmp.file.url) { URL.revokeObjectURL(cmp.file.url); }
+    cmp.file = null;
+    cmp.note = "";
+    send({ type: "compare_left_clear" });
+  }
+
+  function cmpPlay(restart) {
+    var cmp = S.cmp;
+    var videos = ["left", "right"].map(function (which) { return cmp.videos[which]; }).filter(Boolean);
+    if (!videos.length) { return; }
+    if (cmp.playing && !restart) {
+      videos.forEach(function (video) { video.pause(); });
+      cmp.playing = false;
+    } else {
+      videos.forEach(function (video) {
+        if (restart) { video.currentTime = 0; }
+        var started = video.play();
+        if (started && started.catch) { started.catch(function () {}); }
+      });
+      cmp.playing = true;
+    }
+    cmp.parts.play.textContent = cmp.playing ? "Pause both" : "Play both";
+  }
+
+  /* --------------------------------------------- reading a dropped file */
+
+  /* WanGP writes the settings a video was made with into the file: an MP4's
+     comment tag, a Matroska file's COMMENT tag. They are read here, in the
+     browser, reading only the bytes that hold them. */
+  function cmpLoadFile(file) {
+    var cmp = S.cmp;
+    if (!cmp || !file) { return; }
+    cmp.note = "Reading " + file.name + "…";
+    paintCompare();
+    readFileSettings(file).then(function (settings) {
+      if (S.cmp !== cmp) { return; }
+      if (!settings) {
+        cmp.note = "No saved settings found in " + file.name + ".";
+        paintCompare();
+        return;
+      }
+      if (cmp.file && cmp.file.url) { URL.revokeObjectURL(cmp.file.url); }
+      cmp.file = { name: file.name, url: CMP_VIDEO.test(file.name) ? URL.createObjectURL(file) : "" };
+      cmp.note = "";
+      send({ type: "compare_left_file", name: file.name, settings: settings });
+    }, function () {
+      if (S.cmp !== cmp) { return; }
+      cmp.note = "Could not read " + file.name + ".";
+      paintCompare();
+    });
+  }
+
+  function readFileSettings(file) {
+    var name = String(file.name || "").toLowerCase();
+    var reading = /\.json$/.test(name) ? file.text()
+      : /\.(mp4|mov|m4v)$/.test(name) ? mp4Comment(file)
+        : /\.(mkv|webm)$/.test(name) ? mkvComment(file)
+          : Promise.resolve("");
+    return reading.then(parseSettingsText);
+  }
+
+  function parseSettingsText(text) {
+    var cleaned = String(text || "").replace(/^﻿/, "").replace(/[\u0000\s]+$/, "");
+    if (!cleaned) { return null; }
+    try {
+      var value = JSON.parse(cleaned);
+      return value && typeof value === "object" && !Array.isArray(value) && !value._wangp_metadata_reserved
+        ? value : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function fileBytes(file, start, length) {
+    return file.slice(start, Math.min(file.size, start + length)).arrayBuffer().then(function (buffer) {
+      return new Uint8Array(buffer);
+    });
+  }
+
+  function fourcc(bytes, at) {
+    return String.fromCharCode(bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]);
+  }
+
+  /* The text of an MP4's comment tag: moov > udta > meta > ilst > ©cmt >
+     data, walking box headers and skipping everything else, the video
+     included, by its size. */
+  async function mp4Comment(file) {
+    var budget = 4000;
+    async function walk(start, end, inside) {
+      var position = start;
+      while (position + 8 <= end && budget-- > 0) {
+        var head = await fileBytes(file, position, 16);
+        if (head.length < 8) { return ""; }
+        var view = new DataView(head.buffer);
+        var size = view.getUint32(0);
+        var type = fourcc(head, 4);
+        var header = 8;
+        if (size === 1) {
+          if (head.length < 16) { return ""; }
+          size = view.getUint32(8) * 4294967296 + view.getUint32(12);
+          header = 16;
+        } else if (size === 0) {
+          size = end - position;
+        }
+        if (size < header || position + size > end) { return ""; }
+        var found = await inside(type, position + header, position + size);
+        if (found) { return found; }
+        position += size;
+      }
+      return "";
+    }
+    async function boxes(type, body, end) {
+      if (type === "moov" || type === "udta" || type === "ilst") { return walk(body, end, boxes); }
+      if (type === "meta") {
+        // A full box in an MP4 (four bytes of version and flags), not always
+        // in a QuickTime file: its first child, hdlr, says which.
+        var probe = await fileBytes(file, body, 12);
+        return walk(probe.length >= 12 && fourcc(probe, 8) === "hdlr" ? body + 4 : body, end, boxes);
+      }
+      if (type === "©cmt") {
+        return walk(body, end, async function (child, start, stop) {
+          if (child !== "data" || stop - start < 8 || stop - start > 4194312) { return ""; }
+          var bytes = await fileBytes(file, start + 8, stop - start - 8);
+          return new TextDecoder("utf-8").decode(bytes);
+        });
+      }
+      return "";
+    }
+    return walk(0, file.size, boxes);
+  }
+
+  var MKV_COMMENT = [0x45, 0xA3, 0x87, 0x43, 0x4F, 0x4D, 0x4D, 0x45, 0x4E, 0x54];
+
+  function findBytes(haystack, needle, from) {
+    var index = haystack.indexOf(needle[0], from || 0);
+    while (index >= 0 && index <= haystack.length - needle.length) {
+      var match = true;
+      for (var offset = 1; offset < needle.length && match; offset += 1) {
+        match = haystack[index + offset] === needle[offset];
+      }
+      if (match) { return index; }
+      index = haystack.indexOf(needle[0], index + 1);
+    }
+    return -1;
+  }
+
+  function ebmlSize(bytes, at) {
+    var first = bytes[at];
+    var mask = 0x80;
+    var length = 1;
+    while (length <= 8 && !(first & mask)) {
+      mask >>= 1;
+      length += 1;
+    }
+    if (length > 8 || at + length > bytes.length) { return null; }
+    var value = first & (mask - 1);
+    for (var index = 1; index < length; index += 1) { value = value * 256 + bytes[at + index]; }
+    return { value: value, length: length };
+  }
+
+  /* A Matroska file's COMMENT tag, found the way WanGP finds it: its name,
+     then its string. Tags sit at either end, so those are read first. */
+  async function mkvComment(file) {
+    var chunk = 8 * 1024 * 1024;
+    // The head, then back from the end: every byte, each read overlapping the
+    // next by enough to hold the tag's name.
+    var starts = [0];
+    for (var at = file.size - chunk; at > chunk; at -= chunk) { starts.push(at); }
+    if (file.size > chunk) { starts.push(chunk); }
+    for (var index = 0; index < starts.length; index += 1) {
+      var bytes = await fileBytes(file, starts[index], chunk + 64);
+      var at = findBytes(bytes, MKV_COMMENT, 0);
+      while (at >= 0) {
+        var tail = await fileBytes(file, starts[index] + at + MKV_COMMENT.length, 8192 + 16);
+        var value = findBytes(tail, [0x44, 0x87], 0);
+        if (value >= 0) {
+          var size = ebmlSize(tail, value + 2);
+          if (size && size.value <= 4194304) {
+            var begin = starts[index] + at + MKV_COMMENT.length + value + 2 + size.length;
+            return new TextDecoder("utf-8").decode(await fileBytes(file, begin, size.value));
+          }
+        }
+        at = findBytes(bytes, MKV_COMMENT, at + 1);
+      }
+    }
+    return "";
+  }
+
+  /* -------------------------------------------------- the two recipes */
+
+  function cmpEdits() {
+    var cmp = S.cmp;
+    return cmp ? Object.keys(cmp.changes).length + Object.keys(cmp.added).length : 0;
+  }
+
+  function cmpName(entry) {
+    var item = S.byId[entry.source];
+    return item ? displayName(item) : entry.name;
+  }
+
+  /* The right side as edited: each entry with its changes, then LoRAs taken
+     from the left. */
+  function cmpRight(view) {
+    var cmp = S.cmp;
+    var recipe = view.right.recipe;
+    var list = (recipe ? recipe.entries : []).map(function (entry) {
+      var change = cmp.changes[entry.key];
+      if (!change) { return entry; }
+      return Object.assign({}, entry, {
+        phases: change.phases || entry.phases,
+        on: change.on !== undefined ? change.on : entry.on,
+        edited: true
+      });
+    });
+    Object.keys(cmp.added).forEach(function (key) { list.push(cmp.added[key]); });
+    return list;
+  }
+
+  function cmpRowsData(view) {
+    var left = view.left.recipe ? view.left.recipe.entries : [];
+    var right = cmpRight(view);
+    var keys = [];
+    var byLeft = {};
+    var byRight = {};
+    left.forEach(function (entry) {
+      byLeft[entry.key] = entry;
+      keys.push(entry.key);
+    });
+    right.forEach(function (entry) {
+      byRight[entry.key] = entry;
+      if (!byLeft[entry.key]) { keys.push(entry.key); }
+    });
+    return keys.map(function (key) {
+      return { key: key, left: byLeft[key] || null, right: byRight[key] || null };
+    });
+  }
+
+  /* ``values`` over ``count`` steps, the way WanGP spreads a list. */
+  function stretch(values, count) {
+    var out = [];
+    for (var index = 0; index < count; index += 1) {
+      out.push(values[Math.min(values.length - 1, Math.floor(index * values.length / count))]);
+    }
+    return out;
+  }
+
+  function zeros(count) {
+    var out = [];
+    for (var index = 0; index < count; index += 1) { out.push(0); }
+    return out;
+  }
+
+  function cmpRel(a, b) {
+    if (Math.abs(a - b) < 1e-6) { return 0; }
+    return a > b ? 1 : -1;
+  }
+
+  /* The phases a row shows -- the right side's, where it has the LoRA -- and
+     in each, both sides' values over as many steps as either runs per step.
+     ``left``/``right`` are what each applies (0 where it is missing or off);
+     ``leftShown``/``rightShown`` what each holds, to print. */
+  function cmpSegments(view, row) {
+    var leftRecipe = view.left.recipe;
+    var rightRecipe = view.right.recipe;
+    var count = row.right && rightRecipe ? rightRecipe.phases : (leftRecipe ? leftRecipe.phases : 1);
+    var segments = [];
+    function listOf(entry, phase) {
+      if (!entry || !entry.phases) { return null; }
+      return entry.phases[phase] || entry.phases[entry.phases.length - 1];
+    }
+    for (var phase = 0; phase < count; phase += 1) {
+      var leftRan = !!(leftRecipe && phase < leftRecipe.phases);
+      var rightList = listOf(row.right, phase);
+      var leftList = leftRan ? listOf(row.left, phase) : null;
+      var steps = rightList && rightList.length > 1 ? rightList.length
+        : (leftList && leftList.length > 1 ? leftList.length : 1);
+      var segment = {
+        label: count > 1 ? "P" + (phase + 1) : "",
+        steps: steps,
+        perStep: steps > 1,
+        rightPerStep: !!(rightList && rightList.length > 1),
+        leftPerStep: !!(leftList && leftList.length > 1),
+        leftShown: leftList ? stretch(leftList, steps) : null,
+        rightShown: rightList ? stretch(rightList, steps) : null,
+        leftRan: leftRan
+      };
+      // What each applies: nothing where it is missing or off.
+      segment.left = !leftRan ? null
+        : (!row.left || !row.left.on) ? zeros(steps)
+          : (leftList ? stretch(leftList, steps) : null);
+      segment.right = (!row.right || !row.right.on) ? zeros(steps)
+        : (rightList ? stretch(rightList, steps) : null);
+      // A side that cannot be read, or a missing video, compares to nothing.
+      segment.compared = !!(view.left.recipe && rightRecipe && segment.left && segment.right) &&
+        !(row.left && !row.left.phases) && !(row.right && !row.right.phases);
+      segments.push(segment);
+    }
+    return segments;
+  }
+
+  function relClass(rel) {
+    return rel > 0 ? "lb-c-more" : (rel < 0 ? "lb-c-less" : "lb-c-same");
+  }
+
+  function relArrow(rel) {
+    return rel > 0 ? "▲" : (rel < 0 ? "▼" : "");
+  }
+
+  function cmpValue(value) {
+    return fmt(value).replace("-", "−");
+  }
+
+  /* Rows are rebuilt on every edit; what had the focus gets it back. */
+  function focusKey(node, key) {
+    node.dataset.focus = key;
+    return node;
+  }
+
+  function paintCmpRows() {
+    var cmp = S.cmp;
+    var view = S.compareView;
+    var holder = cmp.parts.rows;
+    var scroll = holder.scrollTop;
+    var active = document.activeElement;
+    var focused = active && holder.contains(active) && active.dataset ? active.dataset.focus : "";
+    holder.innerHTML = "";
+    var rows = cmpRowsData(view);
+    if (!rows.length) {
+      holder.appendChild(paragraph(view.left.recipe || view.right.recipe
+        ? "Neither recipe has a LoRA." : "Nothing to compare yet.", "lb-cmp-empty"));
+    }
+    rows.forEach(function (row) { holder.appendChild(cmpRow(view, row)); });
+    holder.scrollTop = scroll;
+    if (focused) {
+      var again = holder.querySelector('[data-focus="' + cssEscape(focused) + '"]');
+      if (again) { again.focus(); }
+    }
+  }
+
+  function cmpRow(view, row) {
+    var segments = cmpSegments(view, row);
+    var node = document.createElement("div");
+    node.className = "lb-cmp-row";
+    node.dataset.key = row.key;
+    var head = document.createElement("div");
+    head.className = "lb-cmp-row-head";
+    head.appendChild(span("lb-cmp-name", cmpName(row.left || row.right)));
+    head.appendChild(span("lb-cmp-note", cmpNote(view, row, segments)));
+    node.appendChild(head);
+    var cells = document.createElement("div");
+    cells.className = "lb-cmp-cells";
+    cells.appendChild(cmpCell(view, row, segments, "left"));
+    cells.appendChild(cmpCell(view, row, segments, "right"));
+    node.appendChild(cells);
+    return node;
+  }
+
+  function cmpNote(view, row, segments) {
+    if (!row.left && view.left.recipe) { return "Only on the right"; }
+    if (!row.right && view.right.recipe) { return view.left.source === "file" ? "Only in your file" : "Only in the gallery video"; }
+    var anyStep = segments.some(function (segment) { return segment.perStep; });
+    var bothStep = segments.some(function (segment) { return segment.leftPerStep && segment.rightPerStep; });
+    var text = !anyStep ? "One strength" : (bothStep ? "Per step" : "One strength vs per step");
+    var same = segments.every(function (segment) {
+      return segment.compared && segment.left.every(function (value, index) {
+        return cmpRel(segment.right[index], value) === 0;
+      });
+    });
+    return same ? text + " · same" : text;
+  }
+
+  function cmpBadges(entry) {
+    var words = [];
+    if (entry.system) { words.push("WanGP's"); }
+    if (entry.mode) { words.push(entry.mode); }
+    if (entry.group) { words.push("Group " + entry.group + (entry.baked ? ", baked" : "")); }
+    if (entry.added) { words.push("Added"); }
+    return words;
+  }
+
+  function cmpCell(view, row, segments, which) {
+    var cmp = S.cmp;
+    var entry = row[which];
+    var other = which === "left" ? "right" : "left";
+    var cell = document.createElement("div");
+    cell.className = "lb-cmp-cell lb-cmp-cell-" + which;
+    var recipe = view[which].recipe;
+
+    if (!recipe) {
+      cell.classList.add("lb-cmp-missing");
+      cell.appendChild(span("lb-cmp-missing-text", which === "left" ? "No settings to compare" : "No recipe"));
+      return cell;
+    }
+    // Whether this side is ahead or behind, where every compared value agrees.
+    var rels = [];
+    segments.forEach(function (segment) {
+      if (!segment.compared) { return; }
+      segment[which].forEach(function (value, index) { rels.push(cmpRel(value, segment[other][index])); });
+    });
+    var overall = rels.length && rels.every(function (rel) { return rel === rels[0]; }) ? rels[0] : 0;
+    cell.classList.add(relClass(overall));
+
+    if (!entry) {
+      cell.classList.add("lb-cmp-missing");
+      cell.appendChild(span("lb-cmp-missing-text", which === "left" ? "Not in this video" : "Not in this recipe"));
+      return cell;
+    }
+    if (!entry.on) { cell.classList.add("lb-cmp-off"); }
+    var editable = which === "right" && !entry.system && !!entry.phases;
+
+    var top = document.createElement("div");
+    top.className = "lb-cmp-cell-top";
+    if (editable) {
+      top.appendChild(cmpSwitch(entry));
+    } else if (!entry.on) {
+      top.appendChild(span("lb-cmp-tag", "Off"));
+    }
+    cmpBadges(entry).forEach(function (word) { top.appendChild(span("lb-cmp-tag", word)); });
+    if (editable && !entry.on) { top.appendChild(span("lb-cmp-tag", "Off, counts as 0")); }
+    if (top.firstChild) { cell.appendChild(top); }
+
+    if (!entry.phases) {
+      // Syntax the panel keeps as it is: shown, not compared.
+      cell.appendChild(codeText(entry.raw));
+      return cell;
+    }
+    var line = document.createElement("div");
+    line.className = "lb-cmp-segs";
+    segments.forEach(function (segment, phase) {
+      line.appendChild(cmpSegment(view, row, segment, phase, which, editable, segments.length));
+    });
+    cell.appendChild(line);
+
+    if (which === "left" && cmpCanUse(view, row)) {
+      var use = focusKey(cmpIconButton("use", "Use this value on the right", function () { cmpUseLeft(view, row); }), row.key + "#use");
+      use.classList.add("lb-cmp-use");
+      cell.appendChild(use);
+    }
+    return cell;
+  }
+
+  function cmpSegment(view, row, segment, phase, which, editable, total) {
+    var cmp = S.cmp;
+    var other = which === "left" ? "right" : "left";
+    var box = document.createElement("div");
+    box.className = "lb-cmp-seg" + (segment.perStep ? " lb-cmp-seg-steps" : "");
+    if (segment.label) { box.appendChild(span("lb-cmp-seg-label", segment.label)); }
+    var shown = segment[which + "Shown"];
+    if (which === "left" && !segment.leftRan) {
+      box.appendChild(span("lb-cmp-notrun", "Not run"));
+      return box;
+    }
+    if (!shown) {
+      box.appendChild(span("lb-cmp-notrun", "—"));
+      return box;
+    }
+    var rels = shown.map(function (value, index) {
+      return segment.compared ? cmpRel(segment[which][index], segment[other][index]) : 0;
+    });
+
+    if (!segment.perStep) {
+      var rel = rels[0];
+      var text = cmpValue(shown[0]);
+      if (editable) {
+        var single = total === 1;
+        var wrap = document.createElement("div");
+        wrap.className = "lb-cmp-flat" + (single ? " lb-cmp-flat-nudge" : "");
+        if (single) {
+          wrap.appendChild(focusKey(makeButton("−", "lb-btn lb-cmp-nudge", function () { cmpNudge(row.right, phase, -S.nudgeStep); },
+            "Lower " + cmpName(row.right) + " by " + fmt(S.nudgeStep)), row.key + "#" + phase + "#down"));
+        }
+        var value = focusKey(makeButton(text, "lb-btn lb-cmp-val " + relClass(rel), function () { cmpTarget(row.right, phase); },
+          "Set " + cmpName(row.right) + (segment.label ? " " + segment.label : "")), row.key + "#" + phase + "#value");
+        if (rel) { value.appendChild(span("lb-cmp-arrow", relArrow(rel))); }
+        wrap.appendChild(value);
+        if (single) {
+          wrap.appendChild(focusKey(makeButton("+", "lb-btn lb-cmp-nudge", function () { cmpNudge(row.right, phase, S.nudgeStep); },
+            "Raise " + cmpName(row.right) + " by " + fmt(S.nudgeStep)), row.key + "#" + phase + "#up"));
+        }
+        box.appendChild(wrap);
+      } else {
+        var number = span("lb-cmp-val " + relClass(rel), text);
+        if (rel) { number.appendChild(span("lb-cmp-arrow", relArrow(rel))); }
+        box.appendChild(number);
+      }
+      return box;
+    }
+
+    var strip = document.createElement("div");
+    strip.className = "lb-cmp-bars";
+    var key = row.key + "#" + phase;
+    var picked = editable ? (cmp.picked[key] || []) : [];
+    shown.forEach(function (value, index) {
+      var bar = document.createElement(editable ? "button" : "span");
+      if (editable) {
+        bar.type = "button";
+        bar.setAttribute("aria-pressed", picked.indexOf(index) >= 0 ? "true" : "false");
+        focusKey(bar, key + "@" + index);
+      }
+      bar.className = "lb-cmp-bar " + relClass(rels[index]) + (picked.indexOf(index) >= 0 ? " lb-bar-on" : "");
+      bar.dataset.step = String(index);
+      bar.title = "Step " + (index + 1) + ": " + fmt(value) +
+        (rels[index] > 0 ? ", more" : (rels[index] < 0 ? ", less" : (segment.compared ? ", the same" : "")));
+      if (editable) { bar.setAttribute("aria-label", bar.title); }
+      var up = span("lb-cmp-up");
+      up.appendChild(document.createElement("i")).style.height = (Math.max(0, Math.min(1, value)) * 100) + "%";
+      var down = span("lb-cmp-down");
+      down.appendChild(document.createElement("i")).style.height = (Math.max(0, Math.min(1, -value)) * 100) + "%";
+      bar.appendChild(up);
+      bar.appendChild(span("lb-cmp-zero"));
+      bar.appendChild(down);
+      strip.appendChild(bar);
+    });
+    if (!editable) { strip.setAttribute("aria-hidden", "true"); }
+    box.appendChild(strip);
+    if (editable) {
+      if (segment.rightPerStep) {
+        cmpWireBars(strip, row.right, phase, picked);
+        box.appendChild(span("lb-cmp-picked", !picked.length ? "Tap or drag across steps"
+          : picked.length === 1 ? "Step " + (picked[0] + 1) + " selected" : picked.length + " steps selected"));
+      } else {
+        // One strength, shown per step against the other side: one value to set.
+        strip.addEventListener("click", function () { cmpTarget(row.right, phase); });
+        box.appendChild(span("lb-cmp-picked", "One strength, " + cmpValue(segment.rightShown[0]) + " every step"));
+      }
+    } else if (!(which === "left" ? segment.leftPerStep : segment.rightPerStep)) {
+      box.appendChild(span("lb-cmp-picked", "One strength, " + cmpValue(shown[0]) + " every step"));
+    }
+    return box;
+  }
+
+  function cmpSwitch(entry) {
+    var on = !!entry.on;
+    var power = document.createElement("button");
+    power.type = "button";
+    power.className = "lb-switch" + (on ? " lb-on" : "");
+    power.setAttribute("role", "switch");
+    power.setAttribute("aria-checked", on ? "true" : "false");
+    power.setAttribute("aria-label", "Apply " + cmpName(entry) + " on the right");
+    power.title = on ? "On - switch off and it counts as 0" : "Off - counts as 0";
+    power.addEventListener("click", function () { cmpChange(entry, { on: !on }); cmpRepaint(); });
+    return focusKey(power, entry.key + "#switch");
+  }
+
+  /* Tap bars to select steps on the right, or drag across them; a finger that
+     moves up or down is scrolling. */
+  function cmpWireBars(strip, entry, phase, picked) {
+    var chosen = picked.slice();
+    var key = entry.key + "#" + phase;
+    var mark = function (bar, on) {
+      var step = Number(bar.dataset.step);
+      var at = chosen.indexOf(step);
+      if (on && at < 0) { chosen.push(step); }
+      if (!on && at >= 0) { chosen.splice(at, 1); }
+      bar.classList.toggle("lb-bar-on", on);
+      bar.setAttribute("aria-pressed", on ? "true" : "false");
+    };
+    var done = function (steps) {
+      S.cmp.picked[key] = steps.slice().sort(function (a, b) { return a - b; });
+      S.cmp.target = { key: entry.key, phase: phase };
+      cmpRepaint(true);
+    };
+    strip.addEventListener("pointerdown", function (event) {
+      var first = event.target.closest(".lb-cmp-bar");
+      if (!first || event.button > 0) { return; }
+      var touch = event.pointerType === "touch";
+      var on = chosen.indexOf(Number(first.dataset.step)) < 0;
+      var startX = event.clientX;
+      var seen = {};
+      var started = false;
+      var begin = function () {
+        if (started) { return; }
+        started = true;
+        seen[first.dataset.step] = true;
+        mark(first, on);
+      };
+      if (!touch) {
+        event.preventDefault();
+        begin();
+      }
+      try { strip.setPointerCapture(event.pointerId); } catch (error) { /* not every pointer can be */ }
+      var move = function (moved) {
+        if (!started) {
+          if (Math.abs(moved.clientX - startX) < 6) { return; }
+          begin();
+        }
+        var under = document.elementFromPoint(moved.clientX, moved.clientY);
+        var bar = under && under.closest ? under.closest(".lb-cmp-bar") : null;
+        if (bar && strip.contains(bar) && !seen[bar.dataset.step]) {
+          seen[bar.dataset.step] = true;
+          mark(bar, on);
+        }
+      };
+      var finish = function (meant) {
+        strip.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", cancel);
+        if (meant) {
+          begin();
+          done(chosen);
+        } else {
+          done(picked);
+        }
+      };
+      var up = function () { finish(true); };
+      var cancel = function () { finish(started && !touch); };
+      strip.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+      window.addEventListener("pointercancel", cancel);
+    });
+    strip.addEventListener("click", function (event) {
+      var bar = event.target.closest(".lb-cmp-bar");
+      if (!bar || event.detail !== 0) { return; }            // a pointer already did it
+      mark(bar, chosen.indexOf(Number(bar.dataset.step)) < 0);
+      done(chosen);
+    });
+  }
+
+  /* ------------------------------------------------- editing the right */
+
+  /* One edit, to an entry and every member of its group: a group moves as one. */
+  function cmpChange(entry, patch) {
+    var cmp = S.cmp;
+    var targets = [entry];
+    if (entry.link && !entry.added) {
+      targets = cmpRight(S.compareView).filter(function (each) { return each.link === entry.link && !each.added; });
+    }
+    targets.forEach(function (target) {
+      if (target.added) {
+        if (patch.phases) { cmp.added[target.key].phases = patch.phases.map(function (list) { return list.slice(); }); }
+        if (patch.on !== undefined) { cmp.added[target.key].on = patch.on; }
+        return;
+      }
+      var change = cmp.changes[target.key] || {};
+      if (patch.phases) { change.phases = patch.phases.map(function (list) { return list.slice(); }); }
+      if (patch.on !== undefined) { change.on = patch.on; }
+      cmp.changes[target.key] = change;
+    });
+    cmp.applied = false;
+  }
+
+  function cmpCurrent(key) {
+    return cmpRight(S.compareView).filter(function (entry) { return entry.key === key; })[0] || null;
+  }
+
+  function cmpTarget(entry, phase) {
+    S.cmp.target = { key: entry.key, phase: phase };
+    paintCmpTray(true);
+    var number = S.cmp.parts.tray.querySelector("input.lb-number");
+    if (number && !number.disabled) { number.focus(); }
+  }
+
+  /* The steps a target sets: the selected ones of a phase run per step, else
+     its one value. */
+  function cmpTargets(entry, phase) {
+    var list = entry.phases[phase] || [];
+    if (list.length > 1) { return S.cmp.picked[entry.key + "#" + phase] || []; }
+    return [0];
+  }
+
+  function cmpSetValues(key, phase, value) {
+    var entry = cmpCurrent(key);
+    if (!entry || !entry.phases) { return; }
+    var number = round4(Number(value));
+    if (!isFinite(number) || number < S.valueMin || number > S.valueMax) { return; }
+    var phases = entry.phases.map(function (list) { return list.slice(); });
+    cmpTargets(entry, phase).forEach(function (step) {
+      if (step < phases[phase].length) { phases[phase][step] = number; }
+    });
+    cmpChange(entry, { phases: phases });
+    cmpRepaint();
+  }
+
+  function cmpNudge(entry, phase, delta) {
+    var current = cmpCurrent(entry.key);
+    if (!current || !current.phases) { return; }
+    var phases = current.phases.map(function (list) { return list.slice(); });
+    cmpTargets(current, phase).forEach(function (step) {
+      var next = round4(phases[phase][step] + delta);
+      if (next >= S.valueMin && next <= S.valueMax) { phases[phase][step] = next; }
+    });
+    cmpChange(current, { phases: phases });
+    cmpRepaint();
+  }
+
+  /* The left's values, in the right's phases, on the right: added where the
+     right does not have the LoRA, switched on where it is off. */
+  function cmpUseLeft(view, row) {
+    var cmp = S.cmp;
+    var count = view.right.recipe ? view.right.recipe.phases : 1;
+    var lists = [];
+    for (var phase = 0; phase < count; phase += 1) {
+      lists.push((row.left.phases[phase] || row.left.phases[row.left.phases.length - 1]).slice());
+    }
+    if (row.right && !row.right.added) {
+      cmpChange(row.right, { phases: lists, on: true });
+    } else {
+      cmp.added[row.key] = {
+        key: row.key, source: row.left.source, name: row.left.name, add_id: row.left.add_id,
+        mode: "", group: "", link: "", system: false, added: true, on: true, phases: lists, raw: ""
+      };
+    }
+    cmp.applied = false;
+    cmpRepaint();
+  }
+
+  function cmpCanUse(view, row) {
+    if (!view.right.recipe || !row.left || !row.left.phases || row.left.system) { return false; }
+    if (!row.right) { return true; }
+    if (row.right.system || !row.right.phases) { return false; }
+    return !row.right.on || JSON.stringify(row.left.phases) !== JSON.stringify(row.right.phases);
+  }
+
+  function cmpRepaint(tray) {
+    if (!S.cmp) { return; }
+    paintCmpRows();
+    if (tray) {
+      paintCmpTray(true);
+    } else if (S.cmp.trayPaint) {
+      S.cmp.trayPaint();
+    }
+    paintCmpFoot();
+    paintCmpMedia(S.compareView);
+  }
+
+  /* The selected steps', or the one strength's, slider, number and -/+:
+     the editor's own control. */
+  function paintCmpTray(force) {
+    var cmp = S.cmp;
+    var tray = cmp.parts.tray;
+    var target = cmp.target;
+    var entry = target ? cmpCurrent(target.key) : null;
+    var trayKey = entry ? entry.key + "#" + target.phase + "#" + (cmp.picked[entry.key + "#" + target.phase] || []).join(".") : "";
+    if (!force && trayKey && trayKey === cmp.trayKey && cmp.trayPaint) {
+      cmp.trayPaint();
+      return;
+    }
+    cmp.trayKey = trayKey;
+    tray.innerHTML = "";
+    cmp.trayPaint = null;
+    if (!entry || !entry.phases || entry.system) {
+      cmp.target = null;
+      tray.hidden = true;
+      return;
+    }
+    tray.hidden = false;
+    var phase = target.phase;
+    var list = entry.phases[phase] || [];
+    var perStep = list.length > 1;
+    var head = document.createElement("div");
+    head.className = "lb-cmp-tray-head";
+    var what = document.createElement("span");
+    what.className = "lb-cmp-tray-what";
+    what.appendChild(document.createElement("strong")).textContent = cmpName(entry);
+    var count = S.compareView.right.recipe ? S.compareView.right.recipe.phases : 1;
+    var described = span("lb-muted");
+    what.appendChild(document.createTextNode(" "));
+    what.appendChild(described);
+    head.appendChild(what);
+    head.appendChild(makeButton("Done", "lb-btn lb-cmp-done", function () {
+      cmp.target = null;
+      paintCmpTray(true);
+    }, "Close the tray"));
+    tray.appendChild(head);
+
+    var valuesNow = function () {
+      var current = cmpCurrent(entry.key);
+      if (!current || !current.phases) { return []; }
+      var now = current.phases[phase] || [];
+      return cmpTargets(current, phase).filter(function (step) { return step < now.length; })
+        .map(function (step) { return now[step]; });
+    };
+    var describe = function () {
+      var picks = cmpTargets(entry, phase);
+      described.textContent = (count > 1 ? "P" + (phase + 1) + ", " : "") + (perStep
+        ? (!picks.length ? "tap steps to select them"
+          : picks.length === 1 ? "step " + (picks[0] + 1) : picks.length + " steps")
+        : "one strength");
+    };
+    var values = valuesNow();
+    var range = rangeNote();
+    var weight = buildWeightLine({
+      value: values.length ? values[0] : 0,
+      label: cmpName(entry) + " on the right",
+      commit: function (value) {
+        cmpSetValues(entry.key, phase, value);
+        range.paint([value]);
+      },
+      nudge: function (delta) { cmpNudge(entry, phase, delta); },
+      settle: function () {},
+      disabled: perStep && !values.length
+    });
+    weight.node.classList.add("lb-cmp-weight");
+    tray.appendChild(weight.node);
+    tray.appendChild(range.node);
+    cmp.trayPaint = function () {
+      var now = valuesNow();
+      describe();
+      if (!now.length) { return; }
+      if (now.every(function (value) { return value === now[0]; })) { weight.paint(now[0]); } else { weight.mixed(now[0]); }
+      range.paint(now);
+    };
+    if (!values.length) {
+      weight.number.value = "";
+      weight.number.placeholder = "–";
+    }
+    cmp.trayPaint();
+  }
+
+  function paintCmpLegend(view) {
+    var legend = S.cmp.parts.legend;
+    legend.innerHTML = "";
+    var run = function (recipe) {
+      if (!recipe) { return ""; }
+      var steps = recipe.steps.length ? recipe.steps.join(" + ") + " steps"
+        : (recipe.total_steps ? recipe.total_steps + " steps" : "");
+      return [steps, recipe.phases > 1 ? recipe.phases + " phases" : "One Phase"].filter(Boolean).join(", ");
+    };
+    var left = run(view.left.recipe);
+    var right = run(view.right.recipe);
+    var text = left && right ? (left === right ? "Both " + left : "Left: " + left + " · Right: " + right)
+      : (left || right);
+    if (view.left.recipe && view.right.recipe && view.left.model_type && view.right.model_type &&
+        view.left.model_type !== view.right.model_type) {
+      text += " · different models";
+    }
+    if (text) { legend.appendChild(span("lb-cmp-run", text)); }
+    legend.appendChild(span("lb-cmp-key lb-c-more", "▲ more weight"));
+    legend.appendChild(span("lb-cmp-key lb-c-less", "▼ less weight"));
+    legend.appendChild(span("lb-cmp-key lb-c-same", "grey: the same"));
+  }
+
+  function paintCmpFoot() {
+    var cmp = S.cmp;
+    var view = S.compareView;
+    var edits = cmpEdits();
+    cmp.parts.status.textContent = cmp.applied ? "Applied to your settings."
+      : edits ? plural(edits, "LoRA", "LoRAs") + " edited"
+        : (view.right.source === "current" ? "Right: your settings now" : "Right: the newest video’s recipe");
+    cmp.parts.reset.disabled = !edits;
+    cmp.parts.apply.disabled = !view.right.recipe;
+  }
+
   /* --------------------------------------------------------- inspect */
 
   /* A near-full-screen view of the Civitai catalogue the enrichment script
@@ -4731,6 +5932,14 @@
     // Not forced: the row key knows when structure changed, and rebuilding on a
     // value-only payload would take focus out of a field being typed into.
     renderRows();
+    // The compare view follows the payload while it is open; one the panel
+    // does not know about (a reload) is closed on the other side too.
+    S.compareView = payload.compare || null;
+    if (S.cmp) {
+      paintCompare();
+    } else if (S.compareView) {
+      send({ type: "compare_close" });
+    }
     paintBulk();
     paintBuildBar();
     paintBuiltLink();

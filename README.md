@@ -46,6 +46,12 @@ thumbnail browser and a real-time strength editor.
   `name: x multiplier` line per LoRA, press Enter, and that is the stack —
   schedules and all. *Copy current stack* writes the same format back out. See
   [Pasting a stack as text](#pasting-a-stack-as-text).
+- **Compare two videos' recipes.** *Compare* opens the video selected in
+  WanGP's gallery beside the newest one, both playing together, with their
+  LoRAs lined up underneath: grey where both apply the same, green where a
+  side applies more, red where it applies less — per LoRA, and step by step.
+  Tune the newest one's weights right there and *Apply* them. See
+  [Comparing two videos](#comparing-two-videos).
 - **A list view for long stacks.** One line per LoRA — picture, name, what each
   phase applies and its switch — with a scheduled phase shown as how many steps
   it runs on. Click a line to open that LoRA's full editor under it; one is
@@ -391,6 +397,64 @@ format, each named by the shortest name that reads back to it — so a stack
 copied here and pasted later, or on another machine with the same files, comes
 back as it was.
 
+### Comparing two videos
+
+Tuning a recipe means rendering variants and looking for what changed.
+**Compare**, above the active LoRAs, opens a pop-up over WanGP — most of the
+window, with WanGP dimmed round its edges — that puts two recipes side by side:
+
+```
+ Gallery video  1 of 12   [×]   Newest video  three.mp4   Edited
+ ┌───────────────────────┐      ┌───────────────────────┐
+ │        video          │      │        video          │
+ └───────────────────────┘      └───────────────────────┘
+ [‹] [›]             [mute]                         [mute]
+ [        Play both         ]  [⟲]
+ Both 8 steps, One Phase   ▲ more weight   ▼ less weight   grey: the same
+
+ Detail_Enhancer                                        Per step
+ ┌ ▆ ▆ ▅ ▅ ▂ ▂ _ _ ──────┐      ┌ ● ▆ ▆ ▆ ▆ ▃ ▂ _ _ ────┐
+ └ red where it is less ─┘      └ green where it is more┘
+ Neg_Blur                                            One strength
+ [ −1 ▲         →  ]            [ ● [−] −2 ▼ [+] ]
+```
+
+- **The left is the video selected in the gallery**, read-only. ‹ › step
+  through the gallery without closing the pop-up. × clears it: drop a video
+  there, or *Browse…* for one — MP4, MOV, M4V, MKV or WebM, or a settings
+  JSON. The settings WanGP saved in the file are read in the browser, from the
+  bytes that hold them, and the video plays from the file itself.
+- **The right is the newest video in the gallery** — taken as it was when
+  the pop-up opened, so a render finishing meanwhile does not swap it — and
+  it is yours to edit. With no video yet, it is your settings as they are.
+- **Both videos play together**: *Play both*, *Restart*, and each its own
+  mute. They loop, so a difference has time to show.
+- **One row per LoRA**, its name once across both sides, both sides
+  scrolling as one. A LoRA is the file you know, whatever carried it: a
+  visual-only copy, a sound half, a group or a bake line up with the LoRA
+  itself, and say so in a small label.
+- **Colours are about weight, not about matching.** Grey: both apply the
+  same. Otherwise the side that applies more is green (▲) and the side that
+  applies less is red (▼) — so one side is green where the other is red.
+  More is the higher number: −1 is more than −2. A LoRA a side does not have,
+  or has switched off, counts as 0 there. One strength against per step is
+  compared step by step, the one strength counting as that value at every
+  step; two phases are compared phase by phase; runs of different lengths at
+  the same point of the run. The colours are two CSS variables, `--lb-more`
+  and `--lb-less`.
+- **Editing the right** works as the editor does, on what the right already
+  has: −/+ on a strength, or tap it for the tray — the 0–1 slider, the number
+  field (any value, −2 included) and −/+. Tap or drag across steps to set
+  several at once; each phase stays one strength or per step. The switch turns
+  a LoRA off. → on a left row puts that LoRA's value on the right, adding the
+  LoRA if the right does not have it. Every edit recolours both sides at once;
+  a group's members move as one.
+- **Apply** makes the right side, edits and all, your LoRAs and multipliers —
+  fitted to the guidance mode WanGP is in. Nothing changes before that:
+  looking, stepping through the gallery and editing are the pop-up's own.
+  *Reset* goes back to the newest video's recipe. Escape, × or a tap outside
+  closes it.
+
 ### The list view
 
 The active LoRAs open as a list: one line per LoRA with its switch, its
@@ -573,8 +637,11 @@ model can apply in full are listed first.
   receive a small derived WebP as a `data:` URI.
 - The frontend addresses LoRAs by stable ID only; paths are resolved server-side
   and validated against the current model's LoRA root.
-- Absolute paths never reach the browser, and all display text is inserted as
-  text nodes rather than HTML.
+- No LoRA's absolute path reaches the browser, and all display text is
+  inserted as text nodes rather than HTML. The compare view plays gallery
+  videos from the Gradio file URLs WanGP's own gallery uses, for the files
+  WanGP lists in it; a dropped file is read in the browser and only the
+  settings found in it, and its name, are sent.
 
 ## The Civitai catalogue
 
@@ -703,6 +770,7 @@ lora_browser/
   builder.py               the background build queue
   stack_modes.py           modes, groups and bakes in the native stack
   stack_files.py           which built files a stack needs, and their state
+  compare.py               two recipes side by side, and edits written back
 assets/                    panel CSS and JavaScript
 ```
 

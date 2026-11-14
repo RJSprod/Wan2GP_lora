@@ -1852,3 +1852,333 @@
 .lb-sheet-overlay .lb-row { border: 0; border-radius: 0; box-shadow: none; }
 /* The room is for the steps: the whole width of the sheet, and taller. */
 .lb-sheet-overlay .lb-bars { --lb-bar-up: 150px; --lb-bar-down: 44px; }
+
+/* ------------------------------------------------------------- compare */
+
+/* More and less: two hues mixed with the theme's text colour, so each reads
+   on a light theme and a dark one. Change these two to recolour every part
+   of the compare view. */
+.__NS__ {
+  --lb-more: color-mix(in srgb, #2fbf71 66%, var(--body-text-color));
+  --lb-less: color-mix(in srgb, #f0524a 66%, var(--body-text-color));
+}
+
+/* A pop-up over WanGP, which shows around it: about 92% of the window. */
+.lb-modal-overlay.lb-cmp-overlay {
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  padding: 16px;
+  border: 0;
+  border-radius: 0;
+}
+@media (min-width: 760px) {
+  .lb-modal-overlay.lb-cmp-overlay { padding: 32px; }
+}
+.lb-cmp-overlay .lb-cmp {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 1500px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-color-primary);
+  border-radius: 16px;
+  background: var(--lb-card);
+  color: var(--body-text-color);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+.lb-cmp-overlay .lb-cmp-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 4px 16px;
+}
+.lb-cmp-overlay .lb-cmp-head h2 { flex: 1 1 auto; margin: 0; font-size: 17px; }
+.lb-cmp-overlay button.lb-btn.lb-cmp-close,
+.lb-cmp-overlay button.lb-btn.lb-cmp-icon {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  line-height: 1;
+}
+.lb-cmp-overlay .lb-cmp-ic svg { width: 18px; height: 18px; }
+
+/* The two videos, docked over the rows. */
+.lb-cmp-overlay .lb-cmp-media {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  padding: 0 12px;
+}
+.lb-cmp-overlay .lb-cmp-col { min-width: 0; display: flex; flex-direction: column; gap: 6px; border-radius: 10px; }
+.lb-cmp-overlay .lb-cmp-col.lb-cmp-over { outline: 2px dashed var(--border-color-accent, var(--color-accent, currentColor)); outline-offset: 2px; }
+.lb-cmp-overlay .lb-cmp-label { display: flex; align-items: center; gap: 6px; min-height: 44px; }
+.lb-cmp-overlay .lb-cmp-words { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.lb-cmp-overlay .lb-cmp-words strong { font-size: 13px; }
+.lb-cmp-overlay .lb-cmp-sub {
+  font-size: 12px;
+  color: var(--lb-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lb-cmp-overlay .lb-cmp-badge {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border: 1px solid var(--border-color-primary);
+  border-radius: 6px;
+  font-size: 11px;
+}
+.lb-cmp-overlay .lb-cmp-screen {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  /* The rows need the height more than the videos do. */
+  max-height: 26vh;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #000;
+}
+.lb-cmp-overlay .lb-cmp-screen video,
+.lb-cmp-overlay .lb-cmp-screen img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.lb-cmp-overlay .lb-cmp-blank {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 6px;
+  text-align: center;
+  color: var(--lb-muted);
+  font-size: 12px;
+  background: var(--lb-raised);
+}
+.lb-cmp-overlay .lb-cmp-drop {
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 6px;
+  text-align: center;
+  border: 2px dashed var(--border-color-primary);
+  border-radius: 8px;
+  background: var(--lb-raised);
+  color: var(--body-text-color);
+  font-size: 13px;
+}
+.lb-cmp-overlay .lb-cmp-drop-note { color: var(--lb-muted); font-size: 11.5px; }
+.lb-cmp-overlay .lb-cmp-controls { display: flex; align-items: center; gap: 4px; }
+.lb-cmp-overlay label.lb-btn.lb-cmp-browse {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  cursor: pointer;
+}
+.lb-cmp-overlay .lb-cmp-browse:focus-within { outline: 2px solid var(--color-accent, Highlight); outline-offset: 2px; }
+.lb-cmp-overlay input.lb-cmp-file { position: absolute; inset: 0; width: 100%; opacity: 0; cursor: pointer; }
+
+.lb-cmp-overlay .lb-cmp-transport { display: flex; gap: 8px; padding: 8px 12px 6px; }
+.lb-cmp-overlay button.lb-btn.lb-cmp-play { flex: 1 1 auto; min-height: 44px; font-weight: 600; }
+.lb-cmp-overlay button.lb-btn.lb-cmp-restart {
+  flex: 0 0 auto;
+  width: 52px;
+  min-height: 44px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.lb-cmp-overlay .lb-cmp-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 0 16px 8px;
+  color: var(--lb-muted);
+  font-size: 12px;
+}
+.lb-cmp-overlay .lb-cmp-key.lb-c-more { color: var(--lb-more); }
+.lb-cmp-overlay .lb-cmp-key.lb-c-less { color: var(--lb-less); }
+
+/* One row per LoRA, its name across both sides; both sides scroll as one. */
+.lb-cmp-overlay .lb-cmp-rows {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 12px;
+  border-top: 1px solid var(--border-color-primary);
+}
+.lb-cmp-overlay .lb-cmp-empty { margin: 16px 4px; color: var(--lb-muted); }
+.lb-cmp-overlay .lb-cmp-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color-primary) 60%, transparent);
+}
+.lb-cmp-overlay .lb-cmp-row-head { display: flex; align-items: baseline; gap: 8px; }
+.lb-cmp-overlay .lb-cmp-name { flex: 1 1 auto; min-width: 0; font-size: 14px; font-weight: 700; overflow-wrap: anywhere; }
+.lb-cmp-overlay .lb-cmp-note { flex: 0 1 auto; color: var(--lb-muted); font-size: 11.5px; text-align: right; }
+.lb-cmp-overlay .lb-cmp-cells { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.lb-cmp-overlay .lb-cmp-cell {
+  position: relative;
+  min-width: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--border-color-primary);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--lb-raised) 40%, var(--lb-card));
+}
+.lb-cmp-overlay .lb-cmp-cell.lb-c-more {
+  border-color: color-mix(in srgb, var(--lb-more) 55%, var(--border-color-primary));
+  background: color-mix(in srgb, var(--lb-more) 12%, var(--lb-card));
+}
+.lb-cmp-overlay .lb-cmp-cell.lb-c-less {
+  border-color: color-mix(in srgb, var(--lb-less) 55%, var(--border-color-primary));
+  background: color-mix(in srgb, var(--lb-less) 12%, var(--lb-card));
+}
+.lb-cmp-overlay .lb-cmp-cell.lb-cmp-missing { border-style: dashed; background: transparent; opacity: 0.8; }
+.lb-cmp-overlay .lb-cmp-missing-text { min-height: 36px; display: flex; align-items: center; font-size: 12.5px; color: var(--lb-muted); }
+.lb-cmp-overlay .lb-cmp-cell.lb-c-less .lb-cmp-missing-text { color: var(--lb-less); }
+.lb-cmp-overlay .lb-cmp-cell.lb-c-more .lb-cmp-missing-text { color: var(--lb-more); }
+.lb-cmp-overlay .lb-cmp-cell.lb-cmp-off .lb-cmp-segs { opacity: 0.6; }
+.lb-cmp-overlay .lb-cmp-cell-top { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+.lb-cmp-overlay .lb-cmp-tag {
+  padding: 0 6px;
+  border: 1px solid var(--border-color-primary);
+  border-radius: 999px;
+  color: var(--lb-muted);
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+.lb-cmp-overlay .lb-cmp-cell code { font: 12px var(--lb-mono); overflow-wrap: anywhere; color: var(--lb-muted); }
+.lb-cmp-overlay .lb-cmp-segs { display: flex; gap: 8px; min-width: 0; }
+.lb-cmp-overlay .lb-cmp-seg { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.lb-cmp-overlay .lb-cmp-seg.lb-cmp-seg-steps { flex-grow: 3; }
+.lb-cmp-overlay .lb-cmp-seg-label { color: var(--lb-muted); font-size: 10.5px; font-weight: 700; }
+.lb-cmp-overlay .lb-cmp-notrun { color: var(--lb-muted); font-size: 12px; min-height: 36px; display: flex; align-items: center; }
+.lb-cmp-overlay .lb-cmp-val {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-height: 36px;
+  font: 700 18px/1 var(--lb-mono);
+  font-variant-numeric: tabular-nums;
+}
+.lb-cmp-overlay .lb-cmp-val.lb-c-more { color: var(--lb-more); }
+.lb-cmp-overlay .lb-cmp-val.lb-c-less { color: var(--lb-less); }
+.lb-cmp-overlay button.lb-btn.lb-cmp-val {
+  min-width: 0;
+  min-height: 44px;
+  justify-content: center;
+  padding: 0 4px;
+  font: 700 17px/1 var(--lb-mono);
+}
+.lb-cmp-overlay .lb-cmp-arrow { font-size: 10px; }
+.lb-cmp-overlay .lb-cmp-flat { display: flex; }
+.lb-cmp-overlay .lb-cmp-flat.lb-cmp-flat-nudge {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) 44px;
+  gap: 4px;
+  align-items: center;
+}
+.lb-cmp-overlay button.lb-btn.lb-cmp-nudge { min-height: 44px; padding: 0; font-size: 20px; line-height: 1; }
+
+/* Steps: a bar each on the 0..1 scale, coloured by which side has more. */
+.lb-cmp-overlay .lb-cmp-bars {
+  display: flex;
+  gap: 2px;
+  height: 64px;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: pan-y;
+}
+.lb-cmp-overlay .lb-cmp-bar {
+  flex: 1 1 0;
+  min-width: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: 4px;
+  background: var(--lb-raised);
+  color: inherit;
+  font: inherit;
+}
+.lb-cmp-overlay button.lb-cmp-bar { cursor: pointer; }
+.lb-cmp-overlay button.lb-cmp-bar:focus-visible { outline: 2px solid var(--color-accent, Highlight); outline-offset: 1px; }
+.lb-cmp-overlay .lb-cmp-bar.lb-bar-on { border-color: var(--body-text-color); }
+.lb-cmp-overlay .lb-cmp-up { flex: 1 1 auto; display: flex; flex-direction: column; justify-content: flex-end; }
+.lb-cmp-overlay .lb-cmp-down { flex: 0 0 14px; display: flex; flex-direction: column; justify-content: flex-start; }
+.lb-cmp-overlay .lb-cmp-up i,
+.lb-cmp-overlay .lb-cmp-down i { display: block; flex: 0 0 auto; background: color-mix(in srgb, var(--body-text-color) 50%, transparent); }
+.lb-cmp-overlay .lb-cmp-zero { flex: 0 0 1px; background: var(--lb-muted); }
+.lb-cmp-overlay .lb-cmp-bar.lb-c-more i { background: var(--lb-more); }
+.lb-cmp-overlay .lb-cmp-bar.lb-c-less i { background: var(--lb-less); }
+.lb-cmp-overlay .lb-cmp-picked { color: var(--lb-muted); font-size: 12px; }
+.lb-cmp-overlay button.lb-btn.lb-cmp-use { align-self: flex-end; }
+
+/* The edit tray: the selected steps', or the one strength's, control. */
+.lb-cmp-overlay .lb-cmp-tray {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border-color-primary);
+  background: var(--background-fill-secondary, var(--lb-raised));
+}
+.lb-cmp-overlay .lb-cmp-tray[hidden] { display: none; }
+.lb-cmp-overlay .lb-cmp-tray-head { display: flex; align-items: center; gap: 8px; }
+.lb-cmp-overlay .lb-cmp-tray-what { flex: 1 1 auto; min-width: 0; font-size: 13px; overflow-wrap: anywhere; }
+.lb-cmp-overlay button.lb-btn.lb-cmp-done { min-height: 44px; padding: 0 16px; }
+.lb-cmp-overlay .lb-weight.lb-cmp-weight { padding: 0; }
+.lb-cmp-overlay .lb-cmp-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--border-color-primary);
+}
+.lb-cmp-overlay .lb-cmp-status { flex: 1 1 auto; min-width: 0; color: var(--lb-muted); font-size: 12px; }
+.lb-cmp-overlay .lb-cmp-foot button.lb-btn { min-height: 44px; padding: 0 16px; }
+
+/* Room to spare: taller bars, and the tray's control on one line. */
+@media (min-width: 760px) {
+  .lb-cmp-overlay .lb-cmp-media { gap: 16px; }
+  .lb-cmp-overlay .lb-cmp-bars { height: 96px; }
+}
+/* A phone: the tray's slider takes a line of its own. */
+@media (max-width: 520px) {
+  .lb-cmp-overlay .lb-weight.lb-cmp-weight {
+    grid-template-columns: 48px minmax(0, 1fr) 48px;
+    grid-template-areas: "range range range" "down number up";
+    row-gap: 4px;
+  }
+  .lb-cmp-overlay .lb-cmp-weight > .lb-down { grid-area: down; }
+  .lb-cmp-overlay .lb-cmp-weight > input[type="range"] { grid-area: range; }
+  .lb-cmp-overlay .lb-cmp-weight > input.lb-number { grid-area: number; }
+  .lb-cmp-overlay .lb-cmp-weight > .lb-up { grid-area: up; }
+  .lb-cmp-overlay .lb-cmp-weight button.lb-step,
+  .lb-cmp-overlay .lb-cmp-weight input.lb-number { min-height: 46px; }
+}

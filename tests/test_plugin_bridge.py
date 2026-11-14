@@ -1962,3 +1962,102 @@ class TestLtxScheduling:
         assert multipliers.split()[0].split(";")[0] == "1,1,0,0,0,0,0,0"
         assert payload["phase_steps"] == [8, 3]
         assert payload["status"] == "Schedules follow the stages: 8 steps, then 3 to refine."
+
+
+class TestCompare:
+    """The compare view: two recipes from WanGP's gallery, side by side, and
+    the right one written back as the LoRAs WanGP applies."""
+
+    def _state(self, state, tmp_path, selected=0, last=False):
+        gallery = dict(state)
+        gallery["gen"] = {
+            "file_list": [str(tmp_path / "out" / "one.mp4"), str(tmp_path / "out" / "two.mp4")],
+            "file_settings_list": [
+                {"activated_loras": ["a.safetensors", "b.safetensors"], "loras_multipliers": "0.7 1,1,0.8,0.8",
+                 "num_inference_steps": 4, "guidance_phases": 1, "model_type": "minimax_h3"},
+                {"activated_loras": ["a.safetensors", "https://hf.co/x/c.safetensors|sub"],
+                 "loras_multipliers": "0.85 0.5", "num_inference_steps": 4, "guidance_phases": 1,
+                 "model_type": "minimax_h3"},
+            ],
+            "selected": selected,
+            "last_selected": last,
+        }
+        return gallery
+
+    def _open(self, plugin, state):
+        return act(plugin, {"type": "compare_open"}, state, ["a.safetensors"], "1", guidance=1, steps=4)
+
+    def test_opening_shows_the_selected_video_and_the_newest(self, plugin, state, tmp_path):
+        state = self._state(state, tmp_path)
+        choices, mults, payload = self._open(plugin, state)
+        # Looking writes nothing.
+        assert "value" not in choices and "value" not in mults
+        view = payload["compare"]
+        assert (view["count"], view["selected"]) == (2, 0)
+        assert (view["left"]["index"], view["right"]["index"]) == (0, 1)
+        assert view["left"]["url"] == "/gradio_api/file=" + str(tmp_path / "out" / "one.mp4").replace("\\", "/")
+        assert view["left"]["kind"] == "video"
+        left = [(e["key"], e["phases"]) for e in view["left"]["recipe"]["entries"]]
+        right = [(e["key"], e["phases"]) for e in view["right"]["recipe"]["entries"]]
+        assert left == [("a.safetensors", [[0.7]]), ("b.safetensors", [[1, 1, 0.8, 0.8]])]
+        assert right == [("a.safetensors", [[0.85]]), ("sub/c.safetensors", [[0.5]])]
+
+    def test_the_newest_follows_wangp_s_selection_of_it(self, plugin, state, tmp_path):
+        view = self._open(plugin, self._state(state, tmp_path, selected=0, last=True))[2]["compare"]
+        assert view["left"]["index"] == 1
+
+    def test_the_left_steps_through_the_gallery_and_takes_a_file(self, plugin, state, tmp_path):
+        state = self._state(state, tmp_path)
+        self._open(plugin, state)
+        view = act(plugin, {"type": "compare_left", "index": 7}, state, ["a.safetensors"], "1", guidance=1)[2]["compare"]
+        assert view["left"]["index"] == 1
+        view = act(plugin, {"type": "compare_left_clear"}, state, ["a.safetensors"], "1", guidance=1)[2]["compare"]
+        assert view["left"]["source"] == "none" and view["left"]["recipe"] is None
+        dropped = {"activated_loras": ["b.safetensors"], "loras_multipliers": "0.3", "num_inference_steps": 4,
+                   "guidance_phases": 1, "model_type": "minimax_h3"}
+        view = act(plugin, {"type": "compare_left_file", "name": "C:\\clips\\mine.mp4", "settings": dropped},
+                   state, ["a.safetensors"], "1", guidance=1)[2]["compare"]
+        assert (view["left"]["source"], view["left"]["name"], view["left"]["url"]) == ("file", "mine.mp4", "")
+        assert [e["key"] for e in view["left"]["recipe"]["entries"]] == ["b.safetensors"]
+        payload = act(plugin, {"type": "compare_left_file", "settings": "not a recipe"}, state,
+                      ["a.safetensors"], "1", guidance=1)[2]
+        assert payload["status_warn"] and payload["compare"]["left"]["source"] == "file"
+
+    def test_the_right_is_the_newest_when_it_opened(self, plugin, state, tmp_path):
+        state = self._state(state, tmp_path)
+        self._open(plugin, state)
+        state["gen"]["file_list"].append(str(tmp_path / "out" / "three.mp4"))
+        state["gen"]["file_settings_list"].append({"activated_loras": [], "loras_multipliers": ""})
+        view = act(plugin, {"type": "compare_left", "index": 2}, state, ["a.safetensors"], "1", guidance=1)[2]["compare"]
+        assert view["right"]["index"] == 1 and len(view["right"]["recipe"]["entries"]) == 2
+        assert view["count"] == 3 and view["left"]["recipe"]["entries"] == []
+
+    def test_apply_makes_the_right_the_settings(self, plugin, state, tmp_path):
+        state = self._state(state, tmp_path)
+        self._open(plugin, state)
+        choices, mults, payload = act(plugin, {
+            "type": "compare_apply",
+            "changes": {"a.safetensors": {"phases": [[0.6]]}, "sub/c.safetensors": {"on": False}},
+            "added": [{"id": "b.safetensors", "phases": [[1, 1, 0.5, 0.5]]}],
+        }, state, ["a.safetensors"], "1", guidance=1, steps=4)
+        assert choices["value"] == ["a.safetensors", "b.safetensors"]
+        # H3 keeps its phase 2 through One Phase.
+        assert mults["value"] == "0.6;0.85 1,1,0.5,0.5;1\n#lora_off 1 0.5 sub/c.safetensors"
+        assert payload["status"] == "Applied the right side to your settings."
+        # Still open: Apply is not Done.
+        assert payload["compare"] is not None
+
+    def test_with_no_video_the_right_is_the_settings_now(self, plugin, state):
+        view = act(plugin, {"type": "compare_open"}, state, ["a.safetensors"], "0.7", guidance=1, steps=4)[2]["compare"]
+        assert (view["count"], view["left"]["source"], view["right"]["source"]) == (0, "none", "current")
+        assert [(e["key"], e["phases"]) for e in view["right"]["recipe"]["entries"]] == [("a.safetensors", [[0.7]])]
+
+    def test_closing_forgets_it(self, plugin, state, tmp_path):
+        state = self._state(state, tmp_path)
+        self._open(plugin, state)
+        payload = act(plugin, {"type": "compare_close"}, state, ["a.safetensors"], "1", guidance=1)[2]
+        assert payload["compare"] is None
+        # Steering a closed view does nothing.
+        choices, mults, payload = act(plugin, {"type": "compare_apply", "changes": {}}, state,
+                                      ["a.safetensors"], "1", guidance=1)
+        assert "value" not in mults and payload["compare"] is None

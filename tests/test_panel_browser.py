@@ -1920,3 +1920,308 @@ class TestListView:
         assert "sound.safetensors" in host.selected and ".sound.safetensors" not in host.multipliers
         host.plugin._builder.run_pending()
         assert problems == []
+
+
+# ------------------------------------------------------------------ compare
+
+
+def _box(kind, payload):
+    import struct
+    return struct.pack(">I", 8 + len(payload)) + kind + payload
+
+
+def mp4_with_settings(settings):
+    """A file shaped like WanGP's MP4s: the settings in the comment tag, after
+    the video, the way an encoder that does not move its index leaves it."""
+    import struct
+    text = json.dumps(settings).encode("utf-8") + b" " * 64    # a reserved slot's padding
+    data = _box(b"data", struct.pack(">II", 1, 0) + text)
+    ilst = _box(b"ilst", _box(b"\xa9cmt", data))
+    meta = _box(b"meta", b"\0\0\0\0" + _box(b"hdlr", b"\0" * 8 + b"mdirappl" + b"\0" * 9) + ilst)
+    moov = _box(b"moov", _box(b"udta", meta))
+    return _box(b"ftyp", b"isom\0\0\2\0isomiso2mp41") + _box(b"mdat", b"\0" * 4096) + moov
+
+
+def mkv_with_settings(settings):
+    text = json.dumps(settings).encode("utf-8")
+    size = bytes([0x40 | (len(text) >> 8), len(text) & 0xFF])
+    tag = b"\x45\xa3\x87COMMENT" + b"\x44\x87" + size + text
+    return b"\x1a\x45\xdf\xa3" + b"\0" * 2048 + b"\x12\x54\xc3\x67" + tag
+
+
+#: A gallery of three: the one selected first, an older one, the newest.
+COMPARE_GALLERY = [
+    ("one.mp4", ["lora_01", "lora_02", "lora_03", "lora_04", "lora_05", "lora_06"],
+     "0.7 1,1,0.875,0.875,0.25,0.25,0,0 0.5 0.6 -1 0.4"),
+    ("two.mp4", ["lora_01"], "1"),
+    ("three.mp4", ["lora_01", "lora_02", "lora_03", "lora_04", "lora_05", "lora_07"],
+     "0.85 1,1,0.95,0.95,0.4,0.25,0,0 0.8,0.8,0.6,0.5,0.5,0.3,0.2,0.2 0.6 -2 0.5"),
+]
+
+
+def _settings(names, multipliers):
+    return {"activated_loras": [name + ".safetensors" for name in names], "loras_multipliers": multipliers,
+            "num_inference_steps": 8, "guidance_phases": 1, "model_type": "browser_model"}
+
+
+@pytest.fixture(scope="module")
+def compare_panel(chromium, tmp_path_factory):
+    root = tmp_path_factory.mktemp("browser-compare")
+    state = dict(STATE)
+    state["gen"] = {
+        "file_list": [str(root / "out" / name) for name, _, _ in COMPARE_GALLERY],
+        "file_settings_list": [_settings(names, text) for _, names, text in COMPARE_GALLERY],
+        "selected": 0,
+        "last_selected": False,
+    }
+    host = _Host(root, view="list", state=state)
+    host.steps = 8
+    with _open_panel(chromium, host) as opened:
+        yield opened + (root,)
+
+
+def open_compare(page):
+    page.locator('[data-lb="compare"]').click()
+    page.wait_for_selector(".lb-cmp .lb-cmp-row", timeout=5000)
+    settle(page, 300)
+    return page.locator(".lb-cmp")
+
+
+def close_compare(page):
+    if page.locator(".lb-cmp").count():
+        page.keyboard.press("Escape")
+        settle(page, 400)
+
+
+def cmp_row(page, name):
+    return page.locator(".lb-cmp-row", has=page.locator(".lb-cmp-name", has_text=name))
+
+
+def cell_class(row, side):
+    classes = row.locator(f".lb-cmp-cell-{side}").get_attribute("class").split()
+    return next((c for c in classes if c in ("lb-c-more", "lb-c-less", "lb-c-same")), "")
+
+
+def bar_classes(row, side):
+    return row.locator(f".lb-cmp-cell-{side} .lb-cmp-bar").evaluate_all(
+        "bars => bars.map(bar => ['lb-c-more', 'lb-c-less', 'lb-c-same'].find(c => bar.classList.contains(c)))")
+
+
+class TestCompareInTheBrowser:
+    """Two videos' recipes side by side, coloured by which applies more."""
+
+    def test_it_opens_over_wangp_with_both_videos_and_every_lora(self, compare_panel):
+        page, host, problems, _ = compare_panel
+        before = native(page)
+        try:
+            dialog = open_compare(page)
+            assert dialog.get_attribute("role") == "dialog"
+            # A pop-up with WanGP still showing round it.
+            box = dialog.bounding_box()
+            assert box["x"] >= 15 and box["y"] >= 15
+            assert page.locator(".lb-cmp-left .lb-cmp-sub").inner_text() == "1 of 3"
+            assert page.locator(".lb-cmp-right .lb-cmp-sub").inner_text() == "three.mp4"
+            assert page.locator(".lb-cmp-left video").get_attribute("src").endswith("/out/one.mp4")
+            names = page.locator(".lb-cmp-row .lb-cmp-name").all_inner_texts()
+            assert names == [f"lora_0{i}.safetensors" for i in (1, 2, 3, 4, 5, 6, 7)]
+            # Looking changes nothing.
+            assert native(page) == before
+        finally:
+            close_compare(page)
+        assert problems == []
+
+    def test_each_side_says_whether_it_applies_more_or_less(self, compare_panel):
+        page, _, _, _ = compare_panel
+        try:
+            open_compare(page)
+            one = cmp_row(page, "lora_01")
+            assert (cell_class(one, "left"), cell_class(one, "right")) == ("lb-c-less", "lb-c-more")
+            assert one.locator(".lb-cmp-cell-left .lb-cmp-val").inner_text().startswith("0.7")
+            # The same is neutral, and says so.
+            four = cmp_row(page, "lora_04")
+            assert (cell_class(four, "left"), cell_class(four, "right")) == ("lb-c-same", "lb-c-same")
+            assert "same" in four.locator(".lb-cmp-note").inner_text()
+            # More is the higher number: -1 is more than -2.
+            five = cmp_row(page, "lora_05")
+            assert (cell_class(five, "left"), cell_class(five, "right")) == ("lb-c-more", "lb-c-less")
+            # Per step, step by step.
+            two = cmp_row(page, "lora_02")
+            assert bar_classes(two, "right") == ["lb-c-same"] * 2 + ["lb-c-more"] * 3 + ["lb-c-same"] * 3
+            assert bar_classes(two, "left") == ["lb-c-same"] * 2 + ["lb-c-less"] * 3 + ["lb-c-same"] * 3
+            # One strength against per step: that strength at every step.
+            three = cmp_row(page, "lora_03")
+            assert bar_classes(three, "right") == ["lb-c-more"] * 3 + ["lb-c-same"] * 2 + ["lb-c-less"] * 3
+            assert "One strength vs per step" in three.locator(".lb-cmp-note").inner_text()
+            # A LoRA one side does not have counts as 0 there.
+            six = cmp_row(page, "lora_06")
+            assert (cell_class(six, "left"), cell_class(six, "right")) == ("lb-c-more", "lb-c-less")
+            assert six.locator(".lb-cmp-cell-right").inner_text() == "Not in this recipe"
+            seven = cmp_row(page, "lora_07")
+            assert seven.locator(".lb-cmp-cell-left").inner_text() == "Not in this video"
+            assert cell_class(seven, "right") == "lb-c-more"
+        finally:
+            close_compare(page)
+
+    def test_editing_the_right_recolours_as_it_goes(self, compare_panel):
+        page, _, _, _ = compare_panel
+        try:
+            open_compare(page)
+            four = cmp_row(page, "lora_04")
+            four.locator(".lb-cmp-cell-right button.lb-cmp-nudge").nth(1).click()
+            settle(page, 200)
+            assert (cell_class(four, "left"), cell_class(four, "right")) == ("lb-c-less", "lb-c-more")
+            assert page.locator(".lb-cmp-right .lb-cmp-badge").inner_text() == "Edited"
+            # Off counts as 0.
+            one = cmp_row(page, "lora_01")
+            one.locator(".lb-cmp-cell-right button.lb-switch").click()
+            settle(page, 200)
+            assert cell_class(one, "right") == "lb-c-less"
+            assert "counts as 0" in one.locator(".lb-cmp-cell-right").inner_text()
+            # Use this value: the left's, on the right -- added where missing.
+            six = cmp_row(page, "lora_06")
+            six.locator(".lb-cmp-cell-left button.lb-cmp-use").click()
+            settle(page, 200)
+            assert (cell_class(six, "left"), cell_class(six, "right")) == ("lb-c-same", "lb-c-same")
+            assert "Added" in six.locator(".lb-cmp-cell-right").inner_text()
+            assert page.locator(".lb-cmp-status").inner_text() == "3 LoRAs edited"
+            page.locator(".lb-cmp-foot button", has_text="Reset").click()
+            settle(page, 200)
+            assert cell_class(four, "right") == "lb-c-same"
+            assert six.locator(".lb-cmp-cell-right").inner_text() == "Not in this recipe"
+            assert page.locator(".lb-cmp-right .lb-cmp-badge").count() == 0
+        finally:
+            close_compare(page)
+
+    def test_the_tray_sets_selected_steps_to_any_value(self, compare_panel):
+        page, _, _, _ = compare_panel
+        try:
+            open_compare(page)
+            two = cmp_row(page, "lora_02")
+            bars = two.locator(".lb-cmp-cell-right .lb-cmp-bar")
+            first, last = bars.nth(5).bounding_box(), bars.nth(7).bounding_box()
+            page.mouse.move(first["x"] + first["width"] / 2, first["y"] + first["height"] / 2)
+            page.mouse.down()
+            page.mouse.move(last["x"] + last["width"] / 2, last["y"] + last["height"] / 2, steps=8)
+            page.mouse.up()
+            settle(page, 300)
+            assert "3 steps" in page.locator(".lb-cmp-tray").inner_text()
+            number = page.locator(".lb-cmp-tray input.lb-number")
+            number.fill("-2")
+            number.press("Enter")
+            settle(page, 300)
+            assert bar_classes(two, "right")[5:] == ["lb-c-less"] * 3
+            assert "outside the slider" in page.locator(".lb-cmp-tray .lb-range-note").inner_text()
+            page.locator(".lb-cmp-tray button", has_text="Done").click()
+            assert page.locator(".lb-cmp-tray").is_hidden()
+        finally:
+            close_compare(page)
+
+    def test_apply_makes_the_right_side_the_settings(self, compare_panel):
+        page, host, _, _ = compare_panel
+        try:
+            open_compare(page)
+            cmp_row(page, "lora_01").locator(".lb-cmp-cell-right button.lb-cmp-nudge").first.click()
+            settle(page, 200)
+            page.locator(".lb-cmp-apply").click()
+            settle(page, 1500)
+            assert host.selected[:2] == ["lora_01.safetensors", "lora_02.safetensors"]
+            assert native(page).split()[0].startswith("0.84")
+            assert page.locator(".lb-cmp-status").inner_text() == "Applied to your settings."
+        finally:
+            close_compare(page)
+
+    def test_the_left_steps_through_the_gallery(self, compare_panel):
+        page, _, _, _ = compare_panel
+        try:
+            open_compare(page)
+            page.locator('.lb-cmp-left button[aria-label="Next video in the gallery"]').click()
+            page.wait_for_function(
+                "() => document.querySelector('.lb-cmp-left .lb-cmp-sub').textContent === '2 of 3'")
+            assert page.locator(".lb-cmp-left video").get_attribute("src").endswith("/out/two.mp4")
+            assert cmp_row(page, "lora_02").locator(".lb-cmp-cell-left").inner_text() == "Not in this video"
+        finally:
+            close_compare(page)
+
+    def test_a_dropped_file_s_settings_are_read_in_the_browser(self, compare_panel):
+        page, _, _, root = compare_panel
+        files = {
+            "clip.mp4": mp4_with_settings(_settings(["lora_01"], "0.3")),
+            "clip.mkv": mkv_with_settings(_settings(["lora_01"], "0.9")),
+            "recipe.json": json.dumps(_settings(["lora_01"], "0.85")).encode("utf-8"),
+            "blank.mp4": _box(b"ftyp", b"isom\0\0\2\0isom") + _box(b"mdat", b"\0" * 512),
+        }
+        for name, data in files.items():
+            (root / name).write_bytes(data)
+        try:
+            open_compare(page)
+            page.locator(".lb-cmp-left button.lb-cmp-clear").click()
+            page.wait_for_selector(".lb-cmp-drop", timeout=3000)
+            assert page.locator(".lb-cmp-left .lb-cmp-file").get_attribute("accept") == ".mp4,.mov,.m4v,.mkv,.webm,.json"
+
+            def drop(name):
+                page.locator(".lb-cmp-left .lb-cmp-file").set_input_files(str(root / name))
+
+            drop("clip.mp4")
+            page.wait_for_function(
+                "() => document.querySelector('.lb-cmp-left .lb-cmp-sub').textContent === 'clip.mp4'")
+            settle(page, 300)
+            one = cmp_row(page, "lora_01")
+            assert one.locator(".lb-cmp-cell-left .lb-cmp-val").inner_text().startswith("0.3")
+            assert cell_class(one, "left") == "lb-c-less"
+            assert page.locator(".lb-cmp-left video").get_attribute("src").startswith("blob:")
+
+            page.locator(".lb-cmp-left button.lb-cmp-clear").click()
+            page.wait_for_selector(".lb-cmp-drop", timeout=3000)
+            drop("clip.mkv")
+            page.wait_for_function(
+                "() => document.querySelector('.lb-cmp-left .lb-cmp-sub').textContent === 'clip.mkv'")
+            settle(page, 300)
+            assert cell_class(cmp_row(page, "lora_01"), "left") == "lb-c-more"
+
+            page.locator(".lb-cmp-left button.lb-cmp-clear").click()
+            page.wait_for_selector(".lb-cmp-drop", timeout=3000)
+            drop("recipe.json")
+            page.wait_for_function(
+                "() => document.querySelector('.lb-cmp-left .lb-cmp-sub').textContent === 'recipe.json'")
+            settle(page, 300)
+            assert cell_class(cmp_row(page, "lora_01"), "left") == "lb-c-same"
+
+            page.locator(".lb-cmp-left button.lb-cmp-clear").click()
+            page.wait_for_selector(".lb-cmp-drop", timeout=3000)
+            drop("blank.mp4")
+            page.wait_for_function(
+                "() => document.querySelector('.lb-cmp-drop-note').textContent.includes('No saved settings')")
+            # Back to the gallery's video.
+            page.locator('.lb-cmp-left button[aria-label="Back to the video selected in the gallery"]').click()
+            page.wait_for_function(
+                "() => document.querySelector('.lb-cmp-left .lb-cmp-sub').textContent === '1 of 3'")
+        finally:
+            close_compare(page)
+
+    def test_escape_closes_it_and_the_plugin_forgets_it(self, compare_panel):
+        page, host, problems, _ = compare_panel
+        open_compare(page)
+        page.keyboard.press("Escape")
+        settle(page, 600)
+        assert page.locator(".lb-cmp").count() == 0
+        assert host.plugin._instance(INSTANCE).compare is None
+        assert problems == []
+
+    def test_it_fits_a_phone(self, compare_panel):
+        page, _, _, _ = compare_panel
+        page.set_viewport_size({"width": 400, "height": 900})
+        try:
+            settle(page, 300)
+            dialog = open_compare(page)
+            box = dialog.bounding_box()
+            assert box["x"] >= 15 and box["x"] + box["width"] <= 385
+            assert page.evaluate("""() => {
+              const rows = document.querySelector('.lb-cmp-rows');
+              return rows.scrollWidth <= rows.clientWidth + 1;
+            }""")
+            for button in page.locator(".lb-cmp-controls button, .lb-cmp-foot button, .lb-cmp-nudge").all():
+                assert button.bounding_box()["height"] >= 44
+        finally:
+            close_compare(page)
+            page.set_viewport_size({"width": 1100, "height": 1000})
+            settle(page, 300)
