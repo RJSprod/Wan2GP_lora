@@ -1515,6 +1515,21 @@
 }
 .__NS__ .lb-track-picture .lb-track-head { color: var(--lb-visual); }
 .__NS__ .lb-track-sound .lb-track-head { color: var(--lb-audio); }
+/* A shrunk group's file per phase: a section each, named by its phase, and
+   the other phases' chips locked -- the file runs in its own phase only. */
+.__NS__ .lb-track-phase .lb-track-head { color: var(--lb-group); }
+.__NS__ .lb-track-note {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--lb-muted);
+}
+.__NS__ .lb-chip.lb-chip-locked,
+.__NS__ .lb-chip.lb-chip-locked:hover {
+  cursor: not-allowed;
+  opacity: 0.45;
+  border-style: dashed;
+  background: transparent;
+}
 .__NS__ .lb-li-ph.lb-li-pair { flex-direction: column; align-items: flex-start; gap: 1px; }
 .__NS__ .lb-li-side { display: flex; align-items: center; gap: 5px; }
 .__NS__ .lb-li-side .lb-ic svg { width: 11px; height: 11px; }
@@ -2319,6 +2334,7 @@ body.lb-scroll-locked {
 .__NS__ .lb-shrink-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
 .__NS__ .lb-shrink-runs { margin: 4px 0 0; font-size: 12.5px; color: var(--lb-muted); }
 .__NS__ .lb-shrink-runs code { overflow-wrap: anywhere; }
+.__NS__ .lb-shrink-phase + .lb-shrink-phase { margin-top: 2px; }
 .__NS__ .lb-shrink-list {
   margin: 6px 0 0;
   padding: 0;

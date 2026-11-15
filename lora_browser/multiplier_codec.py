@@ -83,9 +83,10 @@ _GROUP_LINE = re.compile(r"^\s*#lora_group\s+([A-Z])\s+(\S.*?)\s*$")
 #: different amounts: a shrunk stack's LoRAs, each at the strength it ran at.
 #: A group with these lines is baked with every member scaled by its weight,
 #: and the baked file runs at the group's own multiplier on top -- 1 for a
-#: shrink of single strengths.  One line per member, the LoRA last:
+#: shrink of single strengths.  A weight per phase, ``0.8;0.5``, is a group
+#: baked a file per phase.  One line per member, the LoRA last:
 #:
-#:     #lora_weight <letter> <weight> <lora>
+#:     #lora_weight <letter> <weight[;weight...]> <lora>
 WEIGHT_MARK = "#lora_weight"
 _WEIGHT_LINE = re.compile(r"^\s*#lora_weight\s+([A-Z])\s+(\S+)\s+(\S.*?)\s*$")
 
@@ -196,23 +197,39 @@ def parse_groups(text: str) -> dict[str, list[str]]:
     return groups
 
 
-def parse_weights(text: str) -> dict[str, dict[str, float]]:
-    """``letter -> {lora: weight}`` for every ``#lora_weight`` line."""
-    weights: dict[str, dict[str, float]] = {}
+def parse_weight(text: str) -> list[float] | None:
+    """``0.7`` -> ``[0.7]``, ``0.8;0.5`` -> ``[0.8, 0.5]``; None for anything else."""
+    parts = [part.strip() for part in str(text or "").split(";")]
+    if not parts or not all(is_finite_number(part) for part in parts):
+        return None
+    return [float(part) for part in parts]
+
+
+def weight_text(values) -> str:
+    """A weight as its line writes it: one value, or one per phase."""
+    values = list(values) if isinstance(values, (list, tuple)) else [values]
+    return ";".join(format_number(value) for value in values)
+
+
+def parse_weights(text: str) -> dict[str, dict[str, list[float]]]:
+    """``letter -> {lora: [weight, ...]}`` for every ``#lora_weight`` line:
+    one weight, or one per phase."""
+    weights: dict[str, dict[str, list[float]]] = {}
     for line in str(text or "").replace("\r", "").split("\n"):
         match = _WEIGHT_LINE.match(line)
-        if match and is_finite_number(match.group(2)):
-            weights.setdefault(match.group(1), {})[match.group(3)] = float(match.group(2))
+        values = parse_weight(match.group(2)) if match else None
+        if values is not None:
+            weights.setdefault(match.group(1), {})[match.group(3)] = values
     return weights
 
 
-def weight_lines(weights: dict[str, dict[str, float]] | None, groups: dict[str, list[str]] | None) -> list[str]:
+def weight_lines(weights: dict[str, dict] | None, groups: dict[str, list[str]] | None) -> list[str]:
     """The weight lines of the groups being written, in their members' order."""
     lines = []
     for letter in sorted(weights or {}):
         for lora_id in (groups or {}).get(letter, []):
             if lora_id in weights[letter]:
-                lines.append(f"{WEIGHT_MARK} {letter} {format_number(weights[letter][lora_id])} {lora_id}")
+                lines.append(f"{WEIGHT_MARK} {letter} {weight_text(weights[letter][lora_id])} {lora_id}")
     return lines
 
 
@@ -232,6 +249,35 @@ def scale_token(token: str, factor: float) -> str | None:
             return None
         phases.append(",".join(format_number(float(value) * factor) for value in values))
     return ";".join(phases)
+
+
+def token_parts(token: str, count: int) -> list[list[float]] | None:
+    """A plain or scheduled token's values for ``count`` phases, a short one
+    padded with its last phase as WanGP pads it; None for anything else."""
+    values = token_values(token)
+    if values is None:
+        return None
+    count = max(1, int(count or 1))
+    while len(values) < count:
+        values.append(list(values[-1]))
+    return values
+
+
+def compose_token(parts) -> str:
+    """Phases' value lists as one token: ``[[1, 0.5], [0]]`` -> ``1,0.5;0``."""
+    return ";".join(",".join(format_number(value) for value in part) for part in parts) or DEFAULT_TOKEN
+
+
+def pin_token(token: str, phase: int, capacity: int) -> str:
+    """``token`` running in ``phase`` only: its value there, 0 in every
+    other phase of a ``capacity``-phase run -- every phase written, so
+    WanGP's padding cannot carry it into another.  A run that does not have
+    ``phase`` is 0 throughout."""
+    capacity = max(1, int(capacity or 1))
+    phase = int(phase)
+    parts = token_parts(token, max(capacity, phase)) or [[1.0]] * max(capacity, phase)
+    pinned = [part if index == phase - 1 else [0.0] for index, part in enumerate(parts)]
+    return compose_token(pinned[:capacity])
 
 
 def token_values(token: str) -> list[list[float]] | None:

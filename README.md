@@ -78,7 +78,10 @@ thumbnail browser and a real-time strength editor.
   into one file, each at its strength, and every set of LoRAs that share a
   schedule into a file of their own that runs it — twenty LoRAs at one
   strength and two schedules shared by five more become three files, applying
-  the same. *Unshrink* gives them back. See [Shrinking a stack](#shrinking-a-stack).
+  the same. LoRAs whose strengths differ from phase to phase get **a file per
+  phase**, each running in its own phase only, so they need not match each
+  other phase for phase. *Unshrink* gives them back. See
+  [Shrinking a stack](#shrinking-a-stack).
 - **Image previews first, video previews as a still.** A LoRA with only a video
   preview gets its *first frame* decoded server-side and cached; the video itself
   is never loaded in the browser.
@@ -654,6 +657,11 @@ run the same:
   phase) go into **a file per schedule**, each at 1, and that file runs the
   schedule: the sum of LoRAs that each follow a schedule is that sum following
   it. A LoRA with no other on its schedule stays as it is.
+- **Strengths that differ from phase to phase** — 0.8 in phase 1 and 0.5 in
+  phase 2 — need not match from LoRA to LoRA: those LoRAs get **a file per
+  phase**. Phase 1's file holds each of them at its phase 1 strength and runs
+  `1;0`; phase 2's holds each at its phase 2 strength and runs `0;1`. See
+  [A file per phase](#a-file-per-phase).
 - **Each file is fitted to the rank of the highest-rank LoRA in it**, the way
   a bake starts. Once built, its row says how much of the combined change it
   kept; **Change size…** builds it again at another rank.
@@ -704,6 +712,39 @@ and the rest are baked again), and **Unshrink** gives every one back as a LoRA
 of its own at the strength it had — times the row's strength, if you changed
 it.
 
+#### A file per phase
+
+In a run with two or three phases, LoRAs whose strengths differ from phase to
+phase are shrunk **a file per phase** — however their phases pair up. Twenty
+LoRAs at twenty different pairs of strengths become two files:
+
+- **Phase 1's file** holds every one of them at its phase 1 strength, **phase
+  2's file** every one at its phase 2 strength.
+- **A phase's file runs in that phase only.** Its multiplier is 0 in every
+  other phase, whatever you set, type or paste — the other phases' chips are
+  locked on it, and a pasted schedule keeps only its own phase. So phase 1's
+  file can never apply in phase 2, nor phase 2's in phase 1.
+- **It is exact for the same reason one strength is.** In each phase WanGP
+  adds each LoRA's change times that phase's multiplier, and skips a LoRA
+  whose multiplier is 0 there, so phase 1 runs `0.8·ΔA + 0.6·ΔB + …` from its
+  file alone, and phase 2 `0.5·ΔA + 0.6·ΔB + …` from its own.
+- **Steps inside a phase still count.** LoRAs that run the same steps in phase
+  1 and differ only in phase 2 get a phase 1 file that runs those steps.
+- **Only where it means fewer files.** A phase nothing brings anything to has
+  no file; every LoRA the same in each phase is one file for every phase, as
+  above; and two LoRAs would be two files either way, so they stay as they
+  are.
+- **Memory**: each phase's file holds every LoRA, so it takes as much as one
+  file of that rank, once per phase. Each step still runs one file where it
+  ran all of them; the dialog says when the files take more memory than the
+  LoRAs they replace.
+
+The row, *Shrunk A — 3 LoRAs in a file per phase*, has an editor per file
+(*Phase 1 file*, *Phase 2 file*), each set in its own phase. Raising phase 1's
+file to 1.2 raises every LoRA's phase 1 strength by a fifth and leaves phase 2
+as it was; **Unshrink** gives each LoRA both its phases back, each times its
+file's strength. In One Phase there is one phase to bake, so one file.
+
 A shrunk file is a group whose lines say what each LoRA brings to it:
 
 ```
@@ -715,9 +756,23 @@ A shrunk file is a group whose lines say what each LoRA brings to it:
 #lora_weight A 0.6 Film_Grain.safetensors
 ```
 
+A file per phase is the same group with a file per phase and a strength per
+phase for each LoRA:
+
+```
+1;0 0;1
+#lora_group A Detail_Enhancer.safetensors
+#lora_group A Film_Grain.safetensors
+#lora_group A _lora_browser/_bakes/5d71c0e93a2f.r64.p1.safetensors
+#lora_group A _lora_browser/_bakes/a40be6f1d8c7.r64.p2.safetensors
+#lora_weight A 0.8;0.5 Detail_Enhancer.safetensors
+#lora_weight A 0.6;0.6 Film_Grain.safetensors
+```
+
 so presets, the queue and every video's saved settings carry everything needed
 to build it again. **Copy current stack** writes the same as tags,
-`Detail_Enhancer [group A, baked r64, weight 0.8]: x1`, and pasting it back
+`Detail_Enhancer [group A, baked r64, weight 0.8]: x1` (or `weight 0.8;0.5`
+with a file per phase), and pasting it back
 gives the shrunk file back; profiles keep it too. The compare view shows each
 shrunk LoRA at what it brings, and leaves it as it is: unshrink to change one.
 

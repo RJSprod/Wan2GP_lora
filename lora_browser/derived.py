@@ -19,7 +19,9 @@ queue, a generated video's settings -- names it like any other:
     _lora_browser/<original without its extension>.<visual|audio|sound>.safetensors
     _lora_browser/_bakes/<hash of the members>.r<rank>[.sound].safetensors
 
-``visual`` and ``audio`` are the visual-only and audio-only copies.  A LoRA
+``visual`` and ``audio`` are the visual-only and audio-only copies; a
+shrunk group whose LoRAs run different strengths per phase is baked a file
+per phase, ``.p1``, ``.p2``, each running in its phase only.  A LoRA
 whose picture and sound have strengths of their own is selected as two
 halves, its ``visual`` copy and its ``sound`` copy -- the sound side alone,
 since the visual copy already holds the layers both sides share.  A group
@@ -60,11 +62,22 @@ RECIPES = "recipes.json"
 MODES = ("visual", "audio", "sound")
 #: The track a group's sound-side bake carries.
 SOUND_TRACK = "sound"
+#: The tracks of a shrunk group baked a file per phase: each file runs in
+#: its phase only.
+PHASE_TRACKS = ("p1", "p2", "p3")
 
 _SPLIT = re.compile(r"^_lora_browser/(?!_bakes/)(?P<stem>.+)\.(?P<mode>visual|audio|sound)\.safetensors$")
 _BAKE = re.compile(
-    r"^_lora_browser/_bakes/(?P<hash>[0-9a-f]{6,64})\.r(?P<rank>[1-9]\d{0,4})(?:\.(?P<track>sound))?\.safetensors$"
+    r"^_lora_browser/_bakes/(?P<hash>[0-9a-f]{6,64})\.r(?P<rank>[1-9]\d{0,4})"
+    r"(?:\.(?P<track>sound|p[1-3]))?\.safetensors$"
 )
+
+
+def phase_of(track: str) -> int:
+    """The phase a phase track's file runs in (``p2`` -> 2), else 0."""
+    return PHASE_TRACKS.index(track) + 1 if track in PHASE_TRACKS else 0
+
+
 _ORIGINAL_EXTENSIONS = (".safetensors", ".sft")
 
 
@@ -174,7 +187,9 @@ def bake_hash(members) -> str:
 
 
 def bake_id(members, rank: int, track: str = "") -> str:
-    suffix = f".{SOUND_TRACK}" if track == SOUND_TRACK else ""
+    """A bake's id: ``.sound`` for a group's sound side, ``.p1``... for a
+    shrunk group's file for one phase."""
+    suffix = f".{track}" if track == SOUND_TRACK or track in PHASE_TRACKS else ""
     return f"{LINK_NAME}/{BAKES}/{bake_hash(members)}.r{int(rank)}{suffix}.safetensors"
 
 
@@ -455,6 +470,8 @@ def recipe_of(entry: dict) -> dict:
         found = {"kind": "bake", "rank": entry.get("rank", 0), "members": members, "label": entry.get("label", "")}
         if entry.get("shrink"):
             found["shrink"] = True
+        if entry.get("track"):
+            found["track"] = entry["track"]
         return found
     return {}
 

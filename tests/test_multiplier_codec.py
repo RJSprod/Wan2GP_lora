@@ -269,7 +269,7 @@ def test_weight_lines_read_back_and_follow_their_group():
     ]
     # A group no longer written takes its weights with it.
     assert "gone.safetensors" not in text
-    assert codec.parse_weights(text) == {"A": {"a.safetensors": 0.7, "my lora.safetensors": -0.25}}
+    assert codec.parse_weights(text) == {"A": {"a.safetensors": [0.7], "my lora.safetensors": [-0.25]}}
     # WanGP never sees them: they are comments.
     assert codec.strip_comments(text) == "1"
 
@@ -295,3 +295,34 @@ def test_token_values():
     assert codec.token_values("1,0.5;0.25") == [[1.0, 0.5], [0.25]]
     assert codec.token_values("0.7") == [[0.7]]
     assert codec.token_values("1:0.5") is None
+
+
+def test_a_weight_per_phase_reads_back():
+    groups = {"A": ["a.safetensors", "b.safetensors"]}
+    weights = {"A": {"a.safetensors": [0.8, 0.5], "b.safetensors": [0.7]}}
+    text = codec.serialize(["1;0", "0;1"], -1, [], groups, weights)
+    assert "#lora_weight A 0.8;0.5 a.safetensors" in text.splitlines()
+    assert codec.parse_weights(text) == {"A": {"a.safetensors": [0.8, 0.5], "b.safetensors": [0.7]}}
+    assert codec.parse_weight("0.8;x") is None and codec.parse_weight("") is None
+
+
+@pytest.mark.parametrize("token,phase,capacity,expected", [
+    ("1", 1, 2, "1;0"),            # a short token pads to every phase: written out, it cannot
+    ("1", 2, 2, "0;1"),
+    ("0.9;0.4", 1, 2, "0.9;0"),
+    ("0.9;0.4", 2, 2, "0;0.4"),
+    ("1,1,0.5;0.3", 1, 2, "1,1,0.5;0"),
+    ("0;1,0.5", 2, 2, "0;1,0.5"),
+    ("1;1;1", 3, 3, "0;0;1"),
+    # A run without that phase: 0 throughout.
+    ("0;1", 2, 1, "0"),
+    ("1:0.5", 1, 2, "1;0"),        # branch syntax: the phase's file at 1
+])
+def test_pin_token_keeps_a_file_in_its_phase(token, phase, capacity, expected):
+    assert codec.pin_token(token, phase, capacity) == expected
+
+
+def test_token_parts_and_compose():
+    assert codec.token_parts("0.7", 2) == [[0.7], [0.7]]
+    assert codec.token_parts("1,0.5;0", 3) == [[1.0, 0.5], [0.0], [0.0]]
+    assert codec.compose_token([[1.0, 0.5], [0.0]]) == "1,0.5;0"

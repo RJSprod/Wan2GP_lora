@@ -27,7 +27,9 @@ Tags in brackets after the name carry what the panel adds to a LoRA:
 ``visual``/``audio`` (or ``normal``) is the mode, ``group A`` the group it
 moves with, and ``baked r32`` that the group is baked at rank 32.  A shrunk
 group's LoRAs say what each brings to its file, ``weight 0.7``: the line's
-multiplier is the file's, and the LoRA runs at its weight times that.
+multiplier is the file's, and the LoRA runs at its weight times that.  One
+baked a file per phase says what it brings to each, ``weight 0.8;0.5``, and
+the line's multiplier is each phase's from its own file.
 Brackets holding anything else are part of the name, as they always were.
 
 A LoRA whose picture and sound have strengths of their own is two lines, one
@@ -63,7 +65,8 @@ _LOOSE = re.compile(r"[\W_]+")
 _TAGGED = re.compile(r"^(?P<name>.*?\S)\s*\[(?P<tags>[^\[\]]*)\]$")
 _GROUP_TAG = re.compile(r"^group\s+([a-z])$")
 _BAKED_TAG = re.compile(r"^baked\s+r?([1-9]\d{0,4})$")
-_WEIGHT_TAG = re.compile(r"^weight\s+(-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)$")
+_NUMBER = r"-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?"
+_WEIGHT_TAG = re.compile(rf"^weight\s+({_NUMBER}(?:\s*;\s*{_NUMBER})*)$")
 #: ``picture`` and ``sound`` are the two sides of a LoRA with separate
 #: strengths; ``picture`` reads the same as ``visual``.
 TAG_MODES = ("normal", "visual", "audio", "picture", "sound")
@@ -85,8 +88,9 @@ class StackLine:
     mode: str = ""
     group: str = ""
     baked: int = 0
-    #: What it brings to its shrunk group's file, or None.
-    weight: float | None = None
+    #: What it brings to its shrunk group's file -- one weight, or one per
+    #: phase -- or None.
+    weight: list[float] | None = None
 
 
 @dataclass(frozen=True)
@@ -126,7 +130,7 @@ def parse(text: str) -> list[StackLine]:
     return lines
 
 
-def split_tags(name: str) -> tuple[str, str, str, int, float | None]:
+def split_tags(name: str) -> tuple[str, str, str, int, list[float] | None]:
     """``(name, mode, group, baked rank, weight)``: the tags taken off the end
     of a name, or the name untouched when its brackets hold anything else."""
     match = _TAGGED.match(str(name or ""))
@@ -148,16 +152,19 @@ def split_tags(name: str) -> tuple[str, str, str, int, float | None]:
             baked = int(found.group(1))
             continue
         found = _WEIGHT_TAG.match(part)
-        if found and is_finite_number(found.group(1)):
-            weight = float(found.group(1))
-            continue
+        if found:
+            values = [value.strip() for value in found.group(1).split(";")]
+            if all(is_finite_number(value) for value in values):
+                weight = [float(value) for value in values]
+                continue
         return name, "", "", 0, None
     return match.group("name").strip(), mode, group, baked, weight
 
 
-def tags_text(mode: str = "", group: str = "", baked: int = 0, weight: float | None = None) -> str:
+def tags_text(mode: str = "", group: str = "", baked: int = 0, weight=None) -> str:
     """`` [visual, group A, baked r32]``, or "" for a plain LoRA; a shrunk
-    group's LoRA adds what it brings, `` [group A, baked r32, weight 0.7]``."""
+    group's LoRA adds what it brings, `` [group A, baked r32, weight 0.7]`` --
+    one per phase, ``weight 0.8;0.5``, where the group has a file per phase."""
     tags = []
     if mode and mode != "normal":
         tags.append(mode)
@@ -166,7 +173,8 @@ def tags_text(mode: str = "", group: str = "", baked: int = 0, weight: float | N
         if baked:
             tags.append(f"baked r{int(baked)}")
         if weight is not None:
-            tags.append(f"weight {format_number(weight)}")
+            values = weight if isinstance(weight, (list, tuple)) else [weight]
+            tags.append("weight " + ";".join(format_number(value) for value in values))
     return f" [{', '.join(tags)}]" if tags else ""
 
 

@@ -221,7 +221,7 @@ def _link(source: str, target: str) -> bool:
 
 
 def bake_job(store: Store, derived_id: str, members: list[tuple], rank: int,
-             sided: bool, label: str, shrunk: bool = False) -> Job:
+             sided: bool, label: str, shrunk: bool = False, track: str = "") -> Job:
     """A group baked into one file.  ``members`` is
     ``(original id, path, mode, display name[, weight])`` per LoRA: a shrunk
     group's members carry what each brings, and its recipe says it is one."""
@@ -249,6 +249,8 @@ def bake_job(store: Store, derived_id: str, members: list[tuple], rank: int,
         }
         if shrunk:
             entry["shrink"] = True
+        if track:
+            entry["track"] = track
         store.record(derived_id, entry)
 
     return Job(key=derived_id, label=f"{label}, baked at rank {int(rank)}", work=work, store=store)

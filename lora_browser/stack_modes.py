@@ -35,6 +35,10 @@ What each feature leaves in WanGP's own state -- which is what presets,
   always baked, as one file whatever its members' sides -- their strengths
   are in it -- and runs at the group's multiplier on top.  Unbaking it gives
   each member back as a LoRA of its own, at its weight times that multiplier.
+* A shrunk group whose LoRAs run different strengths per phase is baked a
+  file per phase (``phased``): its weights are one per phase (``0.8;0.5``),
+  and its files -- ``.p1``, ``.p2`` -- each hold every member at that phase's
+  weight and run in that phase only, 0 in every other (``pin_tracks``).
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from typing import Callable
 
 from . import derived as dv
 from . import multiplier_codec as codec
+from .derived import PHASE_TRACKS
 from .utils import format_number, normalize_id
 
 NORMAL = "normal"
@@ -140,16 +145,39 @@ class Group:
     #: Baked files by the strength they carry: ``ALL``, or ``PICTURE`` and
     #: ``SOUND`` for a group with separate strengths.
     bakes: dict[str, str] = field(default_factory=dict)
-    #: A shrunk group's members, each with what it brings to the baked file.
-    weights: dict[str, float] = field(default_factory=dict)
+    #: A shrunk group's members, each with what it brings to the baked file:
+    #: one weight, or one per phase where it is baked a file per phase.
+    weights: dict[str, list[float]] = field(default_factory=dict)
 
     @property
     def weighted(self) -> bool:
         """A shrunk group: its members' strengths are in its baked file."""
         return bool(self.weights)
 
-    def weight(self, lora_id: str) -> float:
-        return float(self.weights.get(lora_id, 1.0))
+    def weight(self, lora_id: str, track: str = ALL) -> float:
+        """What ``lora_id`` brings to the file of ``track``: its one weight,
+        or its weight in that file's phase."""
+        values = self.weights.get(lora_id) or [1.0]
+        phase = dv.phase_of(track)
+        if phase <= 0:
+            return float(values[0])
+        return float(values[min(phase, len(values)) - 1])
+
+    @property
+    def phased(self) -> bool:
+        """A shrunk group baked a file per phase: its LoRAs bring different
+        strengths to different phases."""
+        if not self.weights:
+            return False
+        if self.bakes:
+            return any(track in PHASE_TRACKS for track in self.bakes)
+        return any(len({round(value, 6) for value in values}) > 1 for values in self.weights.values())
+
+    @property
+    def phase_count(self) -> int:
+        """How many phases a phased group's weights and files speak for."""
+        widest = max((len(values) for values in self.weights.values()), default=1)
+        return max([widest] + [dv.phase_of(track) for track in self.bakes])
 
     @property
     def separate(self) -> bool:
@@ -161,16 +189,30 @@ class Group:
 
     @property
     def tracks(self) -> list[str]:
-        """The strengths the group carries, picture first."""
+        """The strengths the group carries, picture first -- a phased group's
+        files, phase by phase: those its bakes have, or before it is baked,
+        each phase some member brings something to."""
+        if self.phased:
+            present = [track for track in PHASE_TRACKS if track in self.bakes]
+            if present:
+                return present
+            count = min(self.phase_count, len(PHASE_TRACKS))
+            return [PHASE_TRACKS[index] for index in range(count)
+                    if any(self.weight(member, PHASE_TRACKS[index]) != 0 for member in self.members)] \
+                or [PHASE_TRACKS[0]]
         if not self.separate:
             return [ALL]
         present = {entry_track(member) for member in self.members} | set(self.bakes)
         return [track for track in (PICTURE, SOUND) if track in present]
 
     def track_of(self, lora_id: str) -> str:
+        if self.phased:
+            return self.tracks[0]
         return entry_track(lora_id) if self.separate else ALL
 
     def track_members(self, track: str) -> list[str]:
+        if self.phased and track in PHASE_TRACKS:
+            return list(self.members)          # every LoRA is in every phase's file
         return [member for member in self.members if self.track_of(member) == track]
 
     @property
@@ -179,13 +221,14 @@ class Group:
 
     @property
     def bake(self) -> str:
-        """The baked file -- the picture's, where each side has one."""
-        return next((self.bakes[track] for track in (ALL, PICTURE, SOUND) if track in self.bakes), "")
+        """The baked file -- the picture's, where each side has one; phase
+        1's, where each phase has one."""
+        return next((self.bakes[track] for track in (ALL, PICTURE, SOUND) + PHASE_TRACKS if track in self.bakes), "")
 
     @property
     def files(self) -> list[str]:
-        """Every baked file, picture first."""
-        return [self.bakes[track] for track in (ALL, PICTURE, SOUND) if track in self.bakes]
+        """Every baked file, picture first, phase 1 first."""
+        return [self.bakes[track] for track in (ALL, PICTURE, SOUND) + PHASE_TRACKS if track in self.bakes]
 
     def holds(self, lora_id: str) -> bool:
         return lora_id in self.members or lora_id in self.bakes.values()
@@ -198,14 +241,20 @@ def groups(stack) -> dict[str, Group]:
     for letter, values in stack.live_groups().items():
         members = [value for value in values if not _is_bake(value)]
         weights = {
-            member: float(value) for member, value in (weights_by_letter.get(letter) or {}).items()
-            if member in members
+            member: [float(item) for item in (value if isinstance(value, (list, tuple)) else [value])]
+            for member, value in (weights_by_letter.get(letter) or {}).items() if member in members
         }
         separate = not weights and any(is_sound_entry(value) for value in values)
         bakes: dict[str, str] = {}
         for value in values:
             if _is_bake(value):
-                track = SOUND if is_sound_entry(value) else (PICTURE if separate else ALL)
+                parsed = dv.parse(value)
+                if weights and parsed.track in PHASE_TRACKS:
+                    track = parsed.track
+                elif is_sound_entry(value):
+                    track = SOUND
+                else:
+                    track = PICTURE if separate else ALL
                 bakes.setdefault(track, value)
         found[letter] = Group(letter, members, bakes, weights)
     return found
@@ -453,7 +502,65 @@ def _track_tokens(stack, group: Group) -> dict[str, str]:
     the group does not have yet."""
     tokens = {track: _token(stack, lead_of(stack, group, track)) for track in group.tracks}
     first = next((token for token in tokens.values() if token), DEFAULT_TOKEN)
-    return {track: tokens.get(track) or first for track in (ALL, PICTURE, SOUND)}
+    return {track: tokens.get(track) or first for track in (ALL, PICTURE, SOUND) + PHASE_TRACKS}
+
+
+def group_token(stack, group: Group) -> str:
+    """A shrunk group's multiplier as one token: its file's, or -- baked a
+    file per phase -- each phase's from that phase's own file."""
+    tokens = _track_tokens(stack, group)
+    if not group.phased:
+        return tokens[ALL]
+    parts = []
+    for phase in range(1, group.phase_count + 1):
+        track = PHASE_TRACKS[phase - 1] if phase <= len(PHASE_TRACKS) else ""
+        values = codec.token_parts(tokens[track], phase) if track in group.tracks else None
+        parts.append(values[phase - 1] if values else [0.0])
+    return codec.compose_token(parts)
+
+
+def member_token(stack, group: Group, member: str) -> str:
+    """What one LoRA of a shrunk group runs at: its weight times the group's
+    multiplier -- phase by phase, every phase written, where it is baked a
+    file per phase."""
+    if not group.phased:
+        return _weighted_token(group_token(stack, group), group.weight(member))
+    tokens = _track_tokens(stack, group)
+    parts = []
+    for phase in range(1, group.phase_count + 1):
+        track = PHASE_TRACKS[phase - 1] if phase <= len(PHASE_TRACKS) else ""
+        values = codec.token_parts(tokens[track], phase) if track in group.tracks else None
+        weight = group.weight(member, track) if track in group.tracks else 0.0
+        parts.append([value * weight for value in values[phase - 1]] if values else [0.0])
+    return codec.compose_token(parts)
+
+
+def pin_tracks(stack, capacity: int) -> bool:
+    """Keep every file of a group baked a file per phase in its own phase:
+    0 in every other phase of this ``capacity``-phase run, whatever was set,
+    typed or pasted -- a phase 1 file never runs in phase 2."""
+    changed = False
+    for group in groups(stack).values():
+        if not group.weighted:
+            continue
+        for track, value in group.bakes.items():
+            phase = dv.phase_of(track)
+            if not phase:
+                continue
+            position = stack.index_of(value)
+            entry = stack.disabled_entry(value) if position < 0 else None
+            current = stack.tokens[position] if position >= 0 else (entry.token if entry is not None else None)
+            if current is None:
+                continue
+            pinned = codec.pin_token(current, phase, capacity)
+            if pinned == current:
+                continue
+            if position >= 0:
+                stack.tokens[position] = pinned
+            else:
+                entry.token = pinned
+            changed = True
+    return changed
 
 
 def _set_member_mode(stack, group: Group, lora_id: str, mode: str, known_ids=()) -> list[str]:
@@ -654,13 +761,13 @@ def leave_group(stack, letter: str, lora_id: str, known_ids=()) -> bool:
         on = any(entries[index][1] for index in spots)
         at = spots[-1] + 1 if spots else len(entries)
         entries[at:at] = [
-            (member, on, _weighted_token(tokens[group.track_of(member)], group.weight(member)))
+            (member, on, member_token(stack, group, member) if group.weighted else tokens[group.track_of(member)])
             for member in mine if not stack.has_entry(member)
         ]
         stack.set_user_entries(entries, skipped)
         stack.groups[letter] = members + group.files
         if group.weighted:
-            stack.weights[letter] = {member: group.weight(member) for member in members}
+            stack.weights[letter] = {member: list(group.weights.get(member, [1.0])) for member in members}
     else:
         stack.groups[letter] = members
     _single_out(stack, mine, known_ids)
@@ -820,14 +927,14 @@ def unshrink(stack, letter: str) -> bool:
     group = groups(stack).get(letter)
     if group is None or not group.weighted:
         return False
-    token = _token(stack, lead_of(stack, group)) or DEFAULT_TOKEN
+    restored = [(member, member_token(stack, group, member)) for member in group.members]
     entries, skipped = _states(stack)
     mine = set(group.members) | set(group.files)
     spots = [index for index, entry in enumerate(entries) if entry[0] in mine]
     on = any(entries[index][1] for index in spots) if spots else True
     rest = [entry for entry in entries if entry[0] not in mine]
     at = sum(1 for index, entry in enumerate(entries) if entry[0] not in mine and index < spots[0]) if spots else len(rest)
-    rest[at:at] = [(member, on, _weighted_token(token, group.weight(member))) for member in group.members]
+    rest[at:at] = [(member, on, token) for member, token in restored]
     stack.set_user_entries(rest, skipped - mine)
     stack.groups.pop(letter, None)
     stack.weights.pop(letter, None)
@@ -958,7 +1065,14 @@ def fold_rows(rows: list[dict], stack, describe: Callable[[str], dict], known_id
             enabled=group_on(stack, group),
             members=_members(group, stack, by_id, describe, known_ids),
         )
-        if len(tracks) > 1:
+        if group.phased:
+            # A file per phase, each edited in its own phase only.
+            merged["phase_tracks"] = [
+                dict(by_id[group.bakes[track]], track=track, pinned_phase=dv.phase_of(track))
+                for track in tracks if group.bakes.get(track) in by_id
+            ]
+            merged["group_token"] = group_token(stack, group)
+        elif len(tracks) > 1:
             sound = by_id.get(lead_of(stack, group, tracks[1]))
             if sound is not None:
                 merged["sound_track"] = dict(sound, track=tracks[1])
@@ -982,8 +1096,14 @@ def _members(group: Group, stack, by_id: dict, describe, known_ids=()) -> list[d
         member["member_mode"] = member_mode(member["entries"], known_ids)
         if group.weighted:
             # What each of its entries brings to the baked file: one weight,
-            # or the picture's and the sound's.
-            member["weights"] = [group.weight(entry) for entry in member["entries"]]
+            # or the picture's and the sound's -- each, where the group has a
+            # file per phase, one per phase.
+            if group.phased:
+                member["weights"] = [[group.weight(entry, track) for track in group.tracks]
+                                     for entry in member["entries"]]
+                member["phases"] = [dv.phase_of(track) for track in group.tracks]
+            else:
+                member["weights"] = [group.weight(entry) for entry in member["entries"]]
     return out
 
 
