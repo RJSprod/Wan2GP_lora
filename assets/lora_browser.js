@@ -4415,11 +4415,19 @@
     box.setAttribute("aria-modal", "true");
     box.setAttribute("aria-label", "Compare LoRAs");
 
+    // The title, the transport and the close button share one line: the
+    // rows need the height.
     var head = document.createElement("div");
     head.className = "lb-cmp-head";
     var title = document.createElement("h2");
     title.textContent = "Compare";
     head.appendChild(title);
+    var play = makeButton("Play both", "lb-btn lb-cmp-play", function () { cmpPlay(false); });
+    var restart = makeButton("", "lb-btn lb-cmp-restart", function () { cmpPlay(true); }, "Restart both");
+    restart.setAttribute("aria-label", "Restart both from the start");
+    restart.appendChild(cmpIcon("restart"));
+    head.appendChild(play);
+    head.appendChild(restart);
     var close = makeButton("×", "lb-btn lb-cmp-close", function () { closeCompare(); }, "Close compare");
     close.setAttribute("aria-label", "Close compare");
     head.appendChild(close);
@@ -4432,16 +4440,6 @@
     media.appendChild(left);
     media.appendChild(right);
     box.appendChild(media);
-
-    var transport = document.createElement("div");
-    transport.className = "lb-cmp-transport";
-    var play = makeButton("Play both", "lb-btn lb-cmp-play", function () { cmpPlay(false); });
-    var restart = makeButton("", "lb-btn lb-cmp-restart", function () { cmpPlay(true); }, "Restart both");
-    restart.setAttribute("aria-label", "Restart both from the start");
-    restart.appendChild(cmpIcon("restart"));
-    transport.appendChild(play);
-    transport.appendChild(restart);
-    box.appendChild(transport);
 
     var legend = document.createElement("div");
     legend.className = "lb-cmp-legend";
@@ -5004,9 +5002,11 @@
     return list;
   }
 
-  function cmpRowsData(view) {
+  /* One row per LoRA either side has. ``unedited``: the right as its recipe
+     has it, before any edit here. */
+  function cmpRowsData(view, unedited) {
     var left = view.left.recipe ? view.left.recipe.entries : [];
-    var right = cmpRight(view);
+    var right = unedited ? (view.right.recipe ? view.right.recipe.entries : []) : cmpRight(view);
     var keys = [];
     var byLeft = {};
     var byRight = {};
@@ -5104,6 +5104,42 @@
     return node;
   }
 
+  /* Whether a row differs between the sides: in what either applies at any
+     step, or in its mode. Nothing differs where a side has no recipe. */
+  function cmpRowChanged(view, row, segments) {
+    if (!view.left.recipe || !view.right.recipe) { return false; }
+    if (row.left && row.right) {
+      if ((row.left.mode || "") !== (row.right.mode || "")) { return true; }
+      if (!row.left.phases || !row.right.phases) {
+        return !!(row.left.phases || row.right.phases) || row.left.raw !== row.right.raw;
+      }
+    }
+    return !(segments || cmpSegments(view, row)).every(function (segment) {
+      return segment.compared && segment.left.every(function (value, index) {
+        return cmpRel(segment.right[index], value) === 0;
+      });
+    });
+  }
+
+  function cmpPromptChanged(view) {
+    return !!(view.left.recipe && view.right.recipe) && cmpPrompt(view, "left") !== cmpPrompt(view, "right");
+  }
+
+  /* What differs first, what is the same last -- decided when the two sides
+     are picked, so a row being edited does not move away under the finger. */
+  function cmpOrder(view) {
+    var cmp = S.cmp;
+    var pair = cmpSideKey(view, "left") + "||" + cmpSideKey(view, "right");
+    if (!cmp.order || cmp.order.pair !== pair) {
+      var rank = {};
+      cmpRowsData(view, true).forEach(function (row, index) {
+        rank[row.key] = { index: index, changed: cmpRowChanged(view, row) };
+      });
+      cmp.order = { pair: pair, rank: rank, prompt: cmpPromptChanged(view) };
+    }
+    return cmp.order;
+  }
+
   function paintCmpRows() {
     var cmp = S.cmp;
     var view = S.compareView;
@@ -5112,17 +5148,36 @@
     var active = document.activeElement;
     var focused = active && holder.contains(active) && active.dataset ? active.dataset.focus : "";
     holder.innerHTML = "";
-    var prompt = cmpPromptRow(view);
-    if (prompt) {
-      holder.appendChild(prompt);
-      cmpFitPrompt(prompt);
-    }
+    var order = cmpOrder(view);
     var rows = cmpRowsData(view);
+    var place = function (row) {
+      return order.rank[row.key] || { index: 1e6, changed: true };
+    };
+    rows.sort(function (a, b) { return place(a).index - place(b).index; });
+    var changed = rows.filter(function (row) { return place(row).changed; });
+    var same = rows.filter(function (row) { return !place(row).changed; });
+    var prompt = cmpPromptRow(view);
+    var put = function (node) {
+      holder.appendChild(node);
+      if (node === prompt) { cmpFitPrompt(prompt); }
+    };
+    if (prompt && order.prompt) { put(prompt); }
+    changed.forEach(function (row) { put(cmpRow(view, row)); });
+    var restCount = same.length + (prompt && !order.prompt ? 1 : 0);
+    if (restCount && (changed.length || (prompt && order.prompt))) {
+      var divider = document.createElement("div");
+      divider.className = "lb-cmp-divider";
+      divider.setAttribute("role", "separator");
+      divider.appendChild(span("", "The same on both sides"));
+      divider.appendChild(span("lb-cmp-divider-count", String(restCount)));
+      holder.appendChild(divider);
+    }
+    if (prompt && !order.prompt) { put(prompt); }
+    same.forEach(function (row) { put(cmpRow(view, row)); });
     if (!rows.length) {
       holder.appendChild(paragraph(view.left.recipe || view.right.recipe
         ? "Neither recipe has a LoRA." : "Nothing to compare yet.", "lb-cmp-empty"));
     }
-    rows.forEach(function (row) { holder.appendChild(cmpRow(view, row)); });
     holder.scrollTop = scroll;
     if (focused) {
       var again = holder.querySelector('[data-focus="' + cssEscape(focused) + '"]');
@@ -5223,7 +5278,8 @@
     ["left", "right"].forEach(function (which) {
       var text = which === "left" ? left : right;
       var cell = document.createElement("div");
-      cell.className = "lb-cmp-cell lb-cmp-cell-" + which + " lb-cmp-prompt";
+      cell.className = "lb-cmp-cell lb-cmp-cell-" + which + " lb-cmp-prompt" +
+        (which === "right" && cmpPromptChanged(view) ? " lb-cmp-changed" : "");
       if (!text) {
         cell.classList.add("lb-cmp-missing");
         cell.appendChild(span("lb-cmp-missing-text", view[which].recipe ? "No prompt" : "No settings"));
@@ -5280,7 +5336,10 @@
     var cells = document.createElement("div");
     cells.className = "lb-cmp-cells";
     cells.appendChild(cmpCell(view, row, segments, "left"));
-    cells.appendChild(cmpCell(view, row, segments, "right"));
+    var right = cmpCell(view, row, segments, "right");
+    // Gold: something about this LoRA differs, whichever way.
+    if (cmpRowChanged(view, row, segments)) { right.classList.add("lb-cmp-changed"); }
+    cells.appendChild(right);
     node.appendChild(cells);
     return node;
   }
@@ -5338,33 +5397,36 @@
     if (!entry.on) { cell.classList.add("lb-cmp-off"); }
     var editable = which === "right" && !entry.system && !!entry.phases;
 
-    var top = document.createElement("div");
-    top.className = "lb-cmp-cell-top";
-    if (editable) {
-      top.appendChild(cmpSwitch(entry));
-    } else if (!entry.on) {
-      top.appendChild(span("lb-cmp-tag", "Off"));
-    }
-    cmpBadges(entry).forEach(function (word) { top.appendChild(span("lb-cmp-tag", word)); });
-    if (editable && !entry.on) { top.appendChild(span("lb-cmp-tag", "Off, counts as 0")); }
-    if (top.firstChild) { cell.appendChild(top); }
-
+    // One line: the right's switch, the values, the left's "use this value".
+    var main = document.createElement("div");
+    main.className = "lb-cmp-main";
+    if (editable) { main.appendChild(cmpSwitch(entry)); }
     if (!entry.phases) {
       // Syntax the panel keeps as it is: shown, not compared.
-      cell.appendChild(codeText(entry.raw));
-      return cell;
+      main.appendChild(codeText(entry.raw));
+    } else {
+      var line = document.createElement("div");
+      line.className = "lb-cmp-segs";
+      segments.forEach(function (segment, phase) {
+        line.appendChild(cmpSegment(view, row, segment, phase, which, editable, segments.length));
+      });
+      main.appendChild(line);
     }
-    var line = document.createElement("div");
-    line.className = "lb-cmp-segs";
-    segments.forEach(function (segment, phase) {
-      line.appendChild(cmpSegment(view, row, segment, phase, which, editable, segments.length));
-    });
-    cell.appendChild(line);
-
     if (which === "left" && cmpCanUse(view, row)) {
       var use = focusKey(cmpIconButton("use", "Use this value on the right", function () { cmpUseLeft(view, row); }), row.key + "#use");
       use.classList.add("lb-cmp-use");
-      cell.appendChild(use);
+      main.appendChild(use);
+    }
+    cell.appendChild(main);
+
+    // What else to know, under the values, where it moves nothing out of line.
+    var words = cmpBadges(entry);
+    if (!entry.on) { words.unshift(editable ? "Off, counts as 0" : "Off"); }
+    if (words.length) {
+      var tags = document.createElement("div");
+      tags.className = "lb-cmp-tags";
+      words.forEach(function (word) { tags.appendChild(span("lb-cmp-tag", word)); });
+      cell.appendChild(tags);
     }
     return cell;
   }

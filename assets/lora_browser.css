@@ -1861,6 +1861,8 @@
 .__NS__ {
   --lb-more: color-mix(in srgb, #2fbf71 66%, var(--body-text-color));
   --lb-less: color-mix(in srgb, #f0524a 66%, var(--body-text-color));
+  /* Something about a LoRA differs between the sides, whichever way. */
+  --lb-changed: #d9a72b;
 }
 
 /* A pop-up over WanGP, which shows around it: about 92% of the window. */
@@ -1893,10 +1895,18 @@
 .lb-cmp-overlay .lb-cmp-head {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 8px 4px 16px;
+  gap: 6px;
+  padding: 8px 8px 6px 16px;
 }
-.lb-cmp-overlay .lb-cmp-head h2 { flex: 1 1 auto; margin: 0; font-size: 17px; }
+.lb-cmp-overlay .lb-cmp-head h2 {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  font-size: 17px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .lb-cmp-overlay button.lb-btn.lb-cmp-close,
 .lb-cmp-overlay button.lb-btn.lb-cmp-icon {
   flex: 0 0 auto;
@@ -2000,11 +2010,10 @@
 .lb-cmp-overlay .lb-cmp-browse:focus-within { outline: 2px solid var(--color-accent, Highlight); outline-offset: 2px; }
 .lb-cmp-overlay input.lb-cmp-file { position: absolute; inset: 0; width: 100%; opacity: 0; cursor: pointer; }
 
-.lb-cmp-overlay .lb-cmp-transport { display: flex; gap: 8px; padding: 8px 12px 6px; }
-.lb-cmp-overlay button.lb-btn.lb-cmp-play { flex: 1 1 auto; min-height: 44px; font-weight: 600; }
+.lb-cmp-overlay button.lb-btn.lb-cmp-play { flex: 0 1 150px; min-width: 88px; min-height: 44px; font-weight: 600; }
 .lb-cmp-overlay button.lb-btn.lb-cmp-restart {
   flex: 0 0 auto;
-  width: 52px;
+  width: 44px;
   min-height: 44px;
   padding: 0;
   display: inline-flex;
@@ -2016,7 +2025,7 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 4px 12px;
-  padding: 0 16px 8px;
+  padding: 6px 16px 6px;
   color: var(--lb-muted);
   font-size: 12px;
 }
@@ -2036,22 +2045,23 @@
 .lb-cmp-overlay .lb-cmp-row {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 10px 0;
+  gap: 4px;
+  padding: 6px 0;
   border-bottom: 1px solid color-mix(in srgb, var(--border-color-primary) 60%, transparent);
 }
 .lb-cmp-overlay .lb-cmp-row-head { display: flex; align-items: baseline; gap: 8px; }
-.lb-cmp-overlay .lb-cmp-name { flex: 1 1 auto; min-width: 0; font-size: 14px; font-weight: 700; overflow-wrap: anywhere; }
+.lb-cmp-overlay .lb-cmp-name { flex: 1 1 auto; min-width: 0; font-size: 13px; font-weight: 700; overflow-wrap: anywhere; }
 .lb-cmp-overlay .lb-cmp-note { flex: 0 1 auto; color: var(--lb-muted); font-size: 11.5px; text-align: right; }
-.lb-cmp-overlay .lb-cmp-cells { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.lb-cmp-overlay .lb-cmp-cells { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
 .lb-cmp-overlay .lb-cmp-cell {
   position: relative;
   min-width: 0;
   box-sizing: border-box;
+  container-type: inline-size;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 8px;
+  gap: 4px;
+  padding: 5px 6px;
   border: 1px solid var(--border-color-primary);
   border-radius: 10px;
   background: color-mix(in srgb, var(--lb-raised) 40%, var(--lb-card));
@@ -2069,7 +2079,18 @@
 .lb-cmp-overlay .lb-cmp-cell.lb-c-less .lb-cmp-missing-text { color: var(--lb-less); }
 .lb-cmp-overlay .lb-cmp-cell.lb-c-more .lb-cmp-missing-text { color: var(--lb-more); }
 .lb-cmp-overlay .lb-cmp-cell.lb-cmp-off .lb-cmp-segs { opacity: 0.6; }
-.lb-cmp-overlay .lb-cmp-cell-top { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+/* Gold, fading left to right, on the right side of a LoRA that differs --
+   over its green or red, which say which way. */
+.lb-cmp-overlay .lb-cmp-cell.lb-cmp-changed {
+  background-image: linear-gradient(90deg, color-mix(in srgb, var(--lb-changed) 24%, transparent), transparent 72%);
+}
+/* Values on one line on both sides -- the right's switch beside them -- and
+   tags under them. */
+.lb-cmp-overlay .lb-cmp-main { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.lb-cmp-overlay .lb-cmp-main > .lb-cmp-segs,
+.lb-cmp-overlay .lb-cmp-main > code { flex: 1 1 auto; min-width: 0; }
+.lb-cmp-overlay .lb-cmp-main > button.lb-switch { flex: 0 0 auto; }
+.lb-cmp-overlay .lb-cmp-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
 .lb-cmp-overlay .lb-cmp-tag {
   padding: 0 6px;
   border: 1px solid var(--border-color-primary);
@@ -2111,6 +2132,12 @@
   align-items: center;
 }
 .lb-cmp-overlay button.lb-btn.lb-cmp-nudge { min-height: 44px; padding: 0; font-size: 20px; line-height: 1; }
+/* A narrow cell -- a phone's -- has no room for -/+ beside the switch: the
+   value is the target, and its tray has -/+ and the slider. */
+@container (max-width: 250px) {
+  .lb-cmp-overlay .lb-cmp-flat.lb-cmp-flat-nudge { grid-template-columns: minmax(0, 1fr); }
+  .lb-cmp-overlay .lb-cmp-flat-nudge button.lb-btn.lb-cmp-nudge { display: none; }
+}
 
 /* Steps: a bar each on the 0..1 scale, coloured by which side has more. */
 .lb-cmp-overlay .lb-cmp-bars {
@@ -2145,7 +2172,33 @@
 .lb-cmp-overlay .lb-cmp-bar.lb-c-more i { background: var(--lb-more); }
 .lb-cmp-overlay .lb-cmp-bar.lb-c-less i { background: var(--lb-less); }
 .lb-cmp-overlay .lb-cmp-picked { color: var(--lb-muted); font-size: 12px; }
-.lb-cmp-overlay button.lb-btn.lb-cmp-use { align-self: flex-end; }
+.lb-cmp-overlay button.lb-btn.lb-cmp-use { flex: 0 0 auto; }
+
+/* Between what differs and what is the same on both sides. */
+.lb-cmp-overlay .lb-cmp-divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0 4px;
+  color: var(--lb-muted);
+  font-size: 11.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.lb-cmp-overlay .lb-cmp-divider::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--border-color-primary);
+}
+.lb-cmp-overlay .lb-cmp-divider-count {
+  padding: 0 6px;
+  border: 1px solid var(--border-color-primary);
+  border-radius: 999px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
 
 /* The edit tray: the selected steps', or the one strength's, control. */
 .lb-cmp-overlay .lb-cmp-tray {

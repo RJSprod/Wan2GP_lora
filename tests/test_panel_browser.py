@@ -2120,7 +2120,8 @@ class TestCompareInTheBrowser:
             assert page.locator(".lb-cmp-right .lb-cmp-sub").inner_text() == "3 of 3 · three.webm"
             assert page.locator(".lb-cmp-left video").get_attribute("src").endswith("/out/one.webm")
             names = page.locator(".lb-cmp-row .lb-cmp-name").all_inner_texts()
-            assert names == ["Prompt"] + [f"lora_0{i}.safetensors" for i in (1, 2, 3, 4, 5, 6, 7)]
+            # What differs first; lora_04, the same on both sides, last.
+            assert names == ["Prompt"] + [f"lora_0{i}.safetensors" for i in (1, 2, 3, 5, 6, 7, 4)]
             # Looking changes nothing.
             assert native(page) == before
         finally:
@@ -2156,6 +2157,70 @@ class TestCompareInTheBrowser:
             seven = cmp_row(page, "lora_07")
             assert seven.locator(".lb-cmp-cell-left").inner_text() == "Not in this video"
             assert cell_class(seven, "right") == "lb-c-more"
+        finally:
+            close_compare(page)
+
+    def test_what_differs_comes_first_in_gold_and_stays_put(self, compare_panel):
+        page, _, _, _ = compare_panel
+        try:
+            open_compare(page)
+            divider = page.locator(".lb-cmp-divider")
+            assert divider.locator("span").first.text_content() == "The same on both sides"
+            assert divider.locator(".lb-cmp-divider-count").inner_text() == "1"
+            # The divider stands between the two: lora_04 is after it.
+            assert page.evaluate("""() => {
+              const divider = document.querySelector('.lb-cmp-divider');
+              const four = [...document.querySelectorAll('.lb-cmp-row')].find(row =>
+                row.querySelector('.lb-cmp-name').textContent === 'lora_04.safetensors');
+              return !!(divider.compareDocumentPosition(four) & Node.DOCUMENT_POSITION_FOLLOWING);
+            }""")
+            # Gold on the right side of everything that differs, whichever way.
+            gold = page.locator(".lb-cmp-row:has(.lb-cmp-cell-right.lb-cmp-changed) .lb-cmp-name").all_inner_texts()
+            assert gold == ["Prompt"] + [f"lora_0{i}.safetensors" for i in (1, 2, 3, 5, 6, 7)]
+            assert page.evaluate("""() => getComputedStyle(document.querySelector(
+              '.lb-cmp-row .lb-cmp-cell-right.lb-cmp-changed')).backgroundImage""").startswith("linear-gradient")
+            # Over the green or red: lora_01's right side is both.
+            one_right = cmp_row(page, "lora_01").locator(".lb-cmp-cell-right").get_attribute("class").split()
+            assert "lb-c-more" in one_right and "lb-cmp-changed" in one_right
+            four = cmp_row(page, "lora_04")
+            assert "lb-cmp-changed" not in four.locator(".lb-cmp-cell-right").get_attribute("class")
+            # Edits recolour at once, but no row moves under the finger.
+            four.locator(".lb-cmp-cell-right button.lb-cmp-nudge").nth(1).click()
+            settle(page, 200)
+            assert "lb-cmp-changed" in four.locator(".lb-cmp-cell-right").get_attribute("class")
+            assert page.locator(".lb-cmp-row .lb-cmp-name").all_inner_texts()[-1] == "lora_04.safetensors"
+            one = cmp_row(page, "lora_01")
+            one.locator(".lb-cmp-cell-left button.lb-cmp-use").click()
+            settle(page, 200)
+            assert "lb-cmp-changed" not in one.locator(".lb-cmp-cell-right").get_attribute("class")
+            assert page.locator(".lb-cmp-row .lb-cmp-name").all_inner_texts()[1] == "lora_01.safetensors"
+        finally:
+            close_compare(page)
+
+    def test_both_sides_values_sit_on_one_line(self, compare_panel):
+        page, _, _, _ = compare_panel
+
+        def centre(box):
+            return box["y"] + box["height"] / 2
+
+        try:
+            open_compare(page)
+            for name in ("lora_01", "lora_05"):
+                row = cmp_row(page, name)
+                left = row.locator(".lb-cmp-cell-left .lb-cmp-val").bounding_box()
+                right = row.locator(".lb-cmp-cell-right .lb-cmp-val").bounding_box()
+                switch = row.locator(".lb-cmp-cell-right button.lb-switch").bounding_box()
+                assert abs(centre(left) - centre(right)) <= 3
+                # The switch beside the values, not on a line of its own.
+                assert abs(centre(switch) - centre(right)) <= 3 and switch["x"] < right["x"]
+            # A one-strength row: its name, then one line of 44px controls.
+            assert cmp_row(page, "lora_01").bounding_box()["height"] <= 96
+            # Per step too: the switch beside the bars.
+            two = cmp_row(page, "lora_02")
+            bars = two.locator(".lb-cmp-cell-right .lb-cmp-bars").bounding_box()
+            switch = two.locator(".lb-cmp-cell-right button.lb-switch").bounding_box()
+            assert switch["y"] >= bars["y"] - 1 and switch["x"] < bars["x"]
+            assert abs(two.locator(".lb-cmp-cell-left .lb-cmp-bars").bounding_box()["y"] - bars["y"]) <= 3
         finally:
             close_compare(page)
 
@@ -2534,10 +2599,18 @@ class TestCompareInTheBrowser:
               const rows = document.querySelector('.lb-cmp-rows');
               return rows.scrollWidth <= rows.clientWidth + 1;
             }""")
+            # A narrow cell's value is its target, and its tray has -/+.
+            assert page.locator(".lb-cmp-nudge").evaluate_all(
+                "buttons => buttons.every(button => getComputedStyle(button).display === 'none')")
+            value = cmp_row(page, "lora_01").locator(".lb-cmp-cell-right button.lb-cmp-val")
+            assert value.bounding_box()["width"] >= 60 and value.inner_text().startswith("0.85")
             page.locator(".lb-cmp-apply").click()
-            for button in page.locator(".lb-cmp-controls button, .lb-cmp-foot button, .lb-cmp-nudge, "
-                                       ".lb-cmp-choices button").all():
+            for button in page.locator(".lb-cmp-controls button, .lb-cmp-foot button, .lb-cmp-head button, "
+                                       ".lb-cmp-cell-right button.lb-cmp-val, .lb-cmp-choices button").all():
                 assert button.bounding_box()["height"] >= 44
+            # The title still says what this is.
+            assert page.evaluate("(() => { const h = document.querySelector('.lb-cmp-head h2'); "
+                                 "return h.scrollWidth <= h.clientWidth; })()")
             choices = page.locator(".lb-cmp-choices").bounding_box()
             assert choices["x"] + choices["width"] <= 385
         finally:

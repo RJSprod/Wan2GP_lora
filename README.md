@@ -405,22 +405,24 @@ Tuning a recipe means rendering variants and looking for what changed.
 window, with WanGP dimmed round its edges — that puts two recipes side by side:
 
 ```
+ Compare                          [ Play both ] [⟲] [×]
  Gallery video             [×]   Newest video     Edited [×]
  1 of 12 · one.mp4               12 of 12 · three.mp4
  ┌───────────────────────┐      ┌───────────────────────┐
  │        video          │      │        video          │
  └───────────────────────┘      └───────────────────────┘
  [‹] [›]             [mute]     [‹] [›]             [mute]
- [        Play both         ]  [⟲]
  Both 8 steps, One Phase   ▲ more weight   ▼ less weight   grey: the same
 
  Prompt                                      Differs  [Show all]
- ┌ a [red] fox in the snow ┐      ┌ a [grey] fox in the snow [at] [dusk] ┐
+ [ a [red] fox in the snow ]      [ a [grey] fox in the snow [at] [dusk] ]
  Detail_Enhancer                                        Per step
- ┌ ▆ ▆ ▅ ▅ ▂ ▂ _ _ ──────┐      ┌ ● ▆ ▆ ▆ ▆ ▃ ▂ _ _ ────┐
- └ red where it is less ─┘      └ green where it is more┘
+ [ ▆ ▆ ▅ ▅ ▂ ▂ _ _    → ]      [ ● ▆ ▆ ▆ ▆ ▃ ▂ _ _ ]   ← gold fade: differs
  Neg_Blur                                            One strength
- [ −1 ▲         →  ]            [ ● [−] −2 ▼ [+] ]
+ [ −1 ▲             → ]      [ ● [−] −2 ▼ [+] ]
+ ── THE SAME ON BOTH SIDES (3) ─────────────────────────────────
+ Film_Grain                                    One strength · same
+ [ 0.6                ]      [ ● [−] 0.6 [+] ]
 ```
 
 - **It opens on the video selected in the gallery, left, and the newest,
@@ -443,7 +445,18 @@ window, with WanGP dimmed round its edges — that puts two recipes side by side
   does not marked — in the accent colour, since green and red are about
   weight. Prompts are not edited here.
 - **One row per LoRA**, its name once across both sides, both sides
-  scrolling as one. A LoRA is the file you know, whatever carried it: a
+  scrolling as one, and each side's values on one line — the right's switch
+  beside them, any tags under them — so they line up across. On a phone, the
+  right's value is the target: tap it for the tray, which has −/+ and the
+  slider.
+- **What differs comes first.** Every LoRA (and the prompt) that differs
+  between the two is listed at the top; what is the same on both sides comes
+  last, under a divider. The order is set when the two sides are picked, so a
+  row never moves away while you edit it.
+- **Gold means something differs**: the right side of every LoRA that
+  differs fades from gold at its left edge, over its green or red — those say
+  which way, gold says that it does. Editing recolours it at once. The gold is
+  a CSS variable too, `--lb-changed`. A LoRA is the file you know, whatever carried it: a
   visual-only copy, a sound half, a group or a bake line up with the LoRA
   itself, and say so in a small label.
 - **Colours are about weight, not about matching.** Grey: both apply the
