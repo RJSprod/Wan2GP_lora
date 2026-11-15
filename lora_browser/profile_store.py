@@ -27,6 +27,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+from .derived import bake_spec, parse_bake_spec
 from .metadata_store import MetadataStore
 from .utils import normalize_id
 
@@ -87,7 +88,9 @@ class Profile:
     loras: list[ProfileEntry] = field(default_factory=list)
     note: str = ""
     #: Group letter -> the rank it is baked at.
-    bakes: dict[str, int] = field(default_factory=dict)
+    #: Group letter -> the size it is baked at: a rank (kept as a number, as
+    #: before) or a compression level's ``q999``.
+    bakes: dict[str, int | str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -96,7 +99,7 @@ class Profile:
             "note": self.note,
         }
         if self.bakes:
-            payload["bakes"] = dict(self.bakes)
+            payload["bakes"] = {letter: _bake_value(size) for letter, size in self.bakes.items()}
         return payload
 
     @classmethod
@@ -123,12 +126,10 @@ class Profile:
                 )
             )
         bakes = {}
-        for letter, rank in (payload.get("bakes") or {}).items() if isinstance(payload.get("bakes"), dict) else []:
-            try:
-                if _letter(letter) and int(rank) > 0:
-                    bakes[_letter(letter)] = int(rank)
-            except (TypeError, ValueError):
-                continue
+        for letter, spec in (payload.get("bakes") or {}).items() if isinstance(payload.get("bakes"), dict) else []:
+            size, modes = parse_bake_spec(spec)
+            if _letter(letter) and size:
+                bakes[_letter(letter)] = _bake_value(bake_spec(size, modes))
         return cls(
             name=name,
             model_key=str(payload.get("model_key", "") or ""),
@@ -218,7 +219,7 @@ class ProfileStore:
 
     def save(
         self, name: str, model_key: str, entries: list[ProfileEntry], overwrite: bool = False,
-        bakes: dict[str, int] | None = None,
+        bakes: dict[str, int | str] | None = None,
     ) -> Profile:
         clean = sanitize_name(name)
         if self.exists(clean) and not overwrite:
@@ -244,7 +245,7 @@ class ProfileStore:
         self._profiles.pop(str(name))
         self.metadata.save()
 
-    def match(self, entries: list[ProfileEntry], bakes: dict[str, int] | None = None) -> str:
+    def match(self, entries: list[ProfileEntry], bakes: dict[str, int | str] | None = None) -> str:
         """Name of the profile that exactly equals the current stack, else "".
 
         Used so the dropdown never claims profile "X" is active once external
@@ -262,9 +263,19 @@ class ProfileStore:
         return ""
 
 
-def _signature(entries: list[ProfileEntry], bakes: dict[str, int] | None = None) -> tuple:
+def _bake_value(spec) -> int | str:
+    """How a group is baked as a profile keeps it: a rank alone as a number,
+    as profiles always have; otherwise its spec -- a compression level's
+    ``q999``, with any of its files used visual or audio only."""
+    size, modes = parse_bake_spec(spec)
+    if size.startswith("r") and not modes:
+        return int(size[1:])
+    return bake_spec(size, modes)
+
+
+def _signature(entries: list[ProfileEntry], bakes: dict[str, int | str] | None = None) -> tuple:
     """Order matters: WanGP multiplier tokens are positional."""
     return tuple(
         (entry.id, str(entry.multiplier).strip(), bool(entry.enabled), entry.mode, entry.group, entry.skipped)
         for entry in entries
-    ) + (tuple(sorted((bakes or {}).items())),)
+    ) + (tuple(sorted((letter, bake_spec(*parse_bake_spec(spec))) for letter, spec in (bakes or {}).items())),)

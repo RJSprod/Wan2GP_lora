@@ -1610,6 +1610,8 @@ def av_panel(chromium, tmp_path_factory):
         host = _Host(root, view="list", state=state)
         host.plugin.get_model_def = lambda model_type: LTX_MODEL_DEF
         host.plugin._builder = av.SyncBuilder()
+        # Measured the moment a dialog asks: its levels are there at once.
+        host.plugin._measurer = av.EagerBuilder()
         host.steps, host.guidance = 8, 2
         host.selected = list(AV_SELECTED)
         host.multipliers = AV_MULTIPLIERS
@@ -1621,6 +1623,7 @@ def reset_av(page, host, multipliers=AV_MULTIPLIERS):
     """Each test starts from the same stack, in the list, nothing open."""
     host.plugin._builder.run_pending()
     host.plugin._metadata.set_stack_view("list")
+    host.plugin._metadata.set_compression("low")
     host.selected = list(AV_SELECTED)
     host.multipliers = multipliers
     page.reload()
@@ -1748,25 +1751,45 @@ class TestListView:
         assert page.locator(".lb-li").count() == 5             # 3 lines + 2 members
         assert problems == []
 
-    def test_a_group_bakes_at_its_highest_members_rank_and_unbakes(self, av_panel):
+    def test_a_group_bakes_at_a_compression_level_and_unbakes(self, av_panel):
         page, host, problems = av_panel
         reset_av(page, host, "0.8;0.5 0.6;0.6 0.6;0.6 1,1,0.875,0.875,0.25,0.25,0,0;0"
                              "\n#lora_group A picture.safetensors\n#lora_group A sound.safetensors")
         page.locator(".lb-li-ghead .lb-li-name").click()
         settle(page, 300)
         page.locator(".lb-li-editor button", has_text="Bake to save memory").click()
-        page.wait_for_selector(".lb-dialog .lb-opt")
-        chosen = page.locator(".lb-dialog .lb-opt:has(input:checked)").inner_text()
-        # Picture's rank, not sound's 2 -- and exact here: they share no layer.
-        assert "rank 8" in chosen.lower() and "default" in chosen
+        page.wait_for_selector(".lb-dialog .lb-opt .lb-opt-title:has-text('keeps')", timeout=5000)
+        dialog = page.locator(".lb-dialog")
+        titles = dialog.locator(".lb-opt .lb-opt-title").all_text_contents()
+        assert [title.split(" · ")[0] for title in titles] == [
+            "Low compression", "Medium compression", "High compression", "Exact"]
+        # Each level measured: what it keeps and weighs, before anything is built.
+        assert all(" · keeps " in title for title in titles[:3])
+        assert dialog.locator('.lb-opt[data-level="low"] input').is_checked()
+        assert dialog.locator(".lb-opt[data-level='low'] .lb-opt-big").inner_text().endswith("KB")
+        # Beside how a bake was sized before: the highest-rank LoRA, picture's 8.
+        assert "Matching the highest rank (8)" in dialog.locator(".lb-matched").inner_text()
+        dialog.locator('.lb-opt[data-level="medium"]').click()
         page.locator(".lb-dialog button.lb-primary").click()
         settle(page, 800)
-        assert any(value.startswith("_lora_browser/_bakes/") and value.endswith(".r8.safetensors")
+        assert any(value.startswith("_lora_browser/_bakes/") and value.endswith(".q990.safetensors")
                    for value in host.selected)
         assert "picture.safetensors" not in host.selected
+        # The level picked is the one Shrink and Bake use from now on.
+        assert host.plugin._metadata.compression == "medium"
 
         wait_until_built(page, host)
-        assert page.locator(".lb-li-ghead .lb-bake-pill").inner_text().startswith("Baked r8")
+        assert page.locator(".lb-li-ghead .lb-bake-pill").inner_text().startswith("Baked 99%")
+        assert page.locator(".lb-li-editor .lb-load").inner_text().startswith("Medium compression (99%): ")
+
+        # Exact keeps every LoRA as it is: here they share no layer, rank 8.
+        page.locator(".lb-li-editor button", has_text="Change size").click()
+        page.wait_for_selector(".lb-dialog .lb-opt .lb-opt-title:has-text('keeps')", timeout=5000)
+        assert page.locator('.lb-dialog .lb-opt[data-level="medium"] .lb-opt-title').inner_text().endswith("· now")
+        page.locator('.lb-dialog .lb-opt[data-level="exact"]').click()
+        page.locator(".lb-dialog button.lb-primary", has_text="Rebuild").click()
+        settle(page, 800)
+        assert any(value.endswith(".r8.safetensors") for value in host.selected)
 
         page.locator(".lb-li-editor button", has_text="Unbake").click()
         settle(page, 800)
@@ -1807,7 +1830,15 @@ class TestListView:
         assert dialog.locator(".lb-shrink-lead").inner_text().startswith("3 LoRAs into 1 file")
         assert "WanGP loads 2 files instead of 4" in dialog.locator(".lb-shrink-lead").inner_text()
         assert dialog.locator(".lb-shrink-head strong").inner_text() == "At one strength"
-        assert "rank 8" in dialog.locator(".lb-shrink-head").inner_text()
+        # Compression: each level measured, the one last picked chosen.
+        levels = dialog.locator(".lb-shrink-levels .lb-opt")
+        assert levels.count() == 3 and dialog.locator('.lb-opt[data-level="low"] input').is_checked()
+        assert " · keeps " in dialog.locator(".lb-shrink-head .lb-shrink-size").inner_text()
+        low = dialog.locator(".lb-shrink-head .lb-shrink-size").inner_text()
+        dialog.locator('.lb-opt[data-level="high"]').click()
+        high = dialog.locator(".lb-shrink-head .lb-shrink-size").inner_text()
+        assert high != low and high.startswith("3 LoRAs → 1 file · keeps ")
+        assert "as Shrink did before" in dialog.locator(".lb-matched").inner_text()
         details = dialog.locator(".lb-shrink-file .lb-shrink-detail").all_inner_texts()
         assert details == ["at 0.8", "at 0.6", "at 0.7"]
         # What stays, and why, a tap away.
@@ -1821,7 +1852,8 @@ class TestListView:
         dialog.locator("button.lb-primary", has_text="Shrink 3 LoRAs").click()
         settle(page, 800)
         assert len(host.selected) == 2 and host.selected[1] == "sched.safetensors"
-        assert host.selected[0].startswith("_lora_browser/_bakes/") and host.selected[0].endswith(".r8.safetensors")
+        assert host.selected[0].startswith("_lora_browser/_bakes/") and host.selected[0].endswith(".q950.safetensors")
+        assert host.plugin._metadata.compression == "high"
         assert "#lora_weight A 0.8 both.safetensors" in host.multipliers
         head = page.locator(".lb-li-ghead")
         assert head.locator(".lb-li-label").inner_text() == "Shrunk A"
@@ -1831,7 +1863,7 @@ class TestListView:
             "baked in at 0.8", "baked in at 0.6", "baked in at 0.7"]
 
         wait_until_built(page, host)
-        assert head.locator(".lb-bake-pill").inner_text().startswith("Shrunk r8")
+        assert head.locator(".lb-bake-pill").inner_text().startswith("Shrunk 95%")
         assert problems == []
 
     def test_a_shrunk_row_unshrinks_each_lora_back_to_its_strength(self, av_panel):
@@ -1865,7 +1897,7 @@ class TestListView:
         lead = dialog.locator(".lb-shrink-lead").inner_text()
         assert lead.startswith("3 LoRAs into 2 files") and "WanGP loads 3 files instead of 4" in lead
         assert dialog.locator(".lb-shrink-head strong").inner_text() == "One strength in each phase"
-        assert "3 LoRAs → 2 files, one per phase, rank 8" in dialog.locator(".lb-shrink-head").inner_text()
+        assert "3 LoRAs → 2 files, one per phase · keeps " in dialog.locator(".lb-shrink-head").inner_text()
         assert dialog.locator(".lb-shrink-phase").all_text_contents() == [
             "Phase 1's file runs 1;0 · phase 1 only", "Phase 2's file runs 0;1 · phase 2 only"]
         assert dialog.locator(".lb-shrink-file .lb-shrink-detail").all_text_contents() == [
@@ -1877,7 +1909,7 @@ class TestListView:
         dialog.locator("button.lb-primary", has_text="Shrink 3 LoRAs").click()
         settle(page, 800)
         first, second, rest = host.selected
-        assert first.endswith(".r8.p1.safetensors") and second.endswith(".r8.p2.safetensors")
+        assert first.endswith(".q999.p1.safetensors") and second.endswith(".q999.p2.safetensors")
         assert rest == "sched.safetensors"
         tokens = tokens_by_lora(host)
         assert (tokens[first], tokens[second]) == ("1;0", "0;1")
@@ -1889,7 +1921,7 @@ class TestListView:
         assert page.locator(".lb-li-member .lb-li-shared").all_text_contents() == [
             "baked in at P1 0.8, P2 0.5", "baked in at P1 0.6, P2 0.6", "baked in at P1 0.3, P2 0.7"]
         wait_until_built(page, host)
-        assert head.locator(".lb-bake-pill").inner_text().startswith("Shrunk r8")
+        assert head.locator(".lb-bake-pill").inner_text().startswith("Shrunk 99.9%")
 
         page.locator(".lb-li-ghead .lb-li-name").click()
         settle(page, 300)
@@ -1924,6 +1956,77 @@ class TestListView:
         assert tokens_by_lora(host)["sound.safetensors"].endswith(";0.7")
         assert problems == []
 
+    def test_a_lora_beside_its_shrunk_file_and_then_its_double(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host, SHRINK_MULTIPLIERS)
+        page.locator('[data-lb="shrink"]').click()
+        page.wait_for_selector(".lb-dialog .lb-shrink-file", timeout=5000)
+        page.locator(".lb-dialog button.lb-primary").click()
+        settle(page, 800)
+        bake = host.selected[0]
+        # Shrinking again waits for the shrunk stack to be taken apart.
+        assert page.locator('[data-lb="shrink"]').is_disabled()
+        # Its tile shows it inside Shrunk A; a click adds it on its own as well.
+        tile = page.locator('.lb-tile[data-id="both.safetensors"]')
+        assert tile.locator(".lb-inside").inner_text() == "A"
+        tile.click()
+        settle(page, 800)
+        assert host.selected == [bake, "sched.safetensors", "both.safetensors"]
+        assert "applies twice now" in page.locator('[data-lb="status"]').inner_text()
+        assert line(page, "both.safetensors").count() == 1
+
+        # Unshrunk, both comes back at what it brought; the copy beside it is
+        # a double: off, its switch locked, Remove its only way out.
+        page.locator(".lb-li-ghead .lb-li-name").click()
+        settle(page, 300)
+        page.locator(".lb-li-editor button.lb-unshrink").first.click()
+        settle(page, 800)
+        assert host.selected[:3] == ["both.safetensors", "picture.safetensors", "sound.safetensors"]
+        assert "#lora_double" in host.multipliers
+        double = page.locator('.lb-li[data-key="d:both.safetensors"]')
+        assert double.count() == 1 and double.locator(".lb-switch").is_disabled()
+        assert double.locator(".lb-double-pill").text_content() == "Double · not applied"
+        assert not page.locator('[data-lb="shrink"]').is_disabled()
+        double.locator(".lb-li-name").click()
+        settle(page, 300)
+        assert "already in the stack" in page.locator(".lb-li-editor .lb-off-double").inner_text()
+        page.locator(".lb-li-editor button.lb-remove").click()
+        settle(page, 800)
+        assert "#lora_double" not in host.multipliers and "both.safetensors" in host.selected
+        assert problems == []
+
+    def test_a_phase_file_applies_audio_only_as_a_copy_of_itself(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host, PHASE_SHRINK_MULTIPLIERS)
+        page.locator('[data-lb="shrink"]').click()
+        page.wait_for_selector(".lb-dialog .lb-shrink-file", timeout=5000)
+        page.locator(".lb-dialog button.lb-primary").click()
+        settle(page, 800)
+        wait_until_built(page, host)
+        first = host.selected[0]
+        page.locator(".lb-li-ghead .lb-li-name").click()
+        settle(page, 300)
+        section = page.locator(".lb-li-editor .lb-track-phase").nth(0)
+        assert section.locator(".lb-file-mode .lb-seg-normal").get_attribute("aria-checked") == "true"
+        section.locator(".lb-file-mode .lb-seg-audio").click()
+        settle(page, 800)
+        audio = host.selected[0]
+        assert audio == first.replace(".p1.safetensors", ".p1.audio.safetensors")
+        assert f"#lora_group A {audio}" in host.multipliers
+        assert "applies audio only now" in page.locator('[data-lb="status"]').inner_text()
+        section = page.locator(".lb-li-editor .lb-track-phase").nth(0)
+        assert section.locator(".lb-file-mode .lb-seg-audio").get_attribute("aria-checked") == "true"
+        assert "P1 audio only" in page.locator(".lb-li-ghead").text_content()
+        # Only the copy is built: the phase file is there already.
+        assert [job["key"] for job in host.plugin._builder.status()["queued"]] == [audio]
+        wait_until_built(page, host)
+        assert page.locator(".lb-li-ghead .lb-bake-pill").inner_text().startswith("Shrunk 99.9%")
+        # Normal brings the phase file back as it is.
+        section.locator(".lb-file-mode .lb-seg-normal").click()
+        settle(page, 800)
+        assert host.selected[0] == first
+        assert problems == []
+
     def test_a_deleted_built_file_leaves_its_recipe(self, av_panel):
         page, host, problems = av_panel
         reset_av(page, host, SHRINK_MULTIPLIERS)
@@ -1941,7 +2044,7 @@ class TestListView:
         page.locator('[data-lb="built"]').click()
         page.wait_for_selector(".lb-dialog .lb-table")
         row = page.locator(".lb-dialog .lb-table tbody tr", has=page.locator(f'td[title="{baked}"]'))
-        assert "Shrunk file, rank 8" in row.inner_text()
+        assert "Shrunk file, low compression (99.9%)" in row.inner_text()
         row.locator("button.lb-built-delete").click()
         page.wait_for_selector(".lb-dialog .lb-built-recipes", timeout=5000)
         recipes = page.locator(".lb-dialog .lb-built-recipes")

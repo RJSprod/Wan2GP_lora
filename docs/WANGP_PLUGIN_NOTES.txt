@@ -623,6 +623,67 @@ ALWAYS RUN THE NEGATIVE TEST
   per file with the other phases' chips locked, and the list's phase cells
   come from each phase's own file.
 
+  Compression levels: a bake's size is r<rank> (one rank in every layer, as
+  before; "Exact" is r<combined rank>) or q<per mille> (bake.LEVELS: low 999,
+  medium 990, high 950), in the id (<hash>.q990[.track].safetensors), the
+  stack text tag ("baked 99%"), profiles (a rank stays a number, a level is
+  "q990") and recipes. bake.analyze(plan) measures each layer's squared
+  singular values from the Gram matrices U^T U and V V^T (R x R, R the summed
+  member ranks; dW is never formed) -- ~10x cheaper than the build's QR+SVD.
+  bake.allocate(spectrum, kept) gives each layer the fewest directions that
+  keep floor_for(kept) = 1 - 5*(1 - kept) of its own energy, then adds
+  directions across all layers by energy per byte ((out+in)*width) until the
+  whole keeps `kept`; bake.bake(..., ranks={layer: k}) writes a rank per layer
+  (mmgp reads each layer's rank from its lora_A shape, offload.py rank =
+  lora_A.shape[0], alpha/rank per layer). Measurements are keyed by
+  measure_key (paths with size+mtime, modes, weights, sided) and kept in an
+  in-process LRU (bk.remember/recall); a second Builder (plugin._measurer)
+  runs bd.measure_job so measuring never waits behind a build. The bake
+  dialog sends the bake_plan action (live stack, so a shrunk group's weights
+  count) and gets instance.bake_report in the payload; the Shrink plan gives
+  each bundle file a measure key; both dialogs then poll the "measure" media
+  request ({sets: {name: [keys]}} -> per set: measuring with pct, failed, or
+  bk.predictions: each level's kept share and bytes, "matched" -- the old
+  highest-member-rank size -- and "exact"). A lost measurement (LRU evicted,
+  restart) is reported in "lost" and the dialog asks for its plan again. A
+  quality bake job reuses the measurement or measures first (first 30% of
+  its progress). The level picked is saved as metadata "compression" and is
+  the default for the next Shrink and Bake.
+
+  Inside and beside a baked file: Group.inside(member) is a member whose
+  track is baked -- named by the group's lines, never an entry. Group.holds,
+  Group.entries, group_on, set_bakes/remove_group/unshrink/leave_group,
+  fold_rows, settle, aliases, shrink.collect and _profile_entries count only
+  a group's files and unbaked members as its entries, so an entry with an
+  inside member's id is the same LoRA beside the file (a LoRA of its own).
+  _named ignores inside members (an outside copy's id is free); rename and
+  replace leave a group's lines alone for inside members unless replace is
+  given the group's letter (member mode changes from a group row send
+  "group"; member_group falls back to the group holding an id that is no
+  entry). The tile click adds such a LoRA (files.inside_of -> item.inside);
+  Shrink is refused while a weighted group exists (payload can_shrink).
+  When members come out of a file (unshrink, unbake, leave_group,
+  set_bakes to {}), to_doubles moves entries of the same LoRAs (by stem)
+  into stack.doubles -- "#lora_double <at> <token> <id>" lines, parsed apart
+  from #lora_off so they survive the same id being selected -- and
+  seat_doubles puts each right after its twin. repair() runs
+  release_doubles: a double whose LoRA has no entry and is inside no file
+  becomes a regular off entry. Payload rows: kind "double" (key "d:<id>",
+  switch locked, Remove sends remove_double). Profiles and paste keep a
+  LoRA inside a baked group and beside it: the copy beside is held as a
+  "\x00beside:<n>" placeholder until set_bakes has put the file in place.
+
+  A shrunk file visual or audio only: bake ids may end ".visual" or
+  ".audio" (Derived.mode, .base; bake_mode_id). sm.set_file_mode renames the
+  group's file for a track to its copy; files.bake_ids keeps each track's
+  mode, so _rebake_changed and Change size keep it. StackFiles.job builds a
+  copy with bd.split_job from the built file (store.path(base)), queuing the
+  base bake first when it is missing; recipe_job and restore_groups follow
+  the copy's recipe (kind split, source = the base bake) to the bake's.
+  files.empty reads the built base's summary. A group's bake spec
+  ("q999+p1.audio", dv.bake_spec/parse_bake_spec) carries file modes
+  through profiles (bakes values) and stack text ("file p1 audio" tags).
+
   The open editor is laid out with container queries on .lb-rows (and on the
   full-screen sheet's body), never media queries: the panel is one column of
   WanGP's page, so the window's width says nothing about the room an editor

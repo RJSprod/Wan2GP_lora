@@ -27,6 +27,7 @@ import gradio as gr
 
 from shared.utils.plugins import WAN2GPPlugin
 
+from .lora_browser import bake as bk
 from .lora_browser import builder as bd
 from .lora_browser import catalogue as cat
 from .lora_browser import civitai
@@ -172,6 +173,8 @@ class InstanceState:
         #: What a shrink would make of the stack, for the Shrink dialog --
         #: carried by the next payload only, the one answering the question.
         self.shrink_report: dict | None = None
+        #: The same for the bake dialog of one group.
+        self.bake_report: dict | None = None
 
     def take_prompt(self) -> str | None:
         prompt, self.pending_prompt = self.pending_prompt, None
@@ -192,6 +195,10 @@ class InstanceState:
 
     def take_shrink_report(self) -> dict | None:
         report, self.shrink_report = self.shrink_report, None
+        return report
+
+    def take_bake_report(self) -> dict | None:
+        report, self.bake_report = self.bake_report, None
         return report
 
     def note(self, message: str, warn: bool = False) -> None:
@@ -216,6 +223,12 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         #: One queue builds visual-only/audio-only copies and bakes for every
         #: tab, one file at a time.
         self._builder = bd.Builder()
+        #: A second queue measures what each compression level would keep,
+        #: for the dialogs, so a measurement never waits behind a build.
+        self._measurer = bd.Builder()
+        #: What each level keeps and weighs, per set of measured files: the
+        #: dialogs ask again while anything is still being measured.
+        self._predicted: dict[tuple[str, ...], dict] = {}
         #: LoRA folder -> its store of built files.
         self._stores: dict[str, dv.Store] = {}
         self._summaries = lf.SummaryCache()
@@ -628,6 +641,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                         or (index == 0 and (track["id"], up.SHARED_PHASE) in parked)
                         for index in range(phases.capacity)
                     ]
+            rows = self._with_doubles(rows, stack, files, phases, catalogue)
             missing = [row for row in rows if row["missing"]]
             if missing and not status:
                 names = ", ".join(row["name"] for row in missing[:3])
@@ -644,8 +658,10 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 "phase_labels": up.phase_labels(phases.effective),
                 "items": up.build_items(
                     inventory, stack, phases, self._metadata, model_type,
-                    instance.phase_memory, catalogue, files.aliases(stack),
+                    instance.phase_memory, catalogue, files.aliases(stack), files.inside_of(stack),
                 ),
+                # Shrinking again waits for the shrunk stack to be taken apart.
+                "can_shrink": not any(group.weighted for group in sm.groups(stack).values()),
                 "active": rows,
                 "profiles": complete + incomplete,
                 # Named so the dropdown can flag a profile this model can only
@@ -698,7 +714,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 "stack_text": stack_text.format_stack(
                     [
                         (entry.id, entry.multiplier, self._text_mode(entry, entries), entry.group,
-                         bakes.get(entry.group, 0), entry.weight)
+                         bakes.get(entry.group, ""), entry.weight)
                         for entry in entries if entry.enabled
                     ],
                     name_index,
@@ -706,6 +722,10 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 # Set only on the payload answering a pasted stack.
                 "paste_report": instance.take_paste_report(),
                 "shrink_plan": instance.take_shrink_report(),
+                "bake_plan": instance.take_bake_report(),
+                # The compression levels, and the one Shrink and Bake use.
+                "levels": [{"key": key, "label": label, "quality": quality} for key, label, quality in bk.LEVELS],
+                "compression": self._compression(),
                 # Two recipes side by side, while the compare view is open.
                 "compare": self._compare_view(instance, state_value, inventory, model_type),
                 "signature": signature,
@@ -946,23 +966,24 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             "prompt_writable": instance.prompt_writable,
         }
 
-    def _profile_entries(self, stack: up.Stack, files: StackFiles) -> tuple[list[ProfileEntry], dict[str, int]]:
+    def _profile_entries(self, stack: up.Stack, files: StackFiles) -> tuple[list[ProfileEntry], dict[str, str]]:
         """User-editable part of the stack, switched-off LoRAs included where
         they sit -- accelerator LoRAs are excluded -- each by its original's id
-        with its mode and group, and the rank each baked group is baked at.
+        with its mode and group, and the size each baked group is baked at.
         A baked group is listed as its members, where the group sits."""
         found = sm.groups(stack)
-        member_of = {member: group.letter for group in found.values() for member in group.members}
+        member_of = {member: group.letter for group in found.values() for member in group.members
+                     if not group.inside(member)}
         baked = {value: (group, track) for group in found.values() for track, value in group.bakes.items()}
         skipped = stack.skipped()
         entries: list[ProfileEntry] = []
-        bakes: dict[str, int] = {}
+        bakes: dict[str, str] = {}
         listed: set[str] = set()
         for lora_id, on, token in stack.user_entries():
             group, track = baked.get(lora_id, (None, ""))
             members = group.track_members(track) if group else [lora_id]
             if group:
-                bakes[group.letter] = dv.parse(group.bake).rank
+                bakes[group.letter] = dv.bake_spec(dv.parse(group.bake).size, sm.file_modes(group))
                 if group.phased:
                     # A file per phase: its LoRAs once, at the group's
                     # multiplier, each with what it brings to each phase.
@@ -990,8 +1011,19 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         modes as built copies, groups as group lines, bakes as baked files.
         Anything not on disk yet is built by the next payload."""
         native, skipped, groups, seen, weights = [], set(), {}, set(), {}
-        for entry in entries:
+        # A LoRA both inside a baked group's file and beside it: the copy
+        # beside it waits for the file to take the group's place.
+        baked_letters = {letter for letter in bakes}
+        inside = {(dv.split_id(entry.id, entry.mode) if files.sided else entry.id)
+                  for entry in entries if entry.group in baked_letters}
+        beside: dict[str, tuple[str, bool, str]] = {}
+        for index, entry in enumerate(entries):
             lora_id = dv.split_id(entry.id, entry.mode) if files.sided else entry.id
+            if entry.group not in baked_letters and lora_id in inside:
+                mark = f"\x00beside:{index}"
+                beside[mark] = (lora_id, entry.enabled, entry.multiplier)
+                native.append((mark, entry.enabled, entry.multiplier))
+                continue
             if lora_id in seen:
                 continue            # a sound half, on a model without a sound side
             seen.add(lora_id)
@@ -1008,13 +1040,47 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         stack.groups = {letter: members for letter, members in groups.items() if len(members) >= 2}
         # A shrunk group's members bring their weights to its baked file.
         stack.weights = {letter: found for letter, found in weights.items() if letter in stack.groups}
-        for letter, rank in bakes.items():
+        for letter, spec in bakes.items():
+            size, modes = dv.parse_bake_spec(spec)
             group = sm.groups(stack).get(letter)
-            if group is not None and not group.baked:
-                sm.set_bakes(stack, letter, files.bake_ids(group, rank))
+            if group is not None and not group.baked and size:
+                sm.set_bakes(stack, letter, files.bake_ids(group, size))
+                for track, mode in modes.items():
+                    sm.set_file_mode(stack, letter, track, mode)
+        self._place_beside(stack, beside)
         sm.repair(stack, files.known)
         sm.sync_tokens(stack)
         sm.settle(stack, files.empty)
+
+    @staticmethod
+    def _place_beside(stack: up.Stack, beside: dict[str, tuple[str, bool, str]]) -> None:
+        """Put each LoRA held for a place beside a baked file where it stood."""
+        if not beside:
+            return
+        entries, skipped = stack.user_entries(), stack.skipped()
+        stack.set_user_entries([beside.get(value, (value, on, token)) for value, on, token in entries], skipped)
+
+    def _with_doubles(self, rows: list[dict], stack: up.Stack, files: StackFiles, phases, catalogue) -> list[dict]:
+        """The doubles, each a row where it stood: off, its switch locked."""
+        if not stack.doubles:
+            return rows
+        system = sum(1 for row in rows if row.get("system_managed"))
+        found = list(rows)
+        for double in sorted(stack.doubles, key=lambda item: item.at):
+            source, mode = files.source(double.id)
+            # Right after its twin, where there is one; else where it stood.
+            twin = next((index for index, row in enumerate(found)
+                         if row.get("kind") != "double" and (row.get("source_id") or row.get("id")) == source), -1)
+            row = dict(files.describe(double.id, catalogue), id=double.id)
+            row.update(up.multiplier_fields(double.token, phases, double.id, {}, with_schedules=False))
+            row.update(
+                kind="double", double=True, enabled=False, system_managed=False, skipped=False,
+                source_id=source, mode=mode, summary=up.describe_token(double.token, phases),
+                phase_summary=up.phase_summary(double.token, phases), empty=False,
+                build={"state": "original"},
+            )
+            found.insert(twin + 1 if twin >= 0 else min(system + max(0, int(double.at)), len(found)), row)
+        return found
 
     def _build_summary(self, files: StackFiles, stack: up.Stack) -> dict:
         status = self._builder.status()
@@ -1108,6 +1174,18 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             lora_id = normalize_id(action.get("id"))
             # A LoRA in a mode, or baked into a group, is still its tile.
             files = self._stack_files(instance, inventory)
+            holder = files.inside_of(stack).get(lora_id)
+            if holder and action.get("enabled"):
+                # Held only inside a baked file: it goes in again on its own,
+                # beside the file, and applies twice.
+                if inventory.get(lora_id) is None:
+                    instance.note("That LoRA is not available for the current model.", True)
+                    return False
+                if not stack.add(lora_id, phases.capacity):
+                    return False
+                instance.note(f"Added {display_name(lora_id)} on its own, beside {holder}, whose file already "
+                              "holds it: it applies twice now. Unshrinking makes this copy a double, kept off.")
+                return True
             alias = files.aliases(stack).get(lora_id)
             if alias is not None and alias[0] != lora_id:
                 native, on = alias
@@ -1132,6 +1210,14 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 return sm.remove_group(stack, letter)
             return self._remove(instance, stack, files, normalize_id(action.get("id")))
 
+        if kind == "remove_double":
+            lora_id = normalize_id(action.get("id"))
+            kept = [double for double in stack.doubles if double.id != lora_id]
+            if len(kept) == len(stack.doubles):
+                return False
+            stack.doubles = kept
+            return True
+
         if kind == "set_enabled":
             # Off keeps the multiplier -- schedule and all -- where WanGP keeps
             # the rest of the stack, and applies none of it.
@@ -1141,7 +1227,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             )
 
         if kind in ("set_mode", "set_mode_all", "group_create", "group_add", "group_leave",
-                    "ungroup", "bake", "unbake", "group_separate"):
+                    "ungroup", "bake", "bake_plan", "unbake", "group_separate", "file_mode"):
             return self._mode_action(instance, action, stack, self._stack_files(instance, inventory))
 
         if kind in ("shrink_plan", "shrink", "unshrink"):
@@ -1149,6 +1235,11 @@ class LoraBrowserPlugin(WAN2GPPlugin):
 
         if kind == "build_retry":
             self._builder.retry(normalize_id(action.get("id")))
+            return False
+
+        if kind == "compression":
+            if self._metadata:
+                self._metadata.set_compression(action.get("value"))
             return False
 
         if kind == "view":
@@ -1397,15 +1488,16 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 del kept[key]
             kept.update(moved)
 
-    def _rename_mode(self, instance, stack, files: StackFiles, lora_id: str, mode: str) -> str:
+    def _rename_mode(self, instance, stack, files: StackFiles, lora_id: str, mode: str, letter: str = "") -> str:
         lora_id = normalize_id(lora_id)
-        group = sm.group_of(stack, lora_id)
+        named = sm.groups(stack).get(letter) if letter else None
+        group = named if named is not None and lora_id in named.members else sm.member_group(stack, lora_id)
         if group is not None:
             source = files.source(lora_id)[0]
             old = [member for member in group.members if files.source(member)[0] == source]
         else:
             old = sm.unit_of(stack, lora_id, files.known)
-        new = sm.set_mode_entries(stack, lora_id, mode, files.known)
+        new = sm.set_mode_entries(stack, lora_id, mode, files.known, group.letter if group is not None else "")
         if new:
             self._migrate_unit(instance, old, new)
         return new[0] if new else ""
@@ -1418,7 +1510,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         second member is baked; one left with one member is not."""
         for group in sm.groups(stack).values():
             if group.baked:
-                wanted = files.bake_ids(group, dv.parse(group.bake).rank)
+                wanted = files.bake_ids(group, dv.parse(group.bake).size)
                 if wanted != group.bakes:
                     sm.set_bakes(stack, group.letter, wanted)
 
@@ -1521,7 +1613,11 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                     return False
             else:
                 targets = self._mode_targets(stack, action.get("ids"), files)
-            renamed = [new_id for new_id in (self._rename_mode(instance, stack, files, lora_id, mode) for lora_id in targets) if new_id]
+            # A group's row names its group: a member baked into its file
+            # shares its id with any copy of it beside the file.
+            member_of = letter if kind == "set_mode" else ""
+            renamed = [new_id for new_id in (self._rename_mode(instance, stack, files, lora_id, mode, member_of)
+                                             for lora_id in targets) if new_id]
             if not renamed:
                 instance.note("Nothing to change." if kind == "set_mode_all" else "")
                 return False
@@ -1571,6 +1667,41 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             instance.note(f"Group {letter} is separate LoRAs again; each keeps the group's strength and schedule.")
             return True
 
+        if kind == "file_mode":
+            group = sm.groups(stack).get(letter)
+            mode = str(action.get("mode", "") or "")
+            track = str(action.get("track", "") or "")
+            if group is None or not group.weighted or track not in group.bakes or mode not in sm.MODES:
+                return False
+            if not files.sided:
+                instance.note("Visual only and audio only are for LTX-2 models, whose LoRAs change picture and sound separately.", True)
+                return False
+            if not sm.set_file_mode(stack, letter, track, mode):
+                return False
+            moved = sm.settle(stack, files.empty)
+            phase = dv.phase_of(track)
+            which = f"Shrunk {letter}'s phase {phase} file" if phase else f"Shrunk {letter}'s file"
+            if mode == sm.NORMAL:
+                instance.note(f"{which} applies as it is again.")
+            else:
+                instance.note(f"{which} applies {mode} only now: a copy of the built file keeping its "
+                              f"{'picture' if mode == sm.VISUAL else 'sound'} side, made without baking anything again."
+                              + (" It leaves nothing to apply, so it is switched off." if moved.get("off") else ""))
+            return True
+
+        if kind == "bake_plan":
+            group = sm.groups(stack).get(letter)
+            if group is None:
+                instance.bake_report = {"group": letter, "error": "That group is gone."}
+                return False
+            report = files.bake_options(stack, letter)
+            report["group"] = letter
+            if not report.get("error"):
+                for track, key, members in files.measures(group):
+                    self._measure(key, members, files.sided, f"Group {letter}")
+            instance.bake_report = report
+            return False
+
         if kind == "bake":
             group = sm.groups(stack).get(letter)
             if group is None or files.store is None:
@@ -1579,22 +1710,19 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             if recognised:
                 instance.note(recognised, True)
                 return False
-            try:
-                rank = int(action.get("rank") or files.default_rank(group) or 0)
-            except (TypeError, ValueError):
-                rank = 0
-            if rank < 1:
-                instance.note("Choose a rank to bake at.", True)
+            size = self._bake_size(action)
+            if not size:
+                instance.note("Choose how much to compress it.", True)
                 return False
-            wanted = files.bake_ids(group, rank)
+            wanted = files.bake_ids(group, size)
             if not wanted:
                 instance.note(f"No side of Group {letter} has two LoRAs to bake together.", True)
                 return False
             changed = sm.set_bakes(stack, letter, wanted)
             if changed:
                 what = "the baked file" if len(wanted) == 1 else "the baked files"
-                instance.note(f"Baking Group {letter} at rank {rank}. Until it is built, WanGP reports {what} "
-                              "as missing if you generate.")
+                instance.note(f"Baking Group {letter} at {self._size_words(size)}. Until it is built, WanGP "
+                              f"reports {what} as missing if you generate.")
             return changed
 
         if kind == "unbake":
@@ -1621,19 +1749,40 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             if group is None or not group.weighted:
                 return False
             count = len({files.source(member)[0] for member in group.members})
+            moded = sm.file_modes(group)
             if not sm.unshrink(stack, letter):
                 return False
             sm.settle(stack, files.empty)
+            doubles = sum(1 for double in stack.doubles if dv.stem_of(double.id) in
+                          {dv.stem_of(member) for member in group.members})
             instance.note(f"Unshrunk: WanGP loads those {count} LoRAs separately again, each at the strength "
-                          "it had. The shrunk file stays under Built files until you delete it.")
+                          "it had. The shrunk file stays under Built files until you delete it."
+                          + (" Its files' visual/audio-only choices were the files' own: each LoRA is back in "
+                             "the mode it was shrunk in." if moded else "")
+                          + (f" {doubles} LoRA{'s' if doubles != 1 else ''} you had added beside it "
+                             f"{'are doubles' if doubles != 1 else 'is a double'} now, kept off."
+                             if doubles else ""))
             return True
         if files.store is None:
             instance.note("This model has no LoRA folder to build the shrunk files in.", True)
             instance.shrink_report = {"error": "This model has no LoRA folder to build the shrunk files in."}
             return False
-        result = sk.plan(stack, files, phases.capacity if phases is not None else 1)
+        shrunk = [group.letter for group in sm.groups(stack).values() if group.weighted]
+        if shrunk:
+            message = (f"The stack is already shrunk ({', '.join('Shrunk ' + letter for letter in shrunk)}): "
+                       "unshrink it before shrinking again.")
+            if kind == "shrink_plan":
+                instance.shrink_report = {"error": message}
+            else:
+                instance.note(message, True)
+            return False
+        size = self._bake_size(action)
+        result = sk.plan(stack, files, phases.capacity if phases is not None else 1, size)
         if kind == "shrink_plan":
-            instance.shrink_report = result.to_dict()
+            for index, bundle in enumerate(result.bundles):
+                for _, key, members in bundle.measures:
+                    self._measure(key, members, files.sided, f"shrink file {index + 1}")
+            instance.shrink_report = dict(result.to_dict(), size=size)
             return False
         if not result.bundles:
             instance.note("Nothing to shrink: no two LoRAs run at one strength, or share a schedule.", True)
@@ -1646,14 +1795,14 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         count = sum(len(values) for values in made.values())
         files_word = "file" if count == 1 else "files"
         per_phase = " (a file per phase where their phases differ)" if any(b.phased for b in result.bundles) else ""
-        instance.note(f"Shrinking {loras} LoRAs into {count} {files_word}{per_phase}. Until "
+        instance.note(f"Shrinking {loras} LoRAs into {count} {files_word}{per_phase} at {self._size_words(size)}. Until "
                       f"{'it is' if count == 1 else 'they are'} built, WanGP reports "
                       f"{'it' if count == 1 else 'them'} as missing if you generate.")
         return True
 
     def _group_separate(self, instance, stack, files: StackFiles, letter: str, separate: bool) -> bool:
         """Give a group a picture strength and a sound strength, or one again.
-        A baked group is baked again the new way, at the rank it had."""
+        A baked group is baked again the new way, at the size it had."""
         group = sm.groups(stack).get(letter)
         if group is None or group.separate == separate:
             return False
@@ -1666,23 +1815,23 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 instance.note(f"Group {letter} changes only one of picture and sound, "
                               "so there is no second strength to give it.", True)
                 return False
-        rank = dv.parse(group.bake).rank if group.baked else 0
+        size = dv.parse(group.bake).size if group.baked else ""
         before: dict[str, list[str]] = {}
         for member in group.members:
             before.setdefault(files.source(member)[0], []).append(member)
-        if rank:
+        if size:
             sm.unbake(stack, letter)
         if not sm.set_separate(stack, letter, separate, files.known):
-            if rank:
-                sm.set_bakes(stack, letter, files.bake_ids(sm.groups(stack)[letter], rank))
+            if size:
+                sm.set_bakes(stack, letter, files.bake_ids(sm.groups(stack)[letter], size))
             return False
         after: dict[str, list[str]] = {}
         for member in sm.groups(stack)[letter].members:
             after.setdefault(files.source(member)[0], []).append(member)
         for source, old in before.items():
             self._migrate_unit(instance, old, after.get(source, []))
-        if rank:
-            sm.set_bakes(stack, letter, files.bake_ids(sm.groups(stack)[letter], rank))
+        if size:
+            sm.set_bakes(stack, letter, files.bake_ids(sm.groups(stack)[letter], size))
         sm.sync_tokens(stack)
         sm.settle(stack, files.empty)
         if separate:
@@ -1797,7 +1946,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         )
         managed = {lora_id for position, lora_id in enumerate(stack.ids) if stack.is_system(position)}
         files = self._stack_files(instance, inventory)
-        entries, problems, first_line = [], [], {}
+        entries, problems, first_line, owners = [], [], {}, []
         groups: dict[str, list[str]] = {}
         #: What each LoRA of a shrunk group brings to its file.
         weights: dict[str, dict[str, float]] = {}
@@ -1816,11 +1965,13 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             # A LoRA with separate strengths is two lines: its picture's and its sound's.
             half = sm.SOUND if line.mode == sm.SOUND_HALF else "main"
             side = sm.SOUND if line.mode in (sm.SOUND_HALF, sm.AUDIO) else sm.PICTURE
+            # Inside a baked group's file, and beside it, are two places.
+            seat = (lora_id, half) if not (line.group and line.baked) else (lora_id, half, "inside")
             if lora_id and not candidates:
                 if lora_id in managed:
                     reason = f"{names.label(lora_id)} is managed by WanGP"
-                elif (lora_id, half) in first_line:
-                    reason = f"{names.label(lora_id)} is already on line {first_line[(lora_id, half)]}"
+                elif seat in first_line:
+                    reason = f"{names.label(lora_id)} is already on line {first_line[seat]}"
                 elif half == sm.SOUND and not files.sided:
                     reason = "a separate sound strength is for LTX-2 models, whose LoRAs have a sound side"
                 else:
@@ -1836,7 +1987,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             if reason:
                 problems.append(stack_text.LineProblem(line.number, line.text, reason))
                 continue
-            first_line[(lora_id, half)] = line.number
+            first_line[seat] = line.number
             native = lora_id
             mode = sm.VISUAL if line.mode == "picture" else line.mode
             if mode in (sm.VISUAL, sm.AUDIO, sm.SOUND_HALF):
@@ -1850,8 +2001,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 if line.weight is not None:
                     weights.setdefault(line.group, {})[native] = list(line.weight)
                 if line.baked:
-                    bakes[line.group] = max(bakes.get(line.group, 0), line.baked)
+                    bakes.setdefault(line.group, dv.bake_spec(line.baked, line.files))
             entries.append((native, True, token))
+            owners.append(line.group or "")
 
         report["problems"] = [problem.to_dict() for problem in problems]
         if not entries:
@@ -1874,7 +2026,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             problems.append(stack_text.LineProblem(
                 number, text, f"{names.label(source)} is audio only on line {first_line.get((source, 'main'), 0)}, "
                               "so it has no separate sound strength"))
-            entries = [entry for entry in entries if entry[0] != dv.split_id(source, sm.SOUND_HALF)]
+            keep = [index for index, entry in enumerate(entries) if entry[0] != dv.split_id(source, sm.SOUND_HALF)]
+            entries, owners = [entries[index] for index in keep], [owners[index] for index in keep]
             for letter in groups:
                 groups[letter] = [value for value in groups[letter] if value != dv.split_id(source, sm.SOUND_HALF)]
         report["problems"] = [problem.to_dict() for problem in sorted(problems, key=lambda problem: problem.number)]
@@ -1895,7 +2048,19 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             instance.hidden_phases.pop(lora_id, None)
             for key in [key for key in instance.schedules if key[0] == lora_id]:
                 del instance.schedules[key]
-        stack.set_user_entries(entries, set())
+        # A LoRA both inside a baked group's file and beside it: the copy
+        # beside it waits for the file to take the group's place.
+        inside = {value for letter in bakes for value in groups.get(letter, [])}
+        beside: dict[str, tuple[str, bool, str]] = {}
+        placed = []
+        for index, ((native, on, token), owner) in enumerate(zip(entries, owners)):
+            if owner not in bakes and native in inside:
+                mark = f"\x00beside:{index}"
+                beside[mark] = (native, on, token)
+                placed.append((mark, on, token))
+            else:
+                placed.append((native, on, token))
+        stack.set_user_entries(placed, set())
         stack.groups = {letter: members for letter, members in groups.items() if len(members) >= 2}
         stack.weights = {}
         sm.repair(stack, files.known)
@@ -1903,10 +2068,14 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         # that comes without a baked file is its LoRAs at what they brought.
         stack.weights = {letter: {member: found[member] for member in stack.groups[letter] if member in found}
                          for letter, found in weights.items() if letter in stack.groups}
-        for letter, rank in bakes.items():
+        for letter, spec in bakes.items():
+            size, modes = dv.parse_bake_spec(spec)
             group = sm.groups(stack).get(letter)
-            if group is not None:
-                sm.set_bakes(stack, letter, files.bake_ids(group, rank))
+            if group is not None and size:
+                sm.set_bakes(stack, letter, files.bake_ids(group, size))
+                for track, mode in modes.items():
+                    sm.set_file_mode(stack, letter, track, mode)
+        self._place_beside(stack, beside)
         for letter in list(stack.weights):
             group = sm.groups(stack).get(letter)
             if group is not None and not group.baked:
@@ -2151,7 +2320,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         # bake this folder lacks being built by the next payload.
         files = self._stack_files(instance, inventory)
         present = {entry.group for entry in applied if entry.group}
-        bakes = {letter: rank for letter, rank in profile.bakes.items() if letter in present}
+        bakes = {letter: size for letter, size in profile.bakes.items() if letter in present}
         self._apply_entries(stack, files, applied, bakes)
 
         if missing:
@@ -2203,8 +2372,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 reply = {"kind": "builds", **self._builder.status()}
             elif kind == "built":
                 reply = self._serve_built(instance, request, state_value)
-            elif kind == "bake_plan":
-                reply = self._serve_bake_plan(instance, request, state_value)
+            elif kind == "measure":
+                reply = self._serve_measure(request)
             else:
                 reply = self._serve_thumbnails(instance, request, state_value)
         except Exception as error:
@@ -2274,6 +2443,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             rows.append({
                 "id": item["id"], "bytes": item.get("bytes", 0), "kind": item.get("kind", ""),
                 "mode": item.get("mode", ""), "rank": item.get("rank", 0), "kept": item.get("kept"),
+                "quality": getattr(dv.parse(item["id"]), "quality", 0),
                 "exact": item.get("exact"), "label": item.get("label", ""), "linked": bool(item.get("linked")),
                 "members": [member.get("name", "") for member in item.get("members", []) or []],
                 "shrink": bool(item.get("shrink")),
@@ -2289,6 +2459,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             kept.append({
                 "id": derived_id, "kind": recipe.get("kind", ""), "mode": recipe.get("mode", ""),
                 "rank": recipe.get("rank", 0), "label": recipe.get("label", ""), "shrink": bool(recipe.get("shrink")),
+                "quality": getattr(dv.parse(derived_id), "quality", 0),
                 "members": [member.get("name", "") for member in recipe.get("members", []) or []
                             if isinstance(member, dict)],
             })
@@ -2299,30 +2470,86 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             "deletable": sum(1 for row in rows if row["deletable"]), "recipes": kept,
         }
 
-    def _serve_bake_plan(self, instance, request, state_value) -> dict:
-        """Sizes for the bake dialog, from the members' headers only."""
-        files = self._request_files(instance, state_value)
-        members = [normalize_id(value) for value in (request.get("members") or []) if normalize_id(value)]
-        if len(members) < 2:
-            return {"kind": "bake_plan", "error": "A bake needs at least two LoRAs."}
-        stack = up.Stack()
-        stack.set_user_entries([(member, True, "1") for member in members], set())
-        stack.groups = {"A": list(members)}
-        reply = files.bake_options(stack, "A")
-        reply["kind"] = "bake_plan"
-        reply["group"] = str(request.get("group", "") or "")
-        try:
-            copies = int(request.get("phase_files") or 0)
-        except (TypeError, ValueError):
-            copies = 0
-        if 1 < copies <= len(dv.PHASE_TRACKS) and reply.get("files") == 1:
-            # A shrunk group with a file per phase: each phase's file is the
-            # same size, and a resize rebuilds them all.
-            for option in reply.get("options", []):
-                option["bytes"] = option["bytes"] * copies
-            reply["files"] = copies
-            reply["per_phase"] = True
-        return reply
+    # ------------------------------------------------------------ compression
+
+    def _compression(self) -> str:
+        """The compression level Shrink and Bake use: the one last picked."""
+        return self._metadata.compression if self._metadata else bk.DEFAULT_LEVEL
+
+    def _bake_size(self, action: dict) -> str:
+        """The size an action asks to bake at: a level's share (``quality``,
+        per mille, one of the levels), a rank (``rank``) -- the exact size
+        stacks every LoRA as it is -- or the remembered level."""
+        quality = action.get("quality")
+        if quality is not None:
+            try:
+                quality = int(quality)
+            except (TypeError, ValueError):
+                return ""
+            return f"q{quality}" if any(quality == value for _, _, value in bk.LEVELS) else ""
+        rank = action.get("rank")
+        if rank is not None:
+            try:
+                return dv.size_tag(int(rank))
+            except (TypeError, ValueError):
+                return ""
+        return f"q{bk.level_quality(self._compression())}"
+
+    @staticmethod
+    def _size_words(size) -> str:
+        rank, quality = dv.size_parts(size)
+        if quality:
+            return f"{bk.level_of(quality)[1].lower()} (keeping {quality / 10:g}% of their combined change)"
+        return f"rank {rank}"
+
+    def _measure(self, key: str, members, sided: bool, label: str) -> None:
+        """Measure a file-to-be in the background, unless it has been."""
+        if bk.recall(key) is not None:
+            return
+        job_key = bd.MEASURE + key
+        # Asked again: a measurement that failed gets another try.
+        self._measurer.retry(job_key)
+        self._measurer.submit(bd.measure_job(key, members, sided, label))
+
+    def _serve_measure(self, request) -> dict:
+        """What each compression level would keep and weigh, per set of
+        measured files -- or how far the measuring is."""
+        sets = request.get("sets") if isinstance(request.get("sets"), dict) else {}
+        found = {}
+        for name, keys in list(sets.items())[:32]:
+            keys = [str(key) for key in (keys or []) if isinstance(key, str)][:16]
+            spectra, waiting, done, error = [], 0, 0.0, ""
+            for key in keys:
+                spectrum = bk.recall(key)
+                if spectrum is not None:
+                    spectra.append(spectrum)
+                    done += 1
+                    continue
+                job_key = bd.MEASURE + key
+                busy = self._measurer.busy(job_key)
+                if busy == "failed":
+                    error = self._measurer.failure(job_key) or "It could not be measured."
+                elif busy == "building":
+                    done += self._measurer.progress(job_key)
+                    waiting += 1
+                elif busy == "queued":
+                    waiting += 1
+                else:
+                    waiting += 1
+                    found.setdefault("_lost", []).append(str(name))
+            if error:
+                found[str(name)] = {"state": "failed", "error": error}
+            elif waiting or not keys:
+                found[str(name)] = {"state": "measuring", "pct": round(100 * done / len(keys)) if keys else 0}
+            else:
+                memo = tuple(keys)
+                if memo not in self._predicted:
+                    if len(self._predicted) >= 64:
+                        self._predicted.pop(next(iter(self._predicted)))
+                    self._predicted[memo] = bk.predictions(spectra)
+                found[str(name)] = dict(self._predicted[memo], state="done")
+        lost = found.pop("_lost", [])
+        return {"kind": "measure", "sets": found, "lost": lost}
 
     def _entry_for(self, state_value, lora_id):
         """Resolve a frontend-supplied id against the current native inventory."""

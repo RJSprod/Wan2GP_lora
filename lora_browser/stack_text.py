@@ -25,7 +25,10 @@ Tags in brackets after the name carry what the panel adds to a LoRA:
     Skin_Texture_v3 [visual, group A, baked r32]: x1;0.25
 
 ``visual``/``audio`` (or ``normal``) is the mode, ``group A`` the group it
-moves with, and ``baked r32`` that the group is baked at rank 32.  A shrunk
+moves with, and ``baked r32`` that the group is baked at rank 32 -- or
+``baked 99.9%`` at a compression level keeping 99.9% of its change, and
+``file p1 audio`` that its phase 1 file is used audio only (``file audio``
+for a single file).  A shrunk
 group's LoRAs say what each brings to its file, ``weight 0.7``: the line's
 multiplier is the file's, and the LoRA runs at its weight times that.  One
 baked a file per phase says what it brings to each, ``weight 0.8;0.5``, and
@@ -43,8 +46,9 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from . import derived as dv
 from .utils import format_number, is_finite_number, normalize_id
 
 #: Name, separator, optional multiplication mark, token.  The name is lazy, so
@@ -64,9 +68,10 @@ _LOOSE = re.compile(r"[\W_]+")
 #: A name ending in a bracketed list, and the tags the list may hold.
 _TAGGED = re.compile(r"^(?P<name>.*?\S)\s*\[(?P<tags>[^\[\]]*)\]$")
 _GROUP_TAG = re.compile(r"^group\s+([a-z])$")
-_BAKED_TAG = re.compile(r"^baked\s+r?([1-9]\d{0,4})$")
+_BAKED_TAG = re.compile(r"^baked\s+(?:r?(?P<rank>[1-9]\d{0,4})|(?P<kept>\d{2}(?:\.\d)?)\s*%)$")
 _NUMBER = r"-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?"
 _WEIGHT_TAG = re.compile(rf"^weight\s+({_NUMBER}(?:\s*;\s*{_NUMBER})*)$")
+_FILE_TAG = re.compile(r"^file\s+(?:(?P<track>p[1-3])\s+)?(?P<mode>visual|audio)$")
 #: ``picture`` and ``sound`` are the two sides of a LoRA with separate
 #: strengths; ``picture`` reads the same as ``visual``.
 TAG_MODES = ("normal", "visual", "audio", "picture", "sound")
@@ -84,13 +89,15 @@ class StackLine:
     #: The WanGP token with any spaces taken out, or "" for no multiplier.
     token: str
     #: From the tags: the mode ("" when not given), the group letter, and the
-    #: rank the group is baked at (0 for not baked).
+    #: size the group is baked at -- ``r32`` or ``q999`` -- "" for not baked.
     mode: str = ""
     group: str = ""
-    baked: int = 0
+    baked: str = ""
     #: What it brings to its shrunk group's file -- one weight, or one per
     #: phase -- or None.
     weight: list[float] | None = None
+    #: Its shrunk group's files used visual or audio only: ``track -> mode``.
+    files: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -124,19 +131,20 @@ def parse(text: str) -> list[StackLine]:
         else:
             bare = _BARE.match(body)
             name, token = (bare.group("name") if bare else body), ""
-        name, mode, group, baked, weight = split_tags(name.strip())
+        name, mode, group, baked, weight, files = split_tags(name.strip())
         lines.append(StackLine(number=number, text=stripped, name=name, token=token,
-                               mode=mode, group=group, baked=baked, weight=weight))
+                               mode=mode, group=group, baked=baked, weight=weight, files=files))
     return lines
 
 
-def split_tags(name: str) -> tuple[str, str, str, int, list[float] | None]:
-    """``(name, mode, group, baked rank, weight)``: the tags taken off the end
-    of a name, or the name untouched when its brackets hold anything else."""
+def split_tags(name: str) -> tuple[str, str, str, str, list[float] | None, dict[str, str]]:
+    """``(name, mode, group, baked size, weight, files)``: the tags taken off
+    the end of a name, or the name untouched when its brackets hold anything
+    else."""
     match = _TAGGED.match(str(name or ""))
     if not match:
-        return name, "", "", 0, None
-    mode, group, baked, weight = "", "", 0, None
+        return name, "", "", "", None, {}
+    mode, group, baked, weight, files = "", "", "", None, {}
     for part in (piece.strip().lower() for piece in match.group("tags").split(",")):
         if not part:
             continue
@@ -148,8 +156,11 @@ def split_tags(name: str) -> tuple[str, str, str, int, list[float] | None]:
             group = found.group(1).upper()
             continue
         found = _BAKED_TAG.match(part)
-        if found:
-            baked = int(found.group(1))
+        if found and found.group("rank"):
+            baked = f"r{int(found.group('rank'))}"
+            continue
+        if found and 10 <= round(float(found.group("kept")) * 10) <= 999:
+            baked = f"q{round(float(found.group('kept')) * 10)}"
             continue
         found = _WEIGHT_TAG.match(part)
         if found:
@@ -157,21 +168,32 @@ def split_tags(name: str) -> tuple[str, str, str, int, list[float] | None]:
             if all(is_finite_number(value) for value in values):
                 weight = [float(value) for value in values]
                 continue
-        return name, "", "", 0, None
-    return match.group("name").strip(), mode, group, baked, weight
+        found = _FILE_TAG.match(part)
+        if found:
+            files[found.group("track") or "all"] = found.group("mode")
+            continue
+        return name, "", "", "", None, {}
+    return match.group("name").strip(), mode, group, baked, weight, files
 
 
-def tags_text(mode: str = "", group: str = "", baked: int = 0, weight=None) -> str:
+def tags_text(mode: str = "", group: str = "", baked="", weight=None, files=None) -> str:
     """`` [visual, group A, baked r32]``, or "" for a plain LoRA; a shrunk
-    group's LoRA adds what it brings, `` [group A, baked r32, weight 0.7]`` --
-    one per phase, ``weight 0.8;0.5``, where the group has a file per phase."""
+    group's LoRA adds what it brings, `` [group A, baked 99.9%, weight 0.7]``
+    -- one per phase, ``weight 0.8;0.5``, where the group has a file per
+    phase.  ``baked`` is a rank or a size (``r32``, ``q999``)."""
     tags = []
     if mode and mode != "normal":
         tags.append(mode)
     if group:
         tags.append(f"group {group}")
-        if baked:
-            tags.append(f"baked r{int(baked)}")
+        size, modes = dv.parse_bake_spec(baked) if baked else ("", {})
+        rank, quality = dv.size_parts(size) if size else (0, 0)
+        if quality:
+            tags.append(f"baked {quality / 10:g}%")
+        elif rank:
+            tags.append(f"baked r{rank}")
+        for track, file_mode in sorted({**modes, **(files or {})}.items()):
+            tags.append(f"file {file_mode}" if track == "all" else f"file {track} {file_mode}")
         if weight is not None:
             values = weight if isinstance(weight, (list, tuple)) else [weight]
             tags.append("weight " + ";".join(format_number(value) for value in values))
@@ -281,6 +303,6 @@ def format_stack(entries, index: NameIndex) -> str:
     lines = []
     for entry in entries:
         lora_id, token = entry[0], entry[1]
-        tags = tags_text(*entry[2:6]) if len(entry) > 2 else ""
+        tags = tags_text(*entry[2:7]) if len(entry) > 2 else ""
         lines.append(f"{index.name_for(lora_id)}{tags}: x{token}")
     return "\n".join(lines)

@@ -40,6 +40,9 @@
     modelKey: "",
     phases: { capacity: 1, effective: 1 },
     phaseLabels: ["Strength"],
+    //: The compression levels Shrink and Bake offer, and the one last picked.
+    levels: [],
+    compression: "low",
     items: [],
     rows: [],
     byId: {},
@@ -675,6 +678,11 @@
   function toggle(id) {
     var item = S.byId[id];
     if (!item) { return; }
+    if (item.inside) {
+      // Only inside a baked file: it goes in again on its own, beside it.
+      send({ type: "toggle", id: id, enabled: true });
+      return;
+    }
     send({ type: "toggle", id: id, enabled: !item.active });
   }
 
@@ -695,7 +703,9 @@
       { label: "Copy filename", run: function () { copyText(item.name || ""); } },
       item.disabled
         ? { label: "Switch on", run: function () { send({ type: "set_enabled", id: id, value: true }); } }
-        : { label: item.active ? "Exclude LoRA" : "Include LoRA", run: function () { send({ type: "toggle", id: id, enabled: !item.active }); } }
+        : item.inside
+          ? { label: "Add on its own too", run: function () { send({ type: "toggle", id: id, enabled: true }); } }
+          : { label: item.active ? "Exclude LoRA" : "Include LoRA", run: function () { send({ type: "toggle", id: id, enabled: !item.active }); } }
     ];
   }
 
@@ -831,6 +841,7 @@
     tile.setAttribute("aria-selected", item.active ? "true" : "false");
     var tooltip = [displayName(item), item.name];
     if (item.disabled) { tooltip.push("Switched off - click to switch it back on"); }
+    if (item.inside) { tooltip.push("In " + item.inside + "'s file - click to add it on its own as well"); }
     if (item.parent) { tooltip.push(item.parent); }
     if ((item.words || []).length) { tooltip.push("Triggers: " + item.words.join(", ")); }
     tile.title = tooltip.filter(Boolean).join("\n");
@@ -846,6 +857,11 @@
       check.textContent = "\u2713";
     }
     badges.appendChild(check);
+    if (item.inside) {
+      var inside = span("lb-inside", item.inside.replace(/^\S+ /, ""));
+      inside.title = "In " + item.inside + "'s file";
+      badges.appendChild(inside);
+    }
     if (item.favorite) {
       var star = document.createElement("span");
       star.className = "lb-star";
@@ -1260,7 +1276,7 @@
       (row.members || []).map(function (member) {
         return [member.id, member.mode, buildState(member.build), member.enabled === false ? 0 : 1, rowName(member)].join("/");
       }).join(","),
-      row.bake ? [buildState(row.bake), row.bake.rank, row.bake.kept, row.bake.default_rank,
+      row.bake ? [buildState(row.bake), row.bake.rank, row.bake.quality, row.bake.kept, row.bake.default_rank,
         (row.bake.files || []).length].join("/") : "",
       row.separate ? "sep" : "", row.track || ""
     ];
@@ -1414,6 +1430,9 @@
         head.appendChild(span("lb-track-name", title));
         if (pinned) { head.appendChild(span("lb-muted lb-track-note", "runs in phase " + pinned + " only")); }
         section.appendChild(head);
+        if (pinned && row.shrink && S.avSupported) {
+          section.appendChild(fileModeLine(row, track, rowName(row) + " phase " + pinned + " file"));
+        }
         var trackLabel = rowName(row) + " " + (pinned ? "phase " + pinned : side);
         var sidePainters = buildStrengths(section, track, trackLabel, inline);
         if (!inline) { appendClip(head, track, trackLabel, sidePainters, true); }
@@ -1510,6 +1529,7 @@
     }
     if (row.system_managed) { name.appendChild(note("WanGP-managed")); }
     if (row.missing) { name.appendChild(note("Missing locally")); }
+    if (row.double) { name.appendChild(doublePill(row)); }
     top.appendChild(name);
 
     // Copy and Paste, for a card's one strength (filled in by buildRow).
@@ -1547,6 +1567,13 @@
     power.setAttribute("role", "switch");
     power.setAttribute("aria-checked", on ? "true" : "false");
     power.setAttribute("aria-label", "Apply " + rowName(row));
+    if (row.double) {
+      // WanGP cannot apply one LoRA twice: this copy waits for the other.
+      power.disabled = true;
+      power.classList.add("lb-switch-locked");
+      power.title = doubleText(row);
+      return power;
+    }
     power.title = on
       ? "Applied - switch off to skip it and keep its settings"
       : row.skipped && row.empty
@@ -1562,10 +1589,21 @@
     return power;
   }
 
+  function doubleText(row) {
+    return "A double: " + rowName(row) + " is already in the stack, and WanGP cannot apply one LoRA twice. " +
+      "It stays off until the other copy is gone; then it can be switched on.";
+  }
+
   /* What a switched-off LoRA brings back when it is switched on again. */
   function buildOffSummary(row) {
     var line = document.createElement("div");
     line.className = "lb-off-summary";
+    if (row.double) {
+      line.classList.add("lb-off-double");
+      line.appendChild(span("lb-off-label", "Double"));
+      line.appendChild(span("lb-off-text", doubleText(row)));
+      return line;
+    }
     var label = document.createElement("span");
     label.className = "lb-off-label";
     label.textContent = "Off";
@@ -1959,6 +1997,7 @@
   function rowById(id) {
     var found = null;
     S.rows.forEach(function (row) {
+      if (row.double) { return; }
       tracksOf(row).forEach(function (track) { if (track.id === id) { found = track; } });
     });
     return found;
@@ -2569,8 +2608,13 @@
         (row.has_catalogue ? "Inspect " : "Inspect / fetch info for ") + (row.civitai_name || row.name)));
     }
     bar.appendChild(makeButton("Remove", "lb-btn lb-remove", function () {
+      if (row.double) {
+        send({ type: "remove_double", id: row.id });
+        return;
+      }
       send(row.kind === "group" ? { type: "remove", id: row.id, group: row.group } : { type: "remove", id: row.id });
-    }, "Remove " + rowName(row) + (isOn(row) ? "" : " - and forget its settings")));
+    }, row.double ? "Remove this double; the copy that is applied stays"
+      : "Remove " + rowName(row) + (isOn(row) ? "" : " - and forget its settings")));
     return bar;
   }
 
@@ -2845,7 +2889,10 @@
 
   /* What identifies a row from one payload to the next, whatever file it
      loads: a mode change or a bake renames the file, not the row. */
-  function rowKey(row) { return row.kind === "group" ? "g:" + row.group : sourceId(row); }
+  function rowKey(row) {
+    if (row.kind === "double") { return "d:" + row.id; }
+    return row.kind === "group" ? "g:" + row.group : sourceId(row);
+  }
 
   function buildState(build) { return build ? text(build.state) : ""; }
 
@@ -3040,6 +3087,7 @@
         (row.shrink ? shrunkWhere(row) : row.separate ? ", picture and sound strengths" : ", one strength")));
       var bake = bakePill(row);
       if (bake) { name.appendChild(bake); }
+      fileModePills(row).forEach(function (node) { name.appendChild(node); });
     } else {
       modePills(row).forEach(function (node) { name.appendChild(node); });
       if (row.missing) { name.appendChild(note("Missing locally")); }
@@ -3203,7 +3251,14 @@
   }
 
   /* Visual only / Audio only, and where its copy is. */
+  function doublePill(row) {
+    var pill = span("lb-mode-pill lb-pill-warn lb-double-pill", "Double · not applied");
+    pill.title = doubleText(row);
+    return pill;
+  }
+
   function modePills(row) {
+    if (row.double) { return [doublePill(row)]; }
     var mode = row.mode || "normal";
     if (mode === "normal") { return []; }
     var node = span("lb-mode-pill lb-mode-" + mode);
@@ -3244,7 +3299,7 @@
     var node = span("lb-mode-pill lb-bake-pill");
     var shrunk = !!row.shrink;
     if (state === "built") {
-      node.textContent = (shrunk ? "Shrunk r" : "Baked r") + bake.rank + (bake.bytes ? " · " + megabytes(bake.bytes) : "");
+      node.textContent = (shrunk ? "Shrunk " : "Baked ") + bakeSize(bake) + (bake.bytes ? " · " + megabytes(bake.bytes) : "");
     } else if (state === "building") {
       node.textContent = shrunk ? "Shrinking " : "Baking ";
       var pct = span("", (bake.pct || 0) + "%");
@@ -3264,6 +3319,7 @@
   }
 
   function pickBox(row, key, picked) {
+    if (row.double) { return span("lb-pick-none"); }
     var box = document.createElement("button");
     box.type = "button";
     box.className = "lb-pick";
@@ -3389,7 +3445,7 @@
 
   /* Normal, Visual only, Audio only -- and, for a LoRA of its own,
      Separate: picture and sound each at a strength of their own. */
-  function modeSeg(row, small) {
+  function modeSeg(row, small, group) {
     var current = row.mode || "normal";
     var seg = document.createElement("div");
     seg.className = "lb-seg" + (small ? " lb-seg-sm" : "");
@@ -3416,11 +3472,62 @@
       }
       button.addEventListener("click", function (event) {
         event.stopPropagation();
-        if (current !== mode) { send({ type: "set_mode", id: row.id, mode: mode }); }
+        if (current !== mode) {
+          send(group ? { type: "set_mode", id: row.id, mode: mode, group: group } : { type: "set_mode", id: row.id, mode: mode });
+        }
       });
       seg.appendChild(button);
     });
     return seg;
+  }
+
+  /* How one of a shrunk group's files is used: as it is, or a copy of it
+     keeping only its picture or its sound -- made from the built file,
+     nothing baked again. */
+  function fileModeLine(row, track, label) {
+    var line = document.createElement("div");
+    line.className = "lb-file-mode";
+    line.appendChild(span("lb-file-mode-label", "File applies to"));
+    var current = track.file_mode || "normal";
+    var seg = document.createElement("div");
+    seg.className = "lb-seg lb-seg-sm";
+    seg.setAttribute("role", "radiogroup");
+    seg.setAttribute("aria-label", label + " applies to");
+    ["normal", "visual", "audio"].forEach(function (mode) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute("role", "radio");
+      button.className = "lb-seg-" + mode;
+      button.setAttribute("aria-checked", current === mode ? "true" : "false");
+      if (mode !== "normal") { button.appendChild(icon(mode === "visual" ? "picture" : "sound")); }
+      button.appendChild(document.createTextNode(MODE_SHORT[mode]));
+      button.title = mode === "normal" ? "Use the shrunk file as it is"
+        : "Use a copy of the shrunk file keeping only its " + (mode === "visual" ? "picture" : "sound") +
+          " side: made from the built file, nothing is baked again";
+      button.addEventListener("click", function (event) {
+        event.stopPropagation();
+        if (current !== mode) { send({ type: "file_mode", group: row.group, track: track.track, mode: mode }); }
+      });
+      seg.appendChild(button);
+    });
+    line.appendChild(seg);
+    return line;
+  }
+
+  /* A shrunk group's files used visual or audio only, as pills. */
+  function fileModePills(row) {
+    if (!row.shrink) { return []; }
+    var tracks = (row.phase_tracks || []).length ? row.phase_tracks : [{ track: "all", file_mode: row.file_mode }];
+    return tracks.filter(function (track) { return track.file_mode && track.file_mode !== "normal"; })
+      .map(function (track) {
+        var pill = span("lb-mode-pill lb-mode-" + track.file_mode);
+        pill.appendChild(icon(track.file_mode === "visual" ? "picture" : "sound"));
+        pill.appendChild(document.createTextNode((track.pinned_phase ? "P" + track.pinned_phase + " " : "") +
+          MODE_LABEL[track.file_mode].toLowerCase()));
+        pill.title = (track.pinned_phase ? "Phase " + track.pinned_phase + "'s file" : "The shrunk file") +
+          " applies " + MODE_LABEL[track.file_mode].toLowerCase();
+        return pill;
+      });
   }
 
   function changesBoth(row) {
@@ -3748,7 +3855,7 @@
       var detail = memberNote(member, row);
       if (detail) { name.appendChild(span("lb-member-note", detail)); }
       item.appendChild(name);
-      if (S.avSupported && !row.shrink) { item.appendChild(modeSeg(member, true)); }
+      if (S.avSupported && !row.shrink) { item.appendChild(modeSeg(member, true, row.group)); }
       var leave = makeButton("×", "lb-btn lb-icon", function () {
         send({ type: "group_leave", group: row.group, id: member.id });
       }, row.shrink
@@ -3839,6 +3946,9 @@
 
     var bake = row.bake || {};
     var count = (row.members || []).length;
+    if (row.shrink && row.baked && S.avSupported && !(row.phase_tracks || []).length) {
+      box.appendChild(fileModeLine(row, { track: "all", file_mode: row.file_mode }, rowName(row) + " file"));
+    }
     var unbake = function () {
       // A shrunk row has Unshrink in its toolbar already.
       if (row.shrink) { return span(""); }
@@ -3858,12 +3968,14 @@
     }
     var state = buildState(bake);
     if (state === "built") {
-      head.appendChild(span("lb-mode-pill lb-bake-pill", (shrunk ? "Shrunk r" : "Baked r") + bake.rank));
+      head.appendChild(span("lb-mode-pill lb-bake-pill", (shrunk ? "Shrunk " : "Baked ") + bakeSize(bake)));
       head.appendChild(span("lb-grow"));
       head.appendChild(makeButton("Change size…", "lb-btn", function () { openBakeDialog(row); }));
       head.appendChild(unbake());
       var several = (bake.files || []).length > 1;
-      line.textContent = (perPhase ? "WanGP loads a file per phase, each running in its phase only"
+      line.textContent = (bake.quality ? levelWords(bake.quality).replace(/^./, function (first) {
+        return first.toUpperCase(); }) + ": " : "") +
+        (perPhase ? "WanGP loads a file per phase, each running in its phase only"
         : several ? "WanGP loads a file per side" : "WanGP loads one file") +
         (bake.bytes ? (several ? ", " + megabytes(bake.bytes) + " in all," : " of " + megabytes(bake.bytes)) : "") +
         " instead of " + count + ". It keeps " + keptText(bake) + " of their combined change. " +
@@ -3979,67 +4091,187 @@
     if (back && back.focus && document.body.contains(back)) { back.focus(); }
   }
 
+  /* ------------------------------------------------------ compression */
+
+  /* A share kept, floored: it never reads higher than it is. */
+  function keptShare(kept) {
+    var value = Number(kept);
+    if (!(value >= 0)) { return "?"; }
+    if (value >= 0.99995) { return "100%"; }
+    return (Math.floor(value * 1000) / 10).toFixed(1) + "%";
+  }
+
+  function levelFor(key) {
+    return (S.levels || []).filter(function (level) { return level.key === key || level.quality === key; })[0] || null;
+  }
+
+  /* The level a bake size is, "" for a rank. */
+  function levelKey(size) {
+    var match = /^q(\d+)$/.exec(size || "");
+    var level = match ? levelFor(Number(match[1])) : null;
+    return level ? level.key : "";
+  }
+
+  function levelWords(quality) {
+    var level = levelFor(Number(quality));
+    var share = (Number(quality) / 10) + "%";
+    return level ? level.label.toLowerCase() + " (" + share + ")" : share + " kept";
+  }
+
+  /* A built bake's size, short: a level's share, or a rank. */
+  function bakeSize(bake) {
+    return bake.quality ? (Number(bake.quality) / 10) + "%" : "r" + bake.rank;
+  }
+
+  function savesText(bytes, now) {
+    var saves = (now || 0) - (bytes || 0);
+    if (!now) { return ""; }
+    return saves > 0 ? "Saves " + megabytes(saves) + ", " + Math.round(100 * saves / now) + "% smaller than now."
+      : "No smaller than the LoRAs take now.";
+  }
+
+  /* Replace an option row's text: what it is, what it costs. */
+  function setOption(label, title, sub, side) {
+    var main = label.querySelector(".lb-opt-main");
+    var aside = label.querySelector(".lb-opt-side");
+    main.innerHTML = "";
+    main.appendChild(span("lb-opt-title", title));
+    if (sub) { main.appendChild(span("lb-opt-sub", sub)); }
+    aside.innerHTML = "";
+    (side || []).forEach(function (value, index) { aside.appendChild(span(index ? "" : "lb-opt-big", value)); });
+  }
+
+  /* What each set of files keeps and weighs at each level, as the plugin
+     measures it in the background: asked for until every set is measured or
+     the dialog closes.  A measurement the plugin no longer holds is asked for
+     again, once, through ``again``. */
+  function watchMeasures(dialog, sets, paint, again) {
+    var token = {};
+    dialog.measuring = token;
+    var asked = false;
+    function tick() {
+      if (S.dialog !== dialog.overlay || dialog.measuring !== token) { return; }
+      requestMedia({ kind: "measure", sets: sets }, function (reply) {
+        if (S.dialog !== dialog.overlay || dialog.measuring !== token) { return; }
+        var found = (reply && reply.sets) || {};
+        paint(found);
+        if (reply && reply.lost && reply.lost.length && again && !asked) {
+          asked = true;
+          again();
+        }
+        var waiting = Object.keys(sets).some(function (name) {
+          return !found[name] || found[name].state === "measuring";
+        });
+        if (waiting) { setTimeout(tick, 600); }
+      });
+    }
+    tick();
+  }
+
+  function measureNote(found) {
+    if (!found || found.state === "measuring") {
+      return "Measuring each layer of the LoRAs" + (found && found.pct ? "… " + found.pct + "%" : "…");
+    }
+    return found.state === "failed" ? "Could not measure them: " + (found.error || "unknown error") : "";
+  }
+
   function openBakeDialog(row) {
     var body = document.createElement("div");
     body.appendChild(paragraph("Reading the LoRAs…", "lb-muted"));
     var dialog = openDialog((row.baked ? "Change the size of " : "Bake ") + rowName(row), body,
       [{ label: "Cancel" }]);
-    var members = [];
-    (row.members || []).forEach(function (member) {
-      (member.entries || [member.id]).forEach(function (id) { members.push(id); });
-    });
-    var request = { kind: "bake_plan", members: members, group: row.group };
-    // A shrunk group with a file per phase rebuilds every one of them.
-    if ((row.phase_tracks || []).length > 1) { request.phase_files = row.phase_tracks.length; }
-    requestMedia(request, function (plan) {
-      if (S.dialog !== dialog.overlay) { return; }
-      renderBakePlan(dialog, row, plan);
-    });
+    S.bakeDialog = { dialog: dialog, row: row };
+    send({ type: "bake_plan", group: row.group });
+  }
+
+  function onBakePlan(plan) {
+    var open = S.bakeDialog;
+    if (!open || S.dialog !== open.dialog.overlay || plan.group !== open.row.group) { return; }
+    renderBakePlan(open.dialog, open.row, plan);
   }
 
   function renderBakePlan(dialog, row, plan) {
     var body = dialog.body;
     body.innerHTML = "";
-    if (!plan || plan.error || !plan.options) {
+    if (!plan || plan.error || !plan.measures) {
       body.appendChild(paragraph(plan && plan.error ? plan.error : "Could not read the LoRAs in this group."));
       dialog.setActions([{ label: "Close", primary: true }]);
       return;
     }
     var names = (row.members || []).map(rowName);
-    var ranks = plan.options.map(function (option) { return option.rank; });
-    var current = row.baked && row.bake ? row.bake.rank : 0;
-    var pick = ranks.indexOf(current) >= 0 ? current : plan.default_rank;
-    body.appendChild(paragraph((plan.per_phase ? "Builds one LoRA per phase, each running in its phase only, from "
-      : plan.files > 1 ? "Builds one LoRA per side, picture and sound, from "
-      : "Builds one LoRA from ") + listJoin(names) + ". It starts at the rank of the " +
-      "highest-rank LoRA in the group; pick another size if you want one. The originals are not touched, and " +
-      "Unbake goes back to them."));
+    var current = plan.size || "";
+    var exactSize = "r" + plan.combined_rank;
+    var pick = current === exactSize ? "exact" : (levelKey(current) || S.compression || "low");
+    body.appendChild(paragraph((plan.per_phase && plan.files > 1
+      ? "Builds one LoRA per phase, each running in its phase only, from "
+      : plan.files > 1 ? "Builds one LoRA per side, picture and sound, from " : "Builds one LoRA from ") +
+      listJoin(names) + ". Each level is the smallest file that keeps that share of their combined change: " +
+      "every layer gets the rank that keeps the most of it per byte. The originals are not touched, and " +
+      (row.shrink ? "Unshrink" : "Unbake") + " goes back to them."));
     body.appendChild(paragraph("Now: WanGP loads " + plural(names.length, "file", "files") + ", " +
-      megabytes(plan.current_bytes) + " in all, rank " + plan.combined_rank + " combined.", "lb-muted"));
+      megabytes(plan.current_bytes) + " of LoRA weights in all.", "lb-muted"));
+    if (current && current !== exactSize && !levelKey(current)) {
+      var bake = row.bake || {};
+      body.appendChild(paragraph("Baked now at rank " + bake.rank + " for every layer" +
+        (bake.kept !== undefined && bake.kept !== null ? ", keeping " + keptText(bake) + " of their combined change" : "") +
+        ". A level fits each layer's rank to what it holds instead.", "lb-muted"));
+    }
+    var progress = paragraph(measureNote(null), "lb-muted lb-measure");
+    body.appendChild(progress);
     var options = document.createElement("div");
     options.className = "lb-opts";
     options.setAttribute("role", "radiogroup");
-    options.setAttribute("aria-label", "Baked size");
-    plan.options.forEach(function (option) {
-      var saves = plan.current_bytes - option.bytes;
-      var title = (option.exact ? "Exact, rank " : "Rank ") + option.rank +
-        (option.rank === plan.default_rank ? " · default" : "") +
-        (option.rank === current ? " · now" : "");
-      var sub = option.exact && !plan.per_phase
-        ? "Same memory as now: WanGP already runs the group this way. Only worth it to hand someone one file."
-        : (option.rank === plan.default_rank ? "Matches the highest rank in the group. " : "") +
-          (saves > 0 ? "Saves " + megabytes(saves) + "."
-            : plan.per_phase ? "More than the LoRAs take loaded separately." : "");
-      options.appendChild(optionRow("lb-bake-pick", String(option.rank), option.rank === pick, title, sub,
-        [megabytes(option.bytes), option.exact ? "exact" : "re-fit"], function () { pick = option.rank; }));
+    options.setAttribute("aria-label", "Compression");
+    var rows = {};
+    (S.levels || []).forEach(function (level) {
+      var option = optionRow("lb-bake-pick", level.key, level.key === pick, level.label, "Measuring…", [],
+        function () { pick = level.key; });
+      option.dataset.level = level.key;
+      rows[level.key] = option;
+      options.appendChild(option);
     });
+    var exact = optionRow("lb-bake-pick", "exact", pick === "exact",
+      "Exact · keeps everything" + (current === exactSize ? " · now" : ""),
+      "Every LoRA as it is: the memory they take loaded separately. Only worth it to hand someone one file.",
+      [megabytes(plan.current_bytes)], function () { pick = "exact"; });
+    exact.dataset.level = "exact";
+    options.appendChild(exact);
     body.appendChild(options);
-    body.appendChild(paragraph("A smaller file keeps the strongest directions of the group's combined change. " +
-      "How much it keeps is measured while it is built, and shown on the group afterwards.", "lb-fine"));
+    var matched = paragraph("", "lb-fine lb-matched");
+    matched.hidden = true;
+    body.appendChild(matched);
+    body.appendChild(paragraph("The share is of the weight change the LoRAs make together, measured exactly " +
+      "before anything is built; how it looks is for Compare to tell.", "lb-fine"));
+
+    watchMeasures(dialog, { group: plan.measures }, function (found) {
+      var group = found.group;
+      progress.textContent = measureNote(group);
+      progress.hidden = !!group && group.state === "done";
+      if (!group || group.state !== "done") { return; }
+      (group.levels || []).forEach(function (level) {
+        var option = rows[level.key];
+        if (!option) { return; }
+        setOption(option, level.label + " · keeps " + keptShare(level.kept) +
+          (current === "q" + level.quality ? " · now" : ""),
+          savesText(level.bytes, plan.current_bytes), [megabytes(level.bytes)]);
+      });
+      var old = group.matched || {};
+      matched.textContent = "Matching the highest rank (" + old.rank + ") in every layer, as bakes were sized " +
+        "before: keeps " + keptShare(old.kept) + ", " + megabytes(old.bytes) + ".";
+      matched.hidden = false;
+    }, function () { send({ type: "bake_plan", group: row.group }); });
+
     dialog.setActions([
       { label: "Cancel" },
       { label: row.baked ? "Rebuild" : "Bake", primary: true, run: function () {
-        send({ type: "bake", group: row.group, rank: pick });
+        if (pick === "exact") {
+          send({ type: "bake", group: row.group, rank: plan.combined_rank });
+          return;
+        }
+        var level = levelFor(pick);
+        // The level picked is the one Shrink and Bake use from now on.
+        send({ type: "batch", actions: [{ type: "compression", value: pick },
+          { type: "bake", group: row.group, quality: level ? level.quality : undefined }] });
       } }
     ]);
     var checked = body.querySelector("input:checked");
@@ -4180,7 +4412,7 @@
       return (file.shrink ? "Shrunk file" : "Group bake") +
         (/\.sound\.safetensors$/.test(file.id) ? " (sound side)" : "") +
         (phase ? " (phase " + phase[1] + " only)" : "") +
-        ", rank " + file.rank + ": " + listJoin(file.members || []);
+        ", " + (file.quality ? levelWords(file.quality) : "rank " + file.rank) + ": " + listJoin(file.members || []);
     }
     return (file.label || "") + " · " + (MODE_LABEL[file.mode] || file.mode || "");
   }
@@ -6172,6 +6404,13 @@
     return bundle.kind === "flat" ? "at " + fmt(piece.weight !== undefined ? piece.weight : (weights[0] || 1)) : "";
   }
 
+  /* How many files a bundle becomes, in words. */
+  function shrinkFileText(bundle) {
+    if (!bundle.phased) { return "1 file"; }
+    if (shrinkFiles(bundle) > 1) { return plural(shrinkFiles(bundle), "file", "files") + ", one per phase"; }
+    return "1 file, " + phaseName(((bundle.files || [])[0] || { phase: 1 }).phase - 1).toLowerCase() + " only";
+  }
+
   function renderShrinkPlan(dialog, plan) {
     var body = dialog.body;
     body.innerHTML = "";
@@ -6185,42 +6424,67 @@
     var loras = bundles.reduce(function (sum, bundle) { return sum + bundle.loras; }, 0);
     var made = bundles.reduce(function (sum, bundle) { return sum + shrinkFiles(bundle); }, 0);
     var phased = bundles.some(function (bundle) { return bundle.phased; });
+    // The level picked here survives the plan being asked for again.
+    var pick = dialog.shrinkPick || levelKey(plan.size) || S.compression || "low";
+    var found = {};
+    var heads = [];
+    var rows = {};
+    var leadText = null;
+    var progress = null;
+    var matched = null;
+    var more = null;
     if (!bundles.length) {
       body.appendChild(paragraph("Nothing to shrink: no two LoRAs run at one strength, or share a schedule."));
     } else {
-      var before = bundles.reduce(function (sum, bundle) { return sum + (bundle.bytes_before || 0); }, 0);
-      var after = bundles.reduce(function (sum, bundle) { return sum + (bundle.bytes_after || 0); }, 0);
       var lead = paragraph("", "lb-shrink-lead");
       lead.appendChild(document.createElement("strong")).textContent =
         plural(loras, "LoRA", "LoRAs") + " into " + plural(made, "file", "files");
-      lead.appendChild(document.createTextNode(
-        " · WanGP loads " + plural(plan.files_after, "file", "files") + " instead of " + plan.files_before +
-        (before ? ", about " + megabytes(after) + " of LoRA weights instead of " + megabytes(before) : "") + "."));
+      leadText = lead.appendChild(document.createTextNode(""));
       body.appendChild(lead);
       body.appendChild(paragraph("LoRAs at one strength are baked in at that strength, and their file runs at 1. " +
-        "LoRAs that share a schedule are baked in at 1, and their file runs the schedule. Each file is fitted to " +
-        "the rank of the highest-rank LoRA in it.", "lb-fine"));
+        "LoRAs that share a schedule are baked in at 1, and their file runs the schedule. Each file is the smallest " +
+        "that keeps the share you pick of its LoRAs' combined change: every layer gets the rank that keeps the " +
+        "most of it per byte.", "lb-fine"));
       if (phased) {
         body.appendChild(paragraph("Where LoRAs' strengths differ from phase to phase, each phase gets a file of its " +
           "own, baked at that phase's strengths. A phase's file runs in that phase only (at 0 in every other), so " +
           "no phase's file can apply in another phase, and the LoRAs need not match phase for phase.", "lb-fine"));
       }
-      if (after > before) {
-        body.appendChild(paragraph("These files take more memory than the LoRAs they replace" +
-          (phased ? " (a file per phase holds every LoRA once per phase)" : "") + ". Each step still runs one " +
-          "file where it ran several.", "lb-fine lb-shrink-more"));
-      }
+
+      var levels = document.createElement("section");
+      levels.className = "lb-shrink-levels";
+      levels.appendChild(paragraph("", "lb-shrink-levels-head")).appendChild(document.createElement("strong"))
+        .textContent = "Compression";
+      progress = levels.appendChild(paragraph(measureNote(null), "lb-muted lb-measure"));
+      var options = document.createElement("div");
+      options.className = "lb-opts";
+      options.setAttribute("role", "radiogroup");
+      options.setAttribute("aria-label", "Compression");
+      (S.levels || []).forEach(function (level) {
+        var option = optionRow("lb-shrink-pick", level.key, level.key === pick, level.label, "Measuring…", [],
+          function () {
+            pick = level.key;
+            dialog.shrinkPick = pick;
+            repaint();
+          });
+        option.dataset.level = level.key;
+        rows[level.key] = option;
+        options.appendChild(option);
+      });
+      levels.appendChild(options);
+      matched = levels.appendChild(paragraph("", "lb-fine lb-matched"));
+      matched.hidden = true;
+      more = levels.appendChild(paragraph("", "lb-fine lb-shrink-more"));
+      more.hidden = true;
+      body.appendChild(levels);
+
       bundles.forEach(function (bundle) {
         var box = document.createElement("section");
         box.className = "lb-shrink-file";
         var head = document.createElement("div");
         head.className = "lb-shrink-head";
         head.appendChild(document.createElement("strong")).textContent = shrinkWhat(bundle);
-        var fileText = !bundle.phased ? "1 file"
-          : shrinkFiles(bundle) > 1 ? plural(shrinkFiles(bundle), "file", "files") + ", one per phase"
-          : "1 file, " + phaseName(((bundle.files || [])[0] || { phase: 1 }).phase - 1).toLowerCase() + " only";
-        head.appendChild(span("lb-muted", plural(bundle.loras, "LoRA", "LoRAs") + " → " + fileText +
-          ", rank " + bundle.rank + (bundle.bytes_after ? " · " + megabytes(bundle.bytes_after) : "")));
+        heads.push(head.appendChild(span("lb-muted lb-shrink-size", "")));
         box.appendChild(head);
         if (bundle.phased) {
           (bundle.files || []).forEach(function (file) {
@@ -6250,6 +6514,45 @@
         body.appendChild(box);
       });
     }
+
+    /* The picked level in a measured set, or null while it is measured. */
+    function chosen(name) {
+      var set = found[name];
+      if (!set || set.state !== "done") { return null; }
+      return (set.levels || []).filter(function (level) { return level.key === pick; })[0] || null;
+    }
+
+    function repaint() {
+      if (!bundles.length) { return; }
+      var all = found.all && found.all.state === "done" ? found.all : null;
+      var level = chosen("all");
+      var now = all ? all.exact.bytes : 0;
+      leadText.textContent = " · WanGP loads " + plural(plan.files_after, "file", "files") + " instead of " +
+        plan.files_before + (level ? ", about " + megabytes(level.bytes) + " of LoRA weights instead of " +
+        megabytes(now) : "") + ".";
+      (S.levels || []).forEach(function (entry) {
+        var option = rows[entry.key];
+        var measured = all ? (all.levels || []).filter(function (item) { return item.key === entry.key; })[0] : null;
+        if (!option) { return; }
+        setOption(option, entry.label + (measured ? " · keeps " + keptShare(measured.kept) : ""),
+          measured ? savesText(measured.bytes, now) : "Measuring…", measured ? [megabytes(measured.bytes)] : []);
+      });
+      if (all) {
+        matched.textContent = "Matching the highest-rank LoRA in every layer, as Shrink did before: keeps " +
+          keptShare(all.matched.kept) + ", " + megabytes(all.matched.bytes) + ".";
+        matched.hidden = false;
+      }
+      more.hidden = !(level && level.bytes > now);
+      more.textContent = "At this level the files take more memory than the LoRAs they replace" +
+        (phased ? " (a file per phase holds every LoRA once per phase)" : "") + ". Each step still runs one file " +
+        "where it ran several.";
+      bundles.forEach(function (bundle, index) {
+        var mine = chosen("b" + index);
+        heads[index].textContent = plural(bundle.loras, "LoRA", "LoRAs") + " → " + shrinkFileText(bundle) +
+          (mine ? " · keeps " + keptShare(mine.kept) + " · " + megabytes(mine.bytes) : "");
+      });
+    }
+
     if (kept.length) {
       var rest = document.createElement("details");
       rest.className = "lb-shrink-kept";
@@ -6271,9 +6574,27 @@
       body.appendChild(paragraph("The originals stay where they are. Each shrunk file is built in the background; " +
         "until it is, WanGP reports it missing if you generate. Unshrink, on each shrunk row, loads the LoRAs " +
         "separately again.", "lb-fine"));
+      repaint();
+      var sets = { all: [] };
+      bundles.forEach(function (bundle, index) {
+        var keys = (bundle.files || []).map(function (file) { return file.measure; }).filter(Boolean);
+        sets["b" + index] = keys;
+        sets.all = sets.all.concat(keys);
+      });
+      watchMeasures(dialog, sets, function (measured) {
+        found = measured;
+        progress.textContent = measureNote(measured.all);
+        progress.hidden = !!measured.all && measured.all.state === "done";
+        repaint();
+      }, function () { send({ type: "shrink_plan" }); });
       dialog.setActions([
         { label: "Cancel" },
-        { label: "Shrink " + plural(loras, "LoRA", "LoRAs"), primary: true, run: function () { send({ type: "shrink" }); } }
+        { label: "Shrink " + plural(loras, "LoRA", "LoRAs"), primary: true, run: function () {
+          var level = levelFor(pick);
+          // The level picked is the one Shrink and Bake use from now on.
+          send({ type: "batch", actions: [{ type: "compression", value: pick },
+            { type: "shrink", quality: level ? level.quality : undefined }] });
+        } }
       ]);
       var go = dialog.overlay.querySelector(".lb-dialog-foot .lb-primary");
       if (go) { go.focus(); }
@@ -6636,7 +6957,10 @@
     // The answer to a paste is about the paste, even when a newer payload
     // overtook the one carrying it.
     if (payload.paste_report) { onPasteReport(payload.paste_report); }
+    if (payload.levels) { S.levels = payload.levels; }
+    if (payload.compression) { S.compression = payload.compression; }
     if (payload.shrink_plan) { onShrinkPlan(payload.shrink_plan); }
+    if (payload.bake_plan) { onBakePlan(payload.bake_plan); }
     // Ignore a stale async response that lost the race with a newer sync.
     if (payload.revision !== undefined && payload.revision < S.revision) { return; }
 
@@ -6654,6 +6978,7 @@
     S.activeProfile = payload.active_profile || "";
     S.canDisableAll = !!payload.can_disable_all;
     S.canEnableAll = !!payload.can_enable_all;
+    S.canShrink = payload.can_shrink !== false;
     S.stackText = payload.stack_text || "";
     S.signature = payload.signature || "";
     S.sliderMin = payload.slider_min !== undefined ? payload.slider_min : 0;
@@ -6764,6 +7089,10 @@
     el.activeTitle.textContent = "Active LoRAs (" + activeCount + ")" + (offCount ? " \u00B7 " + offCount + " off" : "");
     el.disableAll.disabled = !S.canDisableAll;
     el.enableAll.disabled = !S.canEnableAll;
+    el.shrink.disabled = !S.canShrink;
+    el.shrink.title = S.canShrink
+      ? "Bake the stack down into as few files as run the same, so it takes less memory"
+      : "The stack is already shrunk: unshrink it before shrinking again";
     el.viewSwitch.querySelectorAll("button").forEach(function (button) {
       button.setAttribute("aria-checked", button.dataset.view === S.view ? "true" : "false");
     });

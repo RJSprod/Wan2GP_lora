@@ -46,6 +46,10 @@ DEFAULT_NAME_MODE = "civitai"
 STACK_VIEWS = ("list", "cards")
 DEFAULT_STACK_VIEW = "list"
 
+#: How hard Shrink and Bake compress (``bake.LEVELS``): low keeps the most.
+COMPRESSIONS = ("low", "medium", "high")
+DEFAULT_COMPRESSION = "low"
+
 
 def default_document() -> dict[str, Any]:
     return {
@@ -54,6 +58,7 @@ def default_document() -> dict[str, Any]:
         "sort_mode": DEFAULT_SORT,
         "name_mode": DEFAULT_NAME_MODE,
         "stack_view": DEFAULT_STACK_VIEW,
+        "compression": DEFAULT_COMPRESSION,
         "favorites": {},
         "tags": {},
         "profiles": {},
@@ -121,6 +126,9 @@ class MetadataStore:
         )
         document["stack_view"] = self.sanitize_choice(
             payload.get("stack_view"), STACK_VIEWS, DEFAULT_STACK_VIEW
+        )
+        document["compression"] = self.sanitize_choice(
+            payload.get("compression"), COMPRESSIONS, DEFAULT_COMPRESSION
         )
         document["civitai_api_key"] = str(payload.get("civitai_api_key", "") or "").strip()
         document["schema_version"] = SCHEMA_VERSION
@@ -207,6 +215,17 @@ class MetadataStore:
             self.data["stack_view"] = view
             self.save()
         return view
+
+    @property
+    def compression(self) -> str:
+        return self.sanitize_choice(self.data.get("compression"), COMPRESSIONS, DEFAULT_COMPRESSION)
+
+    def set_compression(self, value: Any) -> str:
+        level = self.sanitize_choice(value, COMPRESSIONS, DEFAULT_COMPRESSION)
+        if level != self.data.get("compression"):
+            self.data["compression"] = level
+            self.save()
+        return level
 
     @property
     def civitai_api_key(self) -> str:

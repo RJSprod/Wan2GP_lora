@@ -56,6 +56,13 @@ class StackFiles:
 
     def empty(self, native_id: str) -> bool:
         """The LoRA's mode leaves it nothing to apply."""
+        parsed = dv.parse(native_id)
+        if parsed is not None and parsed.kind == "bake" and parsed.mode:
+            # A baked file's copy in one mode: what the built file holds says.
+            if not self.sided or self.store is None or not self.store.exists(parsed.base):
+                return False
+            summary = self.summaries.get(self.store.path(parsed.base))
+            return summary is not None and not summary.has(parsed.mode)
         source, mode = self.source(native_id)
         if mode == sm.NORMAL or not self.sided:
             return False
@@ -101,25 +108,26 @@ class StackFiles:
 
     # --------------------------------------------------------------- bakes
 
-    def bake_ids(self, group: sm.Group, rank: int) -> dict[str, str]:
-        """The file each side of ``group`` bakes into at ``rank``: the whole
-        group's, or -- with separate strengths -- the picture's and the
-        sound's, for each side with two or more members.  A shrunk group's
-        members are named with what each brings."""
+    def bake_ids(self, group: sm.Group, size) -> dict[str, str]:
+        """The file each side of ``group`` bakes into at ``size`` (a rank, or
+        a compression level's ``q990``): the whole group's, or -- with
+        separate strengths -- the picture's and the sound's, for each side
+        with two or more members.  A shrunk group's members are named with
+        what each brings."""
         found = {}
         for track in group.tracks:
             members = self.bakeable(group, track)
             if len(members) >= 2:
                 suffix = dv.SOUND_TRACK if track == sm.SOUND else (track if track in dv.PHASE_TRACKS else "")
-                found[track] = dv.bake_id(
+                found[track] = dv.bake_mode_id(dv.bake_id(
                     [(self.source(member)[0], self.sides(member), group.weight(member, track)) for member in members],
-                    rank, track=suffix,
-                )
+                    size, track=suffix,
+                ), sm.file_mode(group, track))
         return found
 
-    def bake_id(self, group: sm.Group, rank: int) -> str:
+    def bake_id(self, group: sm.Group, size) -> str:
         """The group's baked file -- the picture's, where each side has one."""
-        found = self.bake_ids(group, rank)
+        found = self.bake_ids(group, size)
         return next((found[track] for track in (sm.ALL, sm.PICTURE, sm.SOUND) if track in found), "")
 
     def default_rank(self, group: sm.Group) -> int:
@@ -159,44 +167,58 @@ class StackFiles:
             found.append((source, path, mode, display_name(source), group.weight(member, track or sm.ALL)))
         return found
 
+    def bake_members(self, group: sm.Group, track: str) -> list[bk.Member] | None:
+        """What a bake of ``track`` reads: each LoRA's file, mode and what it
+        brings; None when one is missing."""
+        members = self._members(group, track)
+        if members is None:
+            return None
+        return [bk.Member(path, mode, name, weight) for _, path, mode, name, weight in members]
+
+    def measures(self, group: sm.Group) -> list[tuple[str, str, list[bk.Member]]]:
+        """``(track, measurement key, members)`` for each file ``group``
+        bakes into."""
+        found = []
+        for track in group.tracks:
+            members = self.bake_members(group, track)
+            if members is not None and len(members) >= 2:
+                found.append((track, bk.measure_key(members, self.sided), members))
+        return found
+
     def bake_options(self, stack, letter: str) -> dict:
-        """What the bake dialog offers: sizes per rank, read from headers only."""
+        """What the bake dialog shows before anything is measured: the
+        group's files, read from headers only, and what to measure."""
         group = sm.groups(stack).get(letter)
         if group is None:
             return {"error": "That group is gone."}
         recognised = self.recognised(group)
         if recognised:
             return {"error": recognised}
-        plans = []
+        plans, measures = [], []
         for track in group.tracks:
-            members = self._members(group, track)
+            members = self.bake_members(group, track)
             if members is None:
                 return {"error": "A LoRA in this group is missing locally."}
             if len(members) < 2:
                 continue                    # a side of one LoRA stays as it is
             try:
-                plans.append(bk.plan([bk.Member(path, mode, name, weight) for _, path, mode, name, weight in members],
-                                     sided=self.sided))
+                plans.append(bk.plan(members, sided=self.sided))
             except bk.BakeError as error:
                 return {"error": str(error)}
+            measures.append(bk.measure_key(members, self.sided))
         if not plans:
             return {"error": "No side of this group has two LoRAs to bake together."}
         combined = max(plan.combined_rank for plan in plans)
-        default = min(max(plan.default_rank for plan in plans) or combined, combined)
-        ranks = sorted({combined, default, max(1, default // 2)}, reverse=True)
+        parsed = dv.parse(group.bake) if group.baked else None
         return {
             "group": letter,
             "combined_rank": combined,
-            "default_rank": default,
             "current_bytes": sum(plan.size_for(plan.combined_rank) for plan in plans),
-            "options": [
-                {"rank": rank, "bytes": sum(plan.size_for(rank) for plan in plans),
-                 "exact": all(rank >= plan.combined_rank for plan in plans)}
-                for rank in ranks
-            ],
-            "baked_rank": dv.parse(group.bake).rank if group.baked else 0,
-            # A group with separate strengths bakes a file per side.
+            "size": parsed.size if parsed else "",
+            # A file per side, or per phase.
             "files": len(plans),
+            "per_phase": any(track in dv.PHASE_TRACKS for track in group.tracks),
+            "measures": measures,
         }
 
     # --------------------------------------------------------------- state
@@ -222,7 +244,7 @@ class StackFiles:
                 state["bytes"] = os.path.getsize(self.store.path(native_id))
             except OSError:
                 pass
-            for key in ("kept", "exact", "rank"):
+            for key in ("kept", "exact", "rank", "quality"):
                 if key in entry:
                     state[key] = entry[key]
             return state
@@ -250,11 +272,13 @@ class StackFiles:
             if summary is not None and not summary.has(parsed.mode):
                 return None
             return bd.split_job(self.store, native_id, source, path, parsed.mode, display_name(source))
+        if parsed.mode:
+            return self._file_copy_job(stack, native_id, parsed)
         group = sm.group_of(stack, native_id)
         track = next((key for key, value in group.bakes.items() if value == native_id), None) if group else None
         if track is None:
             # Nothing in the stack says what it holds: its recipe does.
-            return self.recipe_job(native_id, parsed.rank)
+            return self.recipe_job(native_id, parsed.size)
         members = self._members(group, track)
         if members is None or len(members) < 2:
             return None
@@ -262,8 +286,31 @@ class StackFiles:
         phase = dv.phase_of(track)
         label = f"{name} {group.letter}" + (f", phase {phase}" if phase else
                                             {sm.PICTURE: ", picture", sm.SOUND: ", sound"}.get(track, ""))
-        return bd.bake_job(self.store, native_id, members, parsed.rank, self.sided, label,
+        return bd.bake_job(self.store, native_id, members, parsed.size, self.sided, label,
                            shrunk=group.weighted, track=track if phase else "")
+
+    def _file_copy_job(self, stack, native_id: str, parsed) -> bd.Job | None:
+        """A shrunk file's copy in one mode, made from the built file itself:
+        the file is built first when it is not there, then copied."""
+        base = parsed.base
+        if not self.store.ready(base):
+            if self.builder.busy(base) in ("building", "queued"):
+                return None
+            group = sm.group_of(stack, native_id)
+            track = next((key for key, value in group.bakes.items() if value == native_id), None) if group else None
+            if track is None:
+                return self.recipe_job(base, parsed.size)
+            members = self._members(group, track)
+            if members is None or len(members) < 2:
+                return None
+            phase = dv.phase_of(track)
+            label = f"Shrunk {group.letter}" + (f", phase {phase}" if phase else "")
+            return bd.bake_job(self.store, base, members, parsed.size, self.sided, label,
+                               shrunk=group.weighted, track=track if phase else "")
+        phase = dv.phase_of(parsed.track)
+        group = sm.group_of(stack, native_id)
+        label = (f"Shrunk {group.letter}" if group is not None else "Shrunk file") + (f", phase {phase} file" if phase else " file")
+        return bd.split_job(self.store, native_id, base, self.store.path(base), parsed.mode, label)
 
     def _recipe_members(self, recipe: dict) -> list[tuple[str, str, str, str, float]] | None:
         found = []
@@ -282,7 +329,7 @@ class StackFiles:
                           str(item.get("name") or display_name(source)), weight))
         return found
 
-    def recipe_job(self, native_id: str, rank: int) -> bd.Job | None:
+    def recipe_job(self, native_id: str, size) -> bd.Job | None:
         """A bake built again from the recipe kept when it was first built."""
         if self.store is None:
             return None
@@ -290,12 +337,19 @@ class StackFiles:
             recipe = self.store.recipe(native_id)
         except OSError:
             return None
+        parsed = dv.parse(native_id)
+        if parsed is not None and parsed.kind == "bake" and parsed.mode:
+            if not self.store.ready(parsed.base):
+                return None if self.builder.busy(parsed.base) in ("building", "queued") \
+                    else self.recipe_job(parsed.base, parsed.size)
+            return bd.split_job(self.store, native_id, parsed.base, self.store.path(parsed.base), parsed.mode,
+                                str(recipe.get("label") or "Shrunk file") if recipe else "Shrunk file")
         if not recipe or recipe.get("kind") != "bake":
             return None
         members = self._recipe_members(recipe)
         if members is None or len(members) < 2:
             return None
-        return bd.bake_job(self.store, native_id, members, rank, self.sided,
+        return bd.bake_job(self.store, native_id, members, size, self.sided,
                            str(recipe.get("label") or "Baked file"), shrunk=bool(recipe.get("shrink")),
                            track=str(recipe.get("track") or ""))
 
@@ -315,7 +369,7 @@ class StackFiles:
             if parsed is None or parsed.kind != "bake" or lora_id in held:
                 continue
             try:
-                recipe = self.store.recipe(lora_id)
+                recipe = self.store.recipe(parsed.base)
             except OSError:
                 return False
             if not recipe or recipe.get("kind") != "bake":
@@ -347,7 +401,9 @@ class StackFiles:
                         files.append(other)
                         per_phase[other_phase] = other_weights
             done.update(files)
-            if any(stack.has_entry(member) or member in named for member in members):
+            # A member named by another group's lines is that group's; an
+            # entry with a member's id is the same LoRA beside the file.
+            if any(member in named for member in members):
                 continue
             letter = sm.next_letter(stack)
             if not letter:
@@ -447,16 +503,34 @@ class StackFiles:
             group = found.get(row["group"])
             if group is None:
                 continue
+            row["file_mode"] = sm.file_mode(group, group.tracks[0]) if group.baked else sm.NORMAL
+            for track in row.get("phase_tracks") or []:
+                track["file_mode"] = sm.file_mode(group, track.get("track", ""))
             info = {"default_rank": self.default_rank(group)}
             if group.baked:
                 parsed = dv.parse(group.bake)
                 info.update(combine([dict(self.state(value), id=value, track=track)
                                      for track, value in group.bakes.items()]))
                 info["rank"] = parsed.rank if parsed else 0
+                info["quality"] = parsed.quality if parsed else 0
             row["bake"] = info
             row["source_id"] = ""
             row["mode"] = sm.NORMAL
         return rows
+
+    def inside_of(self, stack) -> dict[str, str]:
+        """Original id -> the label of the baked group whose file holds it,
+        for LoRAs held only that way: a tile click adds such a LoRA on its
+        own, beside the file."""
+        held = {self.source(lora_id)[0] for lora_id, _, _ in stack.user_entries()}
+        found: dict[str, str] = {}
+        for group in sm.groups(stack).values():
+            label = f"{'Shrunk' if group.weighted else 'Group'} {group.letter}"
+            for member in group.members:
+                source = self.source(member)[0]
+                if group.inside(member) and source not in held:
+                    found.setdefault(source, label)
+        return found
 
     def aliases(self, stack) -> dict[str, tuple[str, bool]]:
         """Original id -> ``(the id the stack holds it by, whether it is on)``,
@@ -471,7 +545,8 @@ class StackFiles:
             if group.baked:
                 on = any(stack.index_of(value) >= 0 for value in group.files)
                 for member in group.members:
-                    found.setdefault(self.source(member)[0], (member, on))
+                    if group.inside(member):
+                        found.setdefault(self.source(member)[0], (member, on))
         return found
 
 

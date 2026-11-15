@@ -71,9 +71,8 @@ thumbnail browser and a real-time strength editor.
   It stays one row with two editors; the panel quietly runs it as two files.
   See [Separate picture and sound strengths](#separate-picture-and-sound-strengths-ltx-2).
 - **Groups and bakes.** LoRAs that share one strength and schedule can be
-  grouped, so they move as one, and a group can be baked into a single LoRA at
-  a rank you choose to save memory — and unbaked again. See
-  [Groups and bakes](#groups-and-bakes).
+  grouped, so they move as one, and a group can be baked into a single LoRA to
+  save memory — and unbaked again. See [Groups and bakes](#groups-and-bakes).
 - **Shrink a big stack.** *Shrink* bakes every LoRA that runs at one strength
   into one file, each at its strength, and every set of LoRAs that share a
   schedule into a file of their own that runs it — twenty LoRAs at one
@@ -82,6 +81,18 @@ thumbnail browser and a real-time strength editor.
   phase**, each running in its own phase only, so they need not match each
   other phase for phase. *Unshrink* gives them back. See
   [Shrinking a stack](#shrinking-a-stack).
+- **A LoRA beside its shrunk file.** Add a LoRA that is baked into a shrunk
+  file again on its own, to push it further; unshrinking keeps the copy
+  beside it as a *double*, off and locked, until the other is gone. A shrunk
+  file — or each phase's file — can be used visual or audio only, as a copy
+  of the built file, without baking anything again. See
+  [A LoRA beside its shrunk file](#a-lora-beside-its-shrunk-file) and
+  [A shrunk file visual or audio only](#a-shrunk-file-visual-or-audio-only).
+- **Low, Medium or High compression.** Before anything is built, the panel
+  measures every layer of the LoRAs and shows what each level keeps of their
+  combined change and how much it weighs. Each level is the smallest file that
+  keeps its share: every layer gets its own rank, the one that keeps the most
+  per byte. See [Compression levels](#compression-levels).
 - **Image previews first, video previews as a still.** A LoRA with only a video
   preview gets its *first frame* decoded server-side and cached; the video itself
   is never loaded in the browser.
@@ -608,7 +619,7 @@ A **group** gets the same with its **Strengths** switch: *One for both* or
 Sound section; each member still has its own Normal / Visual / Audio choice
 and takes the group's strength for each side it brings. Baked, each side with
 two or more LoRAs becomes a file of its own (the sound one's name ends
-`.sound.safetensors`), both at the rank you choose. Switching back to one
+`.sound.safetensors`), both at the compression you choose. Switching back to one
 strength keeps the picture's.
 
 ### Groups and bakes
@@ -626,12 +637,12 @@ applies every active LoRA as one sum per layer, so two LoRAs side by side cost
 no more memory than one file holding both exactly would.
 
 **Bake** is what saves memory: it re-fits the group's combined change as one
-LoRA at the rank you choose. It starts at the rank of the highest-rank LoRA in
-the group, and the dialog lists each size with what it saves. A rank at or
-above the group's combined rank is exact; a smaller one keeps the strongest
-directions of the combined change, layer by layer (a truncated SVD), and once
-it is built the group says how much of the change it kept. The originals are
-never touched: **Unbake** goes back to them and **Change size…** bakes again.
+LoRA at the [compression level](#compression-levels) you choose, the one you
+last picked to start with. The dialog lists each level with the share it keeps
+and its size, measured before anything is built, and **Exact**, every LoRA as it
+is (only worth it to hand someone one file). Once it is built, the group says
+how much of the change it kept. The originals are never touched: **Unbake**
+goes back to them and **Change size…** bakes again at another level.
 Strength and schedule still apply live to the baked file, and changing a
 member's mode or the group's members bakes it again to match. LoRAs that are not
 plain low-rank pairs (DoRA, LoKr, full weight differences) cannot be baked, and
@@ -640,7 +651,8 @@ neither can a LoRA WanGP recognises by its file name (see
 
 A group is stored as `#lora_group <letter> <lora>` lines in `loras_multipliers`;
 a baked group's lines also name its file
-(`_lora_browser/_bakes/<hash>.r<rank>.safetensors`), which is what
+(`_lora_browser/_bakes/<hash>.q999.safetensors` at a compression level keeping
+99.9%, `.r<rank>` for one rank in every layer), which is what
 `loras_choices` then holds. A group with separate picture and sound strengths
 lists each member as the halves it is selected as; nothing else marks it.
 
@@ -662,9 +674,11 @@ run the same:
   phase**. Phase 1's file holds each of them at its phase 1 strength and runs
   `1;0`; phase 2's holds each at its phase 2 strength and runs `0;1`. See
   [A file per phase](#a-file-per-phase).
-- **Each file is fitted to the rank of the highest-rank LoRA in it**, the way
-  a bake starts. Once built, its row says how much of the combined change it
-  kept; **Change size…** builds it again at another rank.
+- **Each file is built at the [compression level](#compression-levels) you
+  pick in the dialog** — Low, Medium or High, each shown with the share it
+  keeps and its size before anything is built. Once built, its row says how
+  much of the combined change it kept; **Change size…** builds it again at
+  another level.
 - **Modes count**: an audio-only LoRA goes in as its sound side, a visual-only
   one as its picture side, and a LoRA with separate picture and sound
   strengths as its picture half at the one and its sound half at the other.
@@ -687,18 +701,25 @@ its change times its multiplier, `W + 0.5·ΔA + 0.7·ΔB`, so a file holding
 `0.5·ΔA + 0.7·ΔB` run at 1 is the same sum, at every step. What can differ is
 the rank: the file keeps the strongest directions of the combined change, and
 its row says how much of it it kept. A subtle LoRA beside strong ones is the
-first to fade — check a render with **Compare**, and give the file more rank
+first to fade — check a render with **Compare**, and pick a lower compression
 with **Change size…** if it did.
 
 ```
  Shrink the stack
  3 LoRAs into 1 file · WanGP loads 2 files instead of 4, about 410 MB of
  LoRA weights instead of 1.2 GB.
- ┌ At one strength   3 LoRAs → 1 file, rank 64 · 410 MB ┐
- │ Detail_Enhancer                              at 0.8 │
- │ Film_Grain                                   at 0.6 │
- │ Neg_Blur                                      at −1 │
- └──────────────────────────────────────────────────────┘
+ Compression
+ (•) Low compression · keeps 99.9%                         410 MB
+     Saves 790 MB, 66% smaller than now.
+ ( ) Medium compression · keeps 99.0%                      230 MB
+ ( ) High compression · keeps 95.1%                        120 MB
+ Matching the highest-rank LoRA in every layer, as Shrink did before:
+ keeps 93.4%, 300 MB.
+ ┌ At one strength   3 LoRAs → 1 file · keeps 99.9% · 410 MB ┐
+ │ Detail_Enhancer                                     at 0.8 │
+ │ Film_Grain                                          at 0.6 │
+ │ Neg_Blur                                             at −1 │
+ └────────────────────────────────────────────────────────────┘
  ▸ 1 LoRA stays as it is
                                  [ Cancel ] [ Shrink 3 LoRAs ]
 ```
@@ -710,7 +731,42 @@ its own, *Shrunk A*, its LoRAs listed under it with the strength each brings.
 Its own strength scales them all. `×` takes one out (it runs on its own again,
 and the rest are baked again), and **Unshrink** gives every one back as a LoRA
 of its own at the strength it had — times the row's strength, if you changed
-it.
+it. **Shrink** waits while the stack is shrunk: unshrink it first, and the next
+Shrink plans everything afresh from the originals.
+
+#### A LoRA beside its shrunk file
+
+A LoRA baked into a shrunk file can be added again **on its own, beside the
+file** — to push it further than the file does, or schedule it differently. Its
+tile shows the group's letter while it is only inside the file; a click (or
+**Add on its own too** in the tile's menu) adds it as a LoRA of its own, with a
+strength of its own, and it applies twice: once inside the file at what it
+brought, once beside it. WanGP's own LoRA picker does the same.
+
+WanGP cannot select one LoRA twice, so **unshrinking** brings the copy inside
+the file back as the LoRA, at what it brought, and the copy beside it becomes a
+**double**: kept, off, *Double · not applied*, its switch locked. Remove it, or
+remove the other copy — then the double is a LoRA of its own again, off where
+it was with its own strength, and its switch works. Taking the LoRA out of the
+shrunk file with `×` does the same. Stack text and profiles keep a LoRA inside
+the file and beside it as two lines.
+
+#### A shrunk file visual or audio only
+
+On LTX-2, each of a shrunk group's files — phase 1's, phase 2's, or its one
+file — can be used **visual or audio only**: *File applies to · Normal · Visual
+· Audio* in its section. That is a copy of the built file keeping only its
+picture side or its sound side (`…p1.audio.safetensors`), made from the file
+itself in a moment — nothing is baked again — and it runs in the file's place,
+in its phase only. The group's line says so (*P1 audio only*). **Normal** goes
+back to the file as it is; **Change size…** keeps each file's choice.
+
+Every copy's recipe names the file it was made from, and that file's recipe
+names its LoRAs: delete either, and settings that name the copy — a preset, a
+video's — build the shrunk file again from the LoRAs, then the copy from it.
+Stack text writes the choice as a tag, `file p1 audio`, and profiles keep it.
+Unshrinking gives the LoRAs back as they were shrunk; the files' choices were
+the files' own.
 
 #### A file per phase
 
@@ -734,8 +790,8 @@ LoRAs at twenty different pairs of strengths become two files:
   no file; every LoRA the same in each phase is one file for every phase, as
   above; and two LoRAs would be two files either way, so they stay as they
   are.
-- **Memory**: each phase's file holds every LoRA, so it takes as much as one
-  file of that rank, once per phase. Each step still runs one file where it
+- **Memory**: each phase's file holds every LoRA, so it takes about as much
+  as one file would, once per phase. Each step still runs one file where it
   ran all of them; the dialog says when the files take more memory than the
   LoRAs they replace.
 
@@ -745,13 +801,48 @@ file to 1.2 raises every LoRA's phase 1 strength by a fifth and leaves phase 2
 as it was; **Unshrink** gives each LoRA both its phases back, each times its
 file's strength. In One Phase there is one phase to bake, so one file.
 
+#### Compression levels
+
+A smaller file keeps less of what the LoRAs change; how much less depends on
+the LoRAs. So before anything is built, the panel **measures** them: for every
+layer it works out the directions their combined change is made of, and how
+much of it each holds (the singular values, from two small matrices per layer;
+the change itself is never formed). That takes seconds to a minute or so for a
+big stack, in the background, and is remembered for the session. From it the
+dialog shows, for each level, the **share of the combined change kept** and
+the **size**, exactly as the build will make them:
+
+| Level | Keeps of the combined change | No layer keeps less than |
+|---|---|---|
+| **Low compression** | 99.9% | 99.5% of its own |
+| **Medium compression** | 99% | 95% of its own |
+| **High compression** | 95% | 75% of its own |
+
+Each level is the **smallest file that keeps its share**. Rather than one rank
+everywhere, every layer gets its own: the directions that hold the most change
+per byte go in first, across every layer together, until the share is kept —
+and no layer is cut below its floor, so a faint layer is never gutted to save
+a few bytes. At the same share that is smaller than one rank for every layer,
+and at the same size it keeps more. WanGP reads each layer's rank from that
+layer's own tensors, so such a file loads like any other.
+
+The dialog also shows what **matching the highest-rank LoRA in every layer** —
+how files were sized before — would keep and weigh, so you can see on your own
+stack whether a level saves memory over it. Whether a level is smaller than
+that depends on the stack: LoRAs that pull the same way fit in few directions,
+while many unrelated LoRAs need many, and keeping 99.9% of them can take more
+than matching one LoRA's rank did (which kept less). The level you pick is
+remembered and used by the next Shrink and Bake. The share is of the weight
+change, which is close to, but not the same as, what you see: **Compare** is
+the real check.
+
 A shrunk file is a group whose lines say what each LoRA brings to it:
 
 ```
 1 1,1,0.5,0.5
 #lora_group A Detail_Enhancer.safetensors
 #lora_group A Film_Grain.safetensors
-#lora_group A _lora_browser/_bakes/3f9c21a07b4e.r64.safetensors
+#lora_group A _lora_browser/_bakes/3f9c21a07b4e.q999.safetensors
 #lora_weight A 0.8 Detail_Enhancer.safetensors
 #lora_weight A 0.6 Film_Grain.safetensors
 ```
@@ -763,15 +854,15 @@ phase for each LoRA:
 1;0 0;1
 #lora_group A Detail_Enhancer.safetensors
 #lora_group A Film_Grain.safetensors
-#lora_group A _lora_browser/_bakes/5d71c0e93a2f.r64.p1.safetensors
-#lora_group A _lora_browser/_bakes/a40be6f1d8c7.r64.p2.safetensors
+#lora_group A _lora_browser/_bakes/5d71c0e93a2f.q999.p1.safetensors
+#lora_group A _lora_browser/_bakes/a40be6f1d8c7.q999.p2.safetensors
 #lora_weight A 0.8;0.5 Detail_Enhancer.safetensors
 #lora_weight A 0.6;0.6 Film_Grain.safetensors
 ```
 
 so presets, the queue and every video's saved settings carry everything needed
 to build it again. **Copy current stack** writes the same as tags,
-`Detail_Enhancer [group A, baked r64, weight 0.8]: x1` (or `weight 0.8;0.5`
+`Detail_Enhancer [group A, baked 99.9%, weight 0.8]: x1` (or `weight 0.8;0.5`
 with a file per phase), and pasting it back
 gives the shrunk file back; profiles keep it too. The compare view shows each
 shrunk LoRA at what it brings, and leaves it as it is: unshrink to change one.
@@ -789,7 +880,7 @@ removes those nothing uses; **Delete all but this stack's** removes every one
 this stack does not use, saved profiles' included.
 
 **Every built file's recipe is kept** — a copy's original and mode; a bake's
-or a shrink's LoRAs, what each brings, and its rank — in `recipes.json` beside
+or a shrink's LoRAs, what each brings, and its size — in `recipes.json` beside
 the files, and deleting a file keeps it. Whenever a stack, a recalled profile,
 a preset or a video's settings names a deleted file again, it is built again
 from its originals. That works even where the settings lost the lines saying

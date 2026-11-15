@@ -17,6 +17,15 @@ largest singular values give the best rank-k approximation there is
 (Eckart-Young), and the share of sum(S^2) they hold -- over every module -- is
 reported as how much of the group's combined change the bake keeps.
 
+A file need not use one rank everywhere: :func:`analyze` measures every
+layer's directions before anything is built (the same singular values, from
+two small Gram matrices), and :func:`allocate` gives each layer the rank that
+buys the most of the combined change per byte -- the strongest directions
+across every layer together, until a share of the whole is kept -- with no
+layer keeping less than :func:`floor_for` of its own.  mmgp reads each layer's
+rank from that layer's own factors, so a file whose layers differ in rank
+loads like any other.
+
 A rank at or above what the members add up to keeps everything, and is built
 by stacking the factors as they are.  A group's strength and schedule are not
 baked in: the group's multiplier applies to the baked file at run time,
@@ -28,8 +37,11 @@ numpy is the only dependency, and WanGP already ships it.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
-from collections import Counter
+import threading
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -143,20 +155,40 @@ class Plan:
             return total
         return max(1, min(rank, module.out_dim, module.in_dim))
 
+    @property
+    def width(self) -> int:
+        return 4 if self.dtype == "F32" else 2
+
     def size_for(self, rank: int) -> int:
         """Bytes of tensor data a bake at ``rank`` writes."""
-        width = 4 if self.dtype == "F32" else 2
-        size = 0
-        for module in self.modules:
-            k = self.output_rank(module, rank)
-            size += k * (module.out_dim + module.in_dim) * width + (4 if k else 0)
-            if any(part.diff_b is not None for part in module.parts):
-                size += module.out_dim * width
-        return size
+        return sum(_module_bytes(module.out_dim, module.in_dim, self.output_rank(module, rank), self.width,
+                                 _has_bias(module))
+                   for module in self.modules)
+
+    def layer_rank(self, module: _Module, rank: int) -> int:
+        """A layer's own rank, as a per-layer allocation asks for it: all of
+        it stacked at or above what its members add up to, else at most its
+        shape allows."""
+        total = module.total_rank
+        rank = int(rank)
+        if not total or rank <= 0:
+            return 0
+        if rank >= total:
+            return total
+        return min(rank, module.out_dim, module.in_dim)
+
+
+def _module_bytes(out_dim: int, in_dim: int, k: int, width: int, bias: bool) -> int:
+    return k * (out_dim + in_dim) * width + (4 if k else 0) + (out_dim * width if bias else 0)
+
+
+def _has_bias(module: _Module) -> bool:
+    return any(part.diff_b is not None for part in module.parts)
 
 
 @dataclass
 class Result:
+    #: The highest rank any layer has.
     rank: int
     #: Share of the combined change kept, 0..1; 1 when nothing was cut.
     kept: float
@@ -283,18 +315,24 @@ def plan(members: list[Member], *, sided: bool) -> Plan:
     return Plan(members=members, files=files, modules=modules, dtype=dtype, member_ranks=ranks)
 
 
-def bake(plan_: Plan, rank: int, path: str, metadata: dict[str, str] | None = None, progress=None) -> Result:
-    """Write the group, re-fitted to ``rank``, to ``path``.
+def bake(plan_: Plan, rank: int, path: str, metadata: dict[str, str] | None = None, progress=None,
+         ranks: dict[str, int] | None = None) -> Result:
+    """Write the group, re-fitted to ``rank``, to ``path`` -- or, with
+    ``ranks``, each layer (by its canonical name) to a rank of its own, as
+    :func:`allocate` chose.
 
     ``progress(done, total)`` counts modules.  The file appears whole or not at
     all.
     """
     rank = int(rank)
-    if rank < 1:
+    if rank < 1 and not ranks:
         raise BakeError("The rank must be at least 1.")
     layout, jobs = [], []
     for module in plan_.modules:
-        k = plan_.output_rank(module, rank)
+        if ranks is not None:
+            k = plan_.layer_rank(module, ranks.get(module.key, 0))
+        else:
+            k = plan_.output_rank(module, rank)
         down_name, up_name = _names(module)
         if k:
             layout.append((down_name, plan_.dtype, (k, module.in_dim)))
@@ -347,8 +385,262 @@ def bake(plan_: Plan, rank: int, path: str, metadata: dict[str, str] | None = No
         for handle in handles:
             handle.close()
     kept = 1.0 if total_energy <= 0 else min(1.0, kept_energy / total_energy)
-    return Result(rank=rank, kept=1.0 if exact else kept, exact=exact,
-                  modules=len(jobs), bytes=plan_.size_for(rank))
+    if ranks is not None:
+        size = sum(_module_bytes(module.out_dim, module.in_dim, k, plan_.width, has_bias)
+                   for module, k, has_bias in jobs)
+        rank = max((k for _, k, _ in jobs), default=0)
+    else:
+        size = plan_.size_for(rank)
+    return Result(rank=rank, kept=1.0 if exact else kept, exact=exact, modules=len(jobs), bytes=size)
+
+
+# ------------------------------------------------------------ compression
+
+#: The compression levels a bake or a shrink is built at: a key, a name, and
+#: the share of the combined change kept, per mille.  Each is the smallest
+#: file that keeps its share, layer ranks chosen by :func:`allocate`.
+LEVELS = (
+    ("low", "Low compression", 999),
+    ("medium", "Medium compression", 990),
+    ("high", "High compression", 950),
+)
+DEFAULT_LEVEL = "low"
+
+
+def level_quality(key) -> int:
+    """A level's share kept, per mille; 0 for no such level."""
+    return next((quality for name, _, quality in LEVELS if name == key), 0)
+
+
+def level_of(quality: int) -> tuple[str, str]:
+    """``(key, name)`` of the level keeping ``quality`` per mille, or of the
+    share itself where no level does."""
+    for key, name, value in LEVELS:
+        if value == int(quality):
+            return key, name
+    return "", f"{int(quality) / 10:g}% kept"
+
+
+def floor_for(kept: float) -> float:
+    """The least any one layer keeps of its own change when the whole keeps
+    ``kept``: no layer loses more than five times the overall loss, so none
+    is gutted to save bytes another layer would have cost."""
+    return max(0.0, 1.0 - 5.0 * (1.0 - float(kept)))
+
+
+@dataclass
+class Spectrum:
+    """A group's combined change, layer by layer, as the directions it is
+    made of: what a file of any size keeps, known before one is built."""
+
+    #: Canonical layer names, in plan order.
+    keys: list[str]
+    #: Each layer's directions' energies (squared singular values),
+    #: strongest first.
+    energies: list[np.ndarray]
+    #: Each layer's ``(out, in)``, the rank its members add up to, and
+    #: whether it carries a bias change.
+    dims: list[tuple[int, int]]
+    totals: list[int]
+    bias: list[bool]
+    #: Bytes per stored value.
+    width: int
+    #: The rank of the highest-rank member: the size a bake matched before.
+    default_rank: int
+
+    @property
+    def total(self) -> float:
+        return float(sum(float(np.sum(values)) for values in self.energies))
+
+    def capped(self, index: int, k: int) -> int:
+        total = self.totals[index]
+        if not total or k <= 0:
+            return 0
+        if k >= total:
+            return total
+        return min(int(k), *self.dims[index])
+
+    def size(self, ranks: list[int]) -> int:
+        """Bytes a file with these layer ranks writes."""
+        return sum(_module_bytes(out_dim, in_dim, self.capped(index, k), self.width, self.bias[index])
+                   for index, ((out_dim, in_dim), k) in enumerate(zip(self.dims, ranks)))
+
+    def kept_energy(self, ranks: list[int]) -> float:
+        kept = 0.0
+        for index, (values, k) in enumerate(zip(self.energies, ranks)):
+            kept += float(np.sum(values[:self.capped(index, k)]))
+        return kept
+
+    def kept(self, ranks: list[int]) -> float:
+        """The share of the combined change these layer ranks keep."""
+        total = self.total
+        return 1.0 if total <= 0 else min(1.0, self.kept_energy(ranks) / total)
+
+    def uniform(self, rank: int) -> list[int]:
+        """The layer ranks one rank for every layer gives."""
+        return [self.capped(index, rank) for index in range(len(self.keys))]
+
+    def exact(self) -> list[int]:
+        return list(self.totals)
+
+    def ranks_by_key(self, ranks: list[int]) -> dict[str, int]:
+        return {key: self.capped(index, k) for index, (key, k) in enumerate(zip(self.keys, ranks))}
+
+
+def analyze(plan_: Plan, progress=None) -> Spectrum:
+    """Measure every layer's directions, reading the members' factors once.
+    ``progress(done, total)`` counts layers."""
+    handles = [open(lora.path, "rb") for lora in plan_.files]
+    energies = []
+    try:
+        for done, module in enumerate(plan_.modules, start=1):
+            energies.append(_directions(module, handles, plan_))
+            if progress:
+                progress(done, len(plan_.modules))
+    finally:
+        for handle in handles:
+            handle.close()
+    return Spectrum(
+        keys=[module.key for module in plan_.modules],
+        energies=energies,
+        dims=[(module.out_dim, module.in_dim) for module in plan_.modules],
+        totals=[module.total_rank for module in plan_.modules],
+        bias=[_has_bias(module) for module in plan_.modules],
+        width=plan_.width,
+        default_rank=min(plan_.default_rank or plan_.combined_rank, plan_.combined_rank),
+    )
+
+
+def _directions(module: _Module, handles, plan_: Plan) -> np.ndarray:
+    """The energies of one layer's combined change, strongest first.
+
+    dW = U V with U = [s_i B_i] (out x R) and V = [A_i] (R x in); its squared
+    singular values are the eigenvalues of (U^T U)(V V^T), two R x R Gram
+    matrices -- dW itself is never formed."""
+    parts = module.factored
+    if not parts:
+        return np.zeros(0)
+    ups = [_load(part.up, handles[part.member]) * np.float32(_scale(part) * _weight(plan_, part.member))
+           for part in parts]
+    downs = [_load(part.down, handles[part.member]) for part in parts]
+    up = np.concatenate(ups, axis=1)
+    down = np.concatenate(downs, axis=0)
+    gram_up = (up.T @ up).astype(np.float64)
+    gram_down = (down @ down.T).astype(np.float64)
+    values, vectors = np.linalg.eigh((gram_down + gram_down.T) * 0.5)
+    root = np.sqrt(np.clip(values, 0.0, None))
+    core = (vectors.T @ gram_up @ vectors) * np.outer(root, root)
+    found = np.clip(np.linalg.eigvalsh((core + core.T) * 0.5)[::-1], 0.0, None)
+    return np.ascontiguousarray(found[:min(len(found), module.out_dim, module.in_dim)])
+
+
+def allocate(spectrum: Spectrum, kept: float) -> list[int]:
+    """Each layer's rank for a file keeping ``kept`` of the combined change
+    in the fewest bytes: every layer first keeps :func:`floor_for` of its own
+    change, then the directions that hold the most energy per byte, across
+    every layer, go in until the whole keeps ``kept``."""
+    kept = min(1.0, max(0.0, float(kept)))
+    floor = floor_for(kept)
+    ranks = []
+    for values in spectrum.energies:
+        ranks.append(_enough(values, floor))
+    total = spectrum.total
+    need = kept * total - spectrum.kept_energy(ranks)
+    if total > 0 and need > total * 1e-12:
+        ratios, energies, owners = [], [], []
+        for index, (values, k) in enumerate(zip(spectrum.energies, ranks)):
+            tail = values[k:]
+            if not len(tail):
+                continue
+            out_dim, in_dim = spectrum.dims[index]
+            ratios.append(tail / float((out_dim + in_dim) * spectrum.width))
+            energies.append(tail)
+            owners.append(np.full(len(tail), index))
+        if ratios:
+            ratio = np.concatenate(ratios)
+            # Stable, so a layer's equal directions go in its own order.
+            order = np.argsort(-ratio, kind="stable")
+            gained = np.cumsum(np.concatenate(energies)[order])
+            take = min(int(np.searchsorted(gained, need * (1 - 1e-12))) + 1, len(order))
+            counts = np.bincount(np.concatenate(owners)[order[:take]], minlength=len(ranks))
+            ranks = [k + int(count) for k, count in zip(ranks, counts)]
+    return ranks
+
+
+def _enough(values: np.ndarray, share: float) -> int:
+    """The fewest of a layer's directions that keep ``share`` of its energy."""
+    if share <= 0 or not len(values):
+        return 0
+    gained = np.cumsum(values)
+    if gained[-1] <= 0:
+        return 0
+    return min(int(np.searchsorted(gained, share * gained[-1] * (1 - 1e-12))) + 1, len(values))
+
+
+def predictions(spectra: list[Spectrum]) -> dict:
+    """What each level would keep and weigh for these files together, beside
+    one rank matching the highest-rank member (how a bake was sized before)
+    and the exact files (what the LoRAs take now)."""
+    total = sum(spectrum.total for spectrum in spectra)
+
+    def share(kept_energy: float) -> float:
+        return 1.0 if total <= 0 else min(1.0, kept_energy / total)
+
+    levels = []
+    for key, name, quality in LEVELS:
+        chosen = [allocate(spectrum, quality / 1000) for spectrum in spectra]
+        levels.append({
+            "key": key, "label": name, "quality": quality,
+            "kept": share(sum(spectrum.kept_energy(ranks) for spectrum, ranks in zip(spectra, chosen))),
+            "bytes": sum(spectrum.size(ranks) for spectrum, ranks in zip(spectra, chosen)),
+            "rank": max((max(ranks, default=0) for ranks in chosen), default=0),
+        })
+    matched = [spectrum.uniform(spectrum.default_rank) for spectrum in spectra]
+    return {
+        "levels": levels,
+        "matched": {
+            "rank": max((spectrum.default_rank for spectrum in spectra), default=0),
+            "kept": share(sum(spectrum.kept_energy(ranks) for spectrum, ranks in zip(spectra, matched))),
+            "bytes": sum(spectrum.size(ranks) for spectrum, ranks in zip(spectra, matched)),
+        },
+        "exact": {"bytes": sum(spectrum.size(spectrum.exact()) for spectrum in spectra)},
+    }
+
+
+def measure_key(members: list[Member], sided: bool) -> str:
+    """One name per set of members as they are on disk and what each
+    brings: a measurement is reused only for exactly that."""
+    lines = [f"sided={int(bool(sided))}"]
+    for member in members:
+        try:
+            stat = os.stat(member.path)
+            stamp = f"{stat.st_size}:{stat.st_mtime_ns}"
+        except OSError:
+            stamp = "missing"
+        lines.append(f"{os.path.realpath(member.path)}\t{stamp}\t{member.mode}\t{float(member.weight)!r}")
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:16]
+
+
+#: Measurements made this session, newest last.  A large stack's is a few MB.
+_MEASURED: OrderedDict[str, Spectrum] = OrderedDict()
+_MEASURED_LOCK = threading.Lock()
+_MEASURED_KEEP = 24
+
+
+def remember(key: str, spectrum: Spectrum) -> None:
+    with _MEASURED_LOCK:
+        _MEASURED[key] = spectrum
+        _MEASURED.move_to_end(key)
+        while len(_MEASURED) > _MEASURED_KEEP:
+            _MEASURED.popitem(last=False)
+
+
+def recall(key: str) -> Spectrum | None:
+    with _MEASURED_LOCK:
+        found = _MEASURED.get(key)
+        if found is not None:
+            _MEASURED.move_to_end(key)
+        return found
 
 
 # ------------------------------------------------------------------ maths

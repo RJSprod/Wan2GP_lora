@@ -284,3 +284,129 @@ def test_check_says_why_one_lora_cannot_be_baked(tmp_path, rng):
     assert "DORA" in bk.check(bk.Member(str(dora), label="Dora"), sided=False)
     assert "Dora" in bk.check(bk.Member(str(dora), label="Dora"), sided=False)
     assert bk.check(bk.Member(str(tmp_path / "gone.safetensors"), label="Gone"), sided=False).startswith("Gone")
+
+
+# ---------------------------------------------------- compression levels
+
+
+def _uneven_members(tmp_path, rng):
+    """Two LoRAs whose change is strong in one layer and faint in another,
+    with a third layer only one of them changes."""
+    a, b = tmp_path / "ua.safetensors", tmp_path / "ub.safetensors"
+    tensors_a, tensors_b = [], []
+    for module, scale in (("blocks.0.attn1.to_q", 1.0), ("blocks.0.ff.net.2", 0.02)):
+        tensors_a += _module_tensors(f"diffusion_model.{module}", *lora_pair(rng, OUT, IN, 8, scale), "F32", 8.0)
+        tensors_b += _module_tensors(f"diffusion_model.{module}", *lora_pair(rng, OUT, IN, 8, scale), "F32", 8.0)
+    tensors_b += _module_tensors("diffusion_model.blocks.1.attn2.to_k", *lora_pair(rng, OUT, IN, 4, 0.3), "F32", 4.0)
+    write_lora(a, tensors_a)
+    write_lora(b, tensors_b)
+    return a, b
+
+
+def _layer_kept(spectrum, ranks):
+    return [float(np.sum(values[:spectrum.capped(index, k)])) / float(np.sum(values))
+            for index, (values, k) in enumerate(zip(spectrum.energies, ranks)) if np.sum(values) > 0]
+
+
+def test_measuring_finds_each_layers_singular_values(tmp_path, rng):
+    a, b = _two_members(tmp_path, rng, alpha_a=8.0, alpha_b=None, header_b="4")
+    plan = bk.plan([bk.Member(str(a), weight=0.7), bk.Member(str(b), weight=-1.5)], sided=False)
+    spectrum = bk.analyze(plan)
+    expected = _sum(_scaled(_dense(a), 0.7), _scaled(_dense(b), -1.5))
+    assert set(spectrum.keys) == set(expected)
+    for key, values in zip(spectrum.keys, spectrum.energies):
+        singular = np.linalg.svd(expected[key], compute_uv=False)
+        np.testing.assert_allclose(values, (singular ** 2)[:len(values)], rtol=1e-4, atol=1e-9)
+        assert np.sum(values) == pytest.approx(np.sum(singular ** 2), rel=1e-5)
+
+
+def test_a_level_keeps_its_share_and_no_layer_less_than_its_floor(tmp_path, rng):
+    a, b = _uneven_members(tmp_path, rng)
+    spectrum = bk.analyze(bk.plan([bk.Member(str(a)), bk.Member(str(b))], sided=False))
+    for _, _, quality in bk.LEVELS:
+        kept = quality / 1000
+        ranks = bk.allocate(spectrum, kept)
+        assert spectrum.kept(ranks) >= kept - 1e-9
+        assert min(_layer_kept(spectrum, ranks)) >= bk.floor_for(kept) - 1e-9
+        # The fewest directions that do it: one less anywhere falls short of
+        # the share, or of that layer's floor.
+        for index, k in enumerate(ranks):
+            if k == 0:
+                continue
+            fewer = list(ranks)
+            fewer[index] -= 1
+            short = spectrum.kept(fewer) < kept - 1e-12
+            values = spectrum.energies[index]
+            starved = np.sum(values[:fewer[index]]) < bk.floor_for(kept) * np.sum(values) * (1 - 1e-9)
+            assert short or starved
+
+
+def test_a_rank_per_layer_is_smaller_than_one_rank_for_the_same_share(tmp_path, rng):
+    a, b = _uneven_members(tmp_path, rng)
+    spectrum = bk.analyze(bk.plan([bk.Member(str(a)), bk.Member(str(b))], sided=False))
+    for kept in (0.95, 0.99, 0.999):
+        chosen = bk.allocate(spectrum, kept)
+        # The smallest single rank that keeps as much.
+        uniform = next(spectrum.uniform(rank) for rank in range(1, 33)
+                       if spectrum.kept(spectrum.uniform(rank)) >= spectrum.kept(chosen) - 1e-12)
+        assert spectrum.size(chosen) < spectrum.size(uniform)
+    # The faint layer is the one that gives way.
+    ranks = dict(zip(spectrum.keys, bk.allocate(spectrum, 0.99)))
+    strong, faint = (key for key in spectrum.keys if key.endswith(("attn1_to_q", "ff_net_2")))
+    assert ranks[faint] < ranks[strong]
+
+
+def test_a_rank_per_layer_bakes_exactly_what_was_predicted(tmp_path, rng):
+    a, b = _uneven_members(tmp_path, rng)
+    plan = bk.plan([bk.Member(str(a), weight=0.8), bk.Member(str(b), weight=0.6)], sided=False)
+    spectrum = bk.analyze(plan)
+    ranks = bk.allocate(spectrum, 0.99)
+    out = tmp_path / "levelled.safetensors"
+    result = bk.bake(plan, 0, str(out), ranks=spectrum.ranks_by_key(ranks))
+    assert result.kept == pytest.approx(spectrum.kept(ranks), rel=1e-6)
+    assert result.bytes == spectrum.size(ranks) == sum(tensor.nbytes for tensor in lf.read_header(str(out)).tensors)
+    assert result.rank == max(spectrum.capped(index, k) for index, k in enumerate(ranks))
+    expected = _sum(_scaled(_dense(a), 0.8), _scaled(_dense(b), 0.6))
+    got = _dense(out)
+    for key, k in spectrum.ranks_by_key(ranks).items():
+        singular = np.linalg.svd(expected[key], compute_uv=False)
+        error = np.linalg.norm(got[key] - expected[key])
+        assert error == pytest.approx(np.sqrt(np.sum(singular[k:] ** 2)), rel=1e-3, abs=1e-6)
+        # Each layer has its own rank in the file.
+        assert np.linalg.matrix_rank(got[key], tol=1e-6) <= k
+
+
+def test_predictions_give_each_level_beside_the_old_size_and_now(tmp_path, rng):
+    a, b = _uneven_members(tmp_path, rng)
+    plan = bk.plan([bk.Member(str(a)), bk.Member(str(b))], sided=False)
+    spectrum = bk.analyze(plan)
+    found = bk.predictions([spectrum, spectrum])
+    assert [level["key"] for level in found["levels"]] == ["low", "medium", "high"]
+    sizes = [level["bytes"] for level in found["levels"]]
+    assert sizes == sorted(sizes, reverse=True)
+    for level in found["levels"]:
+        assert level["kept"] >= level["quality"] / 1000 - 1e-9
+    # Matching the highest-rank member, as a bake was sized before.
+    assert found["matched"]["rank"] == plan.default_rank == 8
+    assert found["matched"]["bytes"] == 2 * plan.size_for(8)
+    assert found["matched"]["kept"] == pytest.approx(spectrum.kept(spectrum.uniform(8)))
+    assert found["exact"]["bytes"] == 2 * plan.size_for(plan.combined_rank)
+
+
+def test_a_measurement_is_reused_only_for_the_same_files_and_strengths(tmp_path, rng):
+    a, b = _two_members(tmp_path, rng)
+    key = bk.measure_key([bk.Member(str(a)), bk.Member(str(b))], sided=False)
+    assert key == bk.measure_key([bk.Member(str(a)), bk.Member(str(b))], sided=False)
+    others = [
+        bk.measure_key([bk.Member(str(a), weight=0.5), bk.Member(str(b))], sided=False),
+        bk.measure_key([bk.Member(str(a), mode="visual"), bk.Member(str(b))], sided=False),
+        bk.measure_key([bk.Member(str(b)), bk.Member(str(a))], sided=False),
+        bk.measure_key([bk.Member(str(a)), bk.Member(str(b))], sided=True),
+    ]
+    assert key not in others and len(set(others)) == len(others)
+    spectrum = bk.analyze(bk.plan([bk.Member(str(a)), bk.Member(str(b))], sided=False))
+    bk.remember(key, spectrum)
+    assert bk.recall(key) is spectrum
+    # The file changing on disk is a new measurement.
+    write_lora(a, _module_tensors("diffusion_model.blocks.0.attn1.to_q", *lora_pair(rng, OUT, IN, 4)))
+    assert bk.measure_key([bk.Member(str(a)), bk.Member(str(b))], sided=False) != key

@@ -20,8 +20,12 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from . import bake as bk
+from . import derived as dv
 from . import lora_files as lf
 from .derived import Store
+
+#: A measurement's job key: never a file's id.
+MEASURE = "measure:"
 
 
 @dataclass
@@ -220,21 +224,36 @@ def _link(source: str, target: str) -> bool:
         return False
 
 
-def bake_job(store: Store, derived_id: str, members: list[tuple], rank: int,
+def bake_job(store: Store, derived_id: str, members: list[tuple], size,
              sided: bool, label: str, shrunk: bool = False, track: str = "") -> Job:
-    """A group baked into one file.  ``members`` is
+    """A group baked into one file at ``size``: a rank for every layer, or a
+    compression level (``q990``), each layer at the rank that keeps that
+    share of the combined change in the fewest bytes.  ``members`` is
     ``(original id, path, mode, display name[, weight])`` per LoRA: a shrunk
     group's members carry what each brings, and its recipe says it is one."""
     members = [tuple(member) + ((1.0,) if len(member) < 5 else ()) for member in members]
+    rank, quality = dv.size_parts(size)
 
     def work(report) -> None:
-        plan = bk.plan([bk.Member(path, mode, name, float(weight)) for _, path, mode, name, weight in members],
-                       sided=sided)
+        bake_members = [bk.Member(path, mode, name, float(weight)) for _, path, mode, name, weight in members]
+        plan = bk.plan(bake_members, sided=sided)
         stamps = [store.source_stamp(lora_id) for lora_id, _, _, _, _ in members]
+        meta = {"lora_browser_members": ", ".join(name for _, _, _, name, _ in members)}
+        ranks, start = None, 0.0
+        if quality:
+            # Measured when the dialog asked, or now: the first part of the work.
+            key = bk.measure_key(bake_members, sided)
+            spectrum = bk.recall(key)
+            if spectrum is None:
+                spectrum = bk.analyze(plan, progress=lambda done, total: report(0.3 * done / total if total else 0.3))
+                bk.remember(key, spectrum)
+                start = 0.3
+            ranks = spectrum.ranks_by_key(bk.allocate(spectrum, quality / 1000))
+            meta["lora_browser_quality"] = f"{quality / 10:g}%"
         result = bk.bake(
-            plan, rank, store.write_path(derived_id),
-            {"lora_browser_members": ", ".join(name for _, _, _, name, _ in members)},
-            progress=lambda done, total: report(done / total if total else 1.0),
+            plan, rank, store.write_path(derived_id), meta,
+            progress=lambda done, total: report(start + (1 - start) * (done / total if total else 1.0)),
+            ranks=ranks,
         )
         listed = []
         for lora_id, _, mode, name, weight in members:
@@ -247,10 +266,26 @@ def bake_job(store: Store, derived_id: str, members: list[tuple], rank: int,
             "sources": stamps, "members": listed,
             "bytes": os.path.getsize(store.write_path(derived_id)), "label": label,
         }
+        if quality:
+            entry["quality"] = quality
         if shrunk:
             entry["shrink"] = True
         if track:
             entry["track"] = track
         store.record(derived_id, entry)
 
-    return Job(key=derived_id, label=f"{label}, baked at rank {int(rank)}", work=work, store=store)
+    how = f"{bk.level_of(quality)[1].lower()}" if quality else f"baked at rank {int(rank)}"
+    return Job(key=derived_id, label=f"{label}, {how}", work=work, store=store)
+
+
+def measure_job(key: str, members: list[bk.Member], sided: bool, label: str) -> Job:
+    """Measure what a file of these members would keep at every size, for
+    the dialogs, before anything is built."""
+
+    def work(report) -> None:
+        if bk.recall(key) is not None:
+            return
+        plan = bk.plan(members, sided=sided)
+        bk.remember(key, bk.analyze(plan, progress=lambda done, total: report(done / total if total else 1.0)))
+
+    return Job(key=MEASURE + key, label=f"Measuring {label}", work=work)
