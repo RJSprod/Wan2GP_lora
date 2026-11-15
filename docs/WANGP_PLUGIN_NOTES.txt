@@ -623,6 +623,33 @@ ALWAYS RUN THE NEGATIVE TEST
   per file with the other phases' chips locked, and the list's phase cells
   come from each phase's own file.
 
+  Compression levels: a bake's size is r<rank> (one rank in every layer, as
+  before; "Exact" is r<combined rank>) or q<per mille> (bake.LEVELS: low 999,
+  medium 990, high 950), in the id (<hash>.q990[.track].safetensors), the
+  stack text tag ("baked 99%"), profiles (a rank stays a number, a level is
+  "q990") and recipes. bake.analyze(plan) measures each layer's squared
+  singular values from the Gram matrices U^T U and V V^T (R x R, R the summed
+  member ranks; dW is never formed) -- ~10x cheaper than the build's QR+SVD.
+  bake.allocate(spectrum, kept) gives each layer the fewest directions that
+  keep floor_for(kept) = 1 - 5*(1 - kept) of its own energy, then adds
+  directions across all layers by energy per byte ((out+in)*width) until the
+  whole keeps `kept`; bake.bake(..., ranks={layer: k}) writes a rank per layer
+  (mmgp reads each layer's rank from its lora_A shape, offload.py rank =
+  lora_A.shape[0], alpha/rank per layer). Measurements are keyed by
+  measure_key (paths with size+mtime, modes, weights, sided) and kept in an
+  in-process LRU (bk.remember/recall); a second Builder (plugin._measurer)
+  runs bd.measure_job so measuring never waits behind a build. The bake
+  dialog sends the bake_plan action (live stack, so a shrunk group's weights
+  count) and gets instance.bake_report in the payload; the Shrink plan gives
+  each bundle file a measure key; both dialogs then poll the "measure" media
+  request ({sets: {name: [keys]}} -> per set: measuring with pct, failed, or
+  bk.predictions: each level's kept share and bytes, "matched" -- the old
+  highest-member-rank size -- and "exact"). A lost measurement (LRU evicted,
+  restart) is reported in "lost" and the dialog asks for its plan again. A
+  quality bake job reuses the measurement or measures first (first 30% of
+  its progress). The level picked is saved as metadata "compression" and is
+  the default for the next Shrink and Bake.
+
   The open editor is laid out with container queries on .lb-rows (and on the
   full-screen sheet's body), never media queries: the panel is one column of
   WanGP's page, so the window's width says nothing about the room an editor

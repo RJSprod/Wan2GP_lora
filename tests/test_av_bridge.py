@@ -13,6 +13,7 @@ import pytest
 
 from lora_browser import builder as bd
 from lora_browser import derived as dv
+from lora_browser import lora_files as lf
 from tests.lora_fixtures import lora_pair, read_tensors, write_lora
 from tests.test_plugin_bridge import H3_MODEL_DEF, plugin_module
 
@@ -26,6 +27,16 @@ class SyncBuilder(bd.Builder):
 
     def submit(self, job, start=True):
         return super().submit(job, start=False)
+
+
+class EagerBuilder(bd.Builder):
+    """Runs each job the moment it is queued, on the caller's thread: a
+    measurement is ready by the time the request that asked for it returns."""
+
+    def submit(self, job, start=True):
+        queued = super().submit(job, start=False)
+        self.run_pending()
+        return queued
 
 
 def _write(path, modules, rank, seed):
@@ -59,6 +70,7 @@ def plugin(tmp_path, loras, monkeypatch):
     instance.get_lora_dir = lambda model_type: str(loras)
     instance._init_stores()
     instance._builder = SyncBuilder()
+    instance._measurer = EagerBuilder()
     return instance
 
 
@@ -231,10 +243,15 @@ def test_removing_a_group_row_removes_the_group(plugin, state):
 def test_bake_and_unbake(plugin, state, loras):
     text = f"0.7;0.7 0.7;0.7 1;1\n#lora_group A {BOTH}\n#lora_group A big.safetensors"
     selected = [BOTH, "big.safetensors", PICTURE]
-    plan = serve(plugin, {"kind": "bake_plan", "members": [BOTH, "big.safetensors"], "group": "A"}, state)
-    assert plan["default_rank"] == 8 and plan["combined_rank"] == 12
-    assert [option["rank"] for option in plan["options"]] == [12, 8, 4]
-    assert plan["options"][0]["exact"] and plan["options"][1]["bytes"] < plan["options"][0]["bytes"]
+    # The dialog: the group's file, read from headers, then measured.
+    _, _, payload = act(plugin, {"type": "bake_plan", "group": "A"}, state, selected, text)
+    plan = payload["bake_plan"]
+    assert (plan["group"], plan["combined_rank"], plan["files"], plan["size"]) == ("A", 12, 1, "")
+    found = serve(plugin, {"kind": "measure", "sets": {"A": plan["measures"]}}, state)["sets"]["A"]
+    assert found["state"] == "done"
+    assert [level["key"] for level in found["levels"]] == ["low", "medium", "high"]
+    assert all(level["kept"] >= level["quality"] / 1000 for level in found["levels"])
+    assert found["matched"]["rank"] == 8 and found["exact"]["bytes"] == plan["current_bytes"]
 
     choices, mults, payload = act(plugin, {"type": "bake", "group": "A", "rank": 8}, state, selected, text)
     selected = native(choices, None)
@@ -482,3 +499,54 @@ def test_a_picture_only_member_brings_nothing_to_the_sound_side(plugin, state):
     choices, _, payload = act(plugin, {"type": "group_separate", "group": "A", "value": True},
                               state, [PICTURE, v_big], "1;1 1;1" + lines)
     assert choices == {} and "no second strength" in payload["status"]
+
+
+def test_a_group_bakes_at_a_compression_level(plugin, state, loras):
+    text = f"0.7;0.7 0.7;0.7 1;1\n#lora_group A {BOTH}\n#lora_group A big.safetensors"
+    selected = [BOTH, "big.safetensors", PICTURE]
+    _, _, payload = act(plugin, {"type": "bake_plan", "group": "A"}, state, selected, text)
+    found = serve(plugin, {"kind": "measure", "sets": {"A": payload["bake_plan"]["measures"]}}, state)["sets"]["A"]
+    medium = next(level for level in found["levels"] if level["key"] == "medium")
+
+    choices, mults, payload = act(plugin, {"type": "bake", "group": "A", "quality": 990}, state, selected, text)
+    bake_id = native(choices, None)[0]
+    assert dv.parse(bake_id).quality == 990 and dv.parse(bake_id).rank == 0
+    assert "medium compression" in payload["status"]
+    build_all(plugin)
+    info = payload_of(plugin, state, native(choices, None), native(mults, None))["active"][0]["bake"]
+    # It keeps what was predicted, in the bytes predicted.
+    assert info["state"] == "built" and info["quality"] == 990
+    assert info["kept"] == pytest.approx(medium["kept"], rel=1e-6)
+    assert sum(tensor.nbytes for tensor in lf.read_header(str(loras / bake_id)).tensors) == medium["bytes"]
+    # Only a level's share, or a rank, is a size to bake at.
+    _, _, payload = act(plugin, {"type": "bake", "group": "A", "quality": 970}, state, selected, text)
+    assert payload["status"] == "Choose how much to compress it."
+
+
+def test_bake_and_shrink_default_to_the_level_last_picked(plugin, state, loras):
+    text = f"0.7;0.7 0.7;0.7 1;1\n#lora_group A {BOTH}\n#lora_group A big.safetensors"
+    selected = [BOTH, "big.safetensors", PICTURE]
+    _, _, payload = act(plugin, {"type": "view", "value": "list"}, state, selected, text)
+    assert payload["compression"] == "low"
+    assert [level["quality"] for level in payload["levels"]] == [999, 990, 950]
+    _, _, payload = act(plugin, {"type": "compression", "value": "high"}, state, selected, text)
+    assert payload["compression"] == "high" and plugin._metadata.compression == "high"
+    choices, _, _ = act(plugin, {"type": "bake", "group": "A"}, state, selected, text)
+    assert dv.parse(native(choices, None)[0]).quality == 950
+    _, _, payload = act(plugin, {"type": "compression", "value": "nonsense"}, state, selected, text)
+    assert payload["compression"] == "low"
+
+
+def test_measuring_reports_progress_until_it_is_done(plugin, state, loras):
+    plugin._measurer = SyncBuilder()
+    text = f"0.7;0.7 0.7;0.7 1;1\n#lora_group A {BOTH}\n#lora_group A big.safetensors"
+    selected = [BOTH, "big.safetensors", PICTURE]
+    _, _, payload = act(plugin, {"type": "bake_plan", "group": "A"}, state, selected, text)
+    keys = payload["bake_plan"]["measures"]
+    found = serve(plugin, {"kind": "measure", "sets": {"A": keys}}, state)
+    assert found["sets"]["A"] == {"state": "measuring", "pct": 0} and found["lost"] == []
+    plugin._measurer.run_pending()
+    assert serve(plugin, {"kind": "measure", "sets": {"A": keys}}, state)["sets"]["A"]["state"] == "done"
+    # A measurement nobody asked for is lost: the dialog asks again.
+    found = serve(plugin, {"kind": "measure", "sets": {"B": ["0" * 16]}}, state)
+    assert found["sets"]["B"]["state"] == "measuring" and found["lost"] == ["B"]

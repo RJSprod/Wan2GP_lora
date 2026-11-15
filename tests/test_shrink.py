@@ -29,9 +29,14 @@ def plan_of(plugin, state, selected, text):
     return payload["shrink_plan"]
 
 
-def shrink(plugin, state, selected, text):
-    choices, mults, payload = act(plugin, {"type": "shrink"}, state, selected, text)
+def shrink(plugin, state, selected, text, **extra):
+    choices, mults, payload = act(plugin, dict({"type": "shrink"}, **extra), state, selected, text)
     return native(choices, selected), native(mults, text), payload
+
+
+def _files(bundle):
+    """A bundle's files as phase and multiplier, without their measurement keys."""
+    return [{"phase": item["phase"], "token": item["token"]} for item in bundle["files"]]
 
 
 def _weighted(*parts):
@@ -89,7 +94,8 @@ def test_shrinking_writes_shrunk_groups_that_build_and_unshrink(plugin, state, l
     selected, text, payload = shrink(plugin, state, [BOTH, PICTURE, SOUND, BIG],
                                      f"0.7;0.7 0.5;0.5 {SCHEDULE} {SCHEDULE}")
     flat, shaped = selected
-    assert dv.parse(flat).rank == 4 and dv.parse(shaped).rank == 8
+    # At the remembered compression level: low, keeping 99.9%.
+    assert dv.parse(flat).quality == dv.parse(shaped).quality == 999
     lines = text.splitlines()
     assert lines[0] == f"1;1 {SCHEDULE}"
     assert lines[1:] == [
@@ -98,7 +104,7 @@ def test_shrinking_writes_shrunk_groups_that_build_and_unshrink(plugin, state, l
         f"#lora_weight A 0.7 {BOTH}", f"#lora_weight A 0.5 {PICTURE}",
         f"#lora_weight B 1 {SOUND}", f"#lora_weight B 1 {BIG}",
     ]
-    assert payload["status"].startswith("Shrinking 4 LoRAs into 2 files.")
+    assert payload["status"].startswith("Shrinking 4 LoRAs into 2 files at low compression")
     rows = payload["active"]
     assert [(row["name"], row["shrink"], row["bake"]["state"]) for row in rows] == [
         ("Shrunk A", True, "queued"), ("Shrunk B", True, "queued")]
@@ -107,9 +113,8 @@ def test_shrinking_writes_shrunk_groups_that_build_and_unshrink(plugin, state, l
     build_all(plugin)
     assert os.path.isfile(loras / flat) and os.path.isfile(loras / shaped)
     rows = payload_of(plugin, state, selected, text)["active"]
-    assert rows[0]["bake"]["state"] == "built" and 0 < rows[0]["bake"]["kept"] < 1
-    # No module of the scheduled two needs more than rank 8: nothing lost.
-    assert rows[1]["bake"]["exact"]
+    assert rows[0]["bake"]["state"] == "built" and rows[0]["bake"]["kept"] >= 0.999
+    assert rows[1]["bake"]["kept"] >= 0.999
 
     # Unshrinking: each LoRA again, at the strength it had.
     choices, mults, payload = act(plugin, {"type": "unshrink", "group": "A"}, state, selected, text)
@@ -197,10 +202,10 @@ def test_profiles_and_stack_text_keep_what_each_brings(plugin, state):
     selected, text, payload = shrink(plugin, state, [BOTH, PICTURE, SOUND, BIG],
                                      f"0.7;0.7 0.5;0.5 {SCHEDULE} {SCHEDULE}")
     assert payload["stack_text"].splitlines() == [
-        "both [group A, baked r4, weight 0.7]: x1;1",
-        "picture [group A, baked r4, weight 0.5]: x1;1",
-        f"sound [group B, baked r8, weight 1]: x{SCHEDULE}",
-        f"big [group B, baked r8, weight 1]: x{SCHEDULE}",
+        "both [group A, baked 99.9%, weight 0.7]: x1;1",
+        "picture [group A, baked 99.9%, weight 0.5]: x1;1",
+        f"sound [group B, baked 99.9%, weight 1]: x{SCHEDULE}",
+        f"big [group B, baked 99.9%, weight 1]: x{SCHEDULE}",
     ]
     choices, mults, _ = act(plugin, {"type": "stack_paste", "text": payload["stack_text"]}, state, [SOUND], "1;1")
     assert native(choices, None) == selected and native(mults, None) == text
@@ -338,7 +343,8 @@ def test_a_lora_wangp_knows_by_name_stays_out_of_a_shrink(plugin, ic_state):
 
 def test_a_group_holding_one_is_not_baked(plugin, ic_state):
     text = f"0.7;0.7 0.7;0.7\n#lora_group A {BOTH}\n#lora_group A {IC}"
-    plan = serve(plugin, {"kind": "bake_plan", "members": [BOTH, IC], "group": "A"}, ic_state)
+    _, _, payload = act(plugin, {"type": "bake_plan", "group": "A"}, ic_state, [BOTH, IC], text)
+    plan = payload["bake_plan"]
     assert "recognises" in plan["error"] and "ic-lora" in plan["error"]
     choices, mults, payload = act(plugin, {"type": "bake", "group": "A", "rank": 4}, ic_state, [BOTH, IC], text)
     assert "value" not in mults and payload["status_warn"] and "recognises" in payload["status"]
@@ -359,7 +365,7 @@ def test_loras_whose_phases_differ_get_a_file_per_phase(plugin, state):
     (bundle,) = plan["bundles"]
     assert (bundle["kind"], bundle["phased"], bundle["loras"], bundle["rank"]) == ("flat", True, 3, 4)
     # Phase 1's file runs in phase 1 only, phase 2's in phase 2 only.
-    assert bundle["files"] == [{"phase": 1, "token": "1;0"}, {"phase": 2, "token": "0;1"}]
+    assert _files(bundle) == [{"phase": 1, "token": "1;0"}, {"phase": 2, "token": "0;1"}]
     assert [member["weights"] for member in bundle["members"]] == [[0.8, 0.5], [0.6, 0.6], [0.7, 0.2]]
     assert (plan["files_before"], plan["files_after"]) == (3, 2)
 
@@ -435,7 +441,7 @@ def test_a_schedule_inside_a_phase(plugin, state):
     plan = plan_of(plugin, state, [BOTH, PICTURE, SOUND], tokens)
     (bundle,) = plan["bundles"]
     assert (bundle["kind"], bundle["phased"]) == ("shaped", True)
-    assert bundle["files"] == [{"phase": 1, "token": "1,1,0.5;0"}, {"phase": 2, "token": "0;1"}]
+    assert _files(bundle) == [{"phase": 1, "token": "1,1,0.5;0"}, {"phase": 2, "token": "0;1"}]
     selected, text, _ = shrink(plugin, state, [BOTH, PICTURE, SOUND], tokens)
     assert text.splitlines()[0] == "1,1,0.5;0 0;1"
     _, mults, _ = act(plugin, {"type": "unshrink", "group": "A"}, state, selected, text)
@@ -451,15 +457,15 @@ def test_a_file_per_phase_is_made_only_where_it_means_fewer_files(plugin, state)
     # One phase with nothing in it: one file for the two.
     plan = plan_of(plugin, state, [BOTH, PICTURE], "0.8;0 0.6;0")
     (bundle,) = plan["bundles"]
-    assert bundle["files"] == [{"phase": 1, "token": "1;0"}]
+    assert _files(bundle) == [{"phase": 1, "token": "1;0"}]
 
 
 def test_profiles_and_stack_text_keep_a_file_per_phase(plugin, state):
     selected, text, payload = shrink(plugin, state, [BOTH, PICTURE, SOUND], PHASED)
     assert payload["stack_text"].splitlines() == [
-        "both [group A, baked r4, weight 0.8;0.5]: x1;1",
-        "picture [group A, baked r4, weight 0.6;0.6]: x1;1",
-        "sound [group A, baked r4, weight 0.7;0.2]: x1;1",
+        "both [group A, baked 99.9%, weight 0.8;0.5]: x1;1",
+        "picture [group A, baked 99.9%, weight 0.6;0.6]: x1;1",
+        "sound [group A, baked 99.9%, weight 0.7;0.2]: x1;1",
     ]
     choices, mults, _ = act(plugin, {"type": "stack_paste", "text": payload["stack_text"]}, state, [SOUND], "1;1")
     assert native(choices, None) == selected and native(mults, None) == text
@@ -499,3 +505,39 @@ def test_one_phase_mode_has_one_file(plugin, state):
     selected = native(choices, None)
     assert len(selected) == 1 and dv.parse(selected[0]).track == ""
     assert "#lora_weight A 0.8 " + BOTH in native(mults, "")
+
+
+# ---------------------------------------------------- compression levels
+
+
+def test_the_plan_measures_each_file_and_shrinks_at_the_level_picked(plugin, state, loras):
+    plan = plan_of(plugin, state, [BOTH, PICTURE, SOUND], PHASED)
+    assert plan["size"] == "q999"
+    (bundle,) = plan["bundles"]
+    keys = [item["measure"] for item in bundle["files"]]
+    assert len(keys) == 2 and all(keys) and keys[0] != keys[1]
+    found = serve(plugin, {"kind": "measure", "sets": {"all": keys, "p1": keys[:1]}}, state)["sets"]
+    assert found["all"]["state"] == found["p1"]["state"] == "done"
+    high = next(level for level in found["all"]["levels"] if level["key"] == "high")
+    assert high["kept"] >= 0.95 and high["bytes"] < found["all"]["exact"]["bytes"] * 2
+
+    selected, text, payload = shrink(plugin, state, [BOTH, PICTURE, SOUND], PHASED, quality=950)
+    assert [dv.parse(value).quality for value in selected] == [950, 950]
+    assert "high compression" in payload["status"]
+    build_all(plugin)
+    bake = payload_of(plugin, state, selected, text)["active"][0]["bake"]
+    assert bake["state"] == "built" and bake["quality"] == 950
+    # Each phase's file keeps at least the level's share of its own change,
+    # and together they keep what was predicted.
+    files = bake["files"]
+    assert [item["id"] for item in files] == selected and all(item["kept"] >= 0.95 for item in files)
+    assert bake["kept"] == pytest.approx(min(item["kept"] for item in files))
+
+
+def test_a_level_survives_unshrinking_and_shrinking_again(plugin, state):
+    selected, text, _ = shrink(plugin, state, [BOTH, PICTURE, SOUND], PHASED, quality=990)
+    choices, mults, _ = act(plugin, {"type": "unshrink", "group": "A"}, state, selected, text)
+    assert native(mults, None) == PHASED
+    # Stack text and profiles carry the level.
+    _, _, payload = act(plugin, {"type": "shrink", "quality": 990}, state, native(choices, None), native(mults, None))
+    assert payload["stack_text"].splitlines()[0] == "both [group A, baked 99%, weight 0.8;0.5]: x1;1"

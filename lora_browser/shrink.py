@@ -8,7 +8,9 @@ own per schedule, each at 1, and that file runs the schedule: the sum of
 LoRAs that each follow a schedule is that sum following it.  A LoRA with no
 other on its schedule stays as it is.
 
-Each file is fitted to the rank of the highest-rank LoRA in it.  A LoRA in a
+Each file is built at a compression level (``bake.LEVELS``): the smallest
+file keeping that share of its LoRAs' combined change, each layer at a rank
+of its own -- or, given a rank, every layer at it.  A LoRA in a
 mode is baked as that mode runs it -- an audio-only LoRA brings its sound
 side, a LoRA with separate picture and sound strengths its picture half at
 the one and its sound half at the other -- and its two halves go into the
@@ -96,12 +98,17 @@ class Bundle:
 
     key: tuple
     pieces: list[Piece] = field(default_factory=list)
+    #: The rank of the highest-rank LoRA in it.
     rank: int = 0
-    #: Bytes the LoRAs' factors take now, and the baked files'.
+    #: What its files are built at: a compression level's ``q990``, or a rank.
+    size: str = ""
+    #: Bytes the LoRAs' factors take now, and the baked files' at ``rank``.
     bytes_before: int = 0
     bytes_after: int = 0
     #: How many phases a token speaks for here.
     count: int = 1
+    #: ``(track, measurement key, members)`` per file it bakes into.
+    measures: list = field(default_factory=list)
 
     @property
     def loras(self) -> int:
@@ -158,6 +165,13 @@ class Bundle:
         would be as many files as before."""
         return self.loras >= 2 and self.loras > len(self.tracks())
 
+    def measure_of(self, track: str) -> str:
+        return next((key for found, key, _ in self.measures if found == track), "")
+
+    def group(self, letter: str = "A") -> sm.Group:
+        """The shrunk group it becomes, before it has a file."""
+        return sm.Group(letter, [piece.entry for piece in self.pieces], {}, self.weights())
+
     def weights(self) -> dict[str, list[float]]:
         """What each LoRA brings: one weight, or one per phase."""
         if self.phased:
@@ -168,7 +182,9 @@ class Bundle:
         return {
             "kind": self.kind, "token": self.token, "rank": self.rank, "loras": self.loras,
             "schedule": self.schedule, "phased": self.phased,
-            "files": [{"phase": dv.phase_of(track), "token": token} for track, token in self.tracks()],
+            "size": self.size,
+            "files": [{"phase": dv.phase_of(track), "token": token, "measure": self.measure_of(track)}
+                      for track, token in self.tracks()],
             "bytes_before": self.bytes_before, "bytes_after": self.bytes_after,
             "members": [piece.to_dict() for piece in self.pieces],
         }
@@ -281,9 +297,10 @@ def _check(piece: Piece, files, capacity: int) -> None:
 # -------------------------------------------------------------------- plan
 
 
-def plan(stack, files, capacity: int = 1) -> Plan:
+def plan(stack, files, capacity: int = 1, size="") -> Plan:
     """What a shrink would make of ``stack`` in a ``capacity``-phase run:
-    its files, and what stays."""
+    its files, each at ``size`` (a compression level's ``q990``, or a rank;
+    by default the rank of the highest-rank LoRA in it), and what stays."""
     pieces, loaded = collect(stack, files)
     for piece in pieces:
         _check(piece, files, capacity)
@@ -338,6 +355,12 @@ def plan(stack, files, capacity: int = 1) -> Plan:
             bundle.rank = baked.default_rank or baked.combined_rank
         bundle.bytes_before = baked.size_for(baked.combined_rank)
         bundle.bytes_after = baked.size_for(bundle.rank) * len(bundle.tracks())
+        bundle.size = dv.size_tag(size) or dv.size_tag(bundle.rank)
+        group = bundle.group()
+        for track, _ in bundle.tracks():
+            members = files.bake_members(group, track)
+            if members is not None and len(members) >= 2:
+                bundle.measures.append((track, bk.measure_key(members, files.sided), members))
     result.bundles = [bundle for bundle in listed if bundle.pieces][:len(sm.LETTERS)]
     taken = {id(piece) for bundle in result.bundles for piece in bundle.pieces}
     result.kept = [piece for piece in pieces if id(piece) not in taken]
@@ -373,8 +396,8 @@ def apply(stack, result: Plan, files) -> dict[str, list[str]]:
     for index, bundle in enumerate(result.bundles):
         if not letters:
             break
-        group = sm.Group(letters[0], [piece.entry for piece in bundle.pieces], {}, bundle.weights())
-        ids = files.bake_ids(group, bundle.rank)
+        group = bundle.group(letters[0])
+        ids = files.bake_ids(group, bundle.size or bundle.rank)
         placed_files = [(ids[track], token) for track, token in bundle.tracks() if ids.get(track)]
         if placed_files:
             letter = letters.pop(0)

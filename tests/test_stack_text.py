@@ -153,11 +153,15 @@ class TestWritingTheStackOut:
 
 
 @pytest.mark.parametrize("line,name,mode,group,baked", [
-    ("Vocal_Enhance_1 [audio]: x0,0.3;0", "Vocal_Enhance_1", "audio", "", 0),
-    ("Body [group A, baked r32]: x1;0.25", "Body", "", "A", 32),
-    ("Skin [visual, group b, baked 16]: x1", "Skin", "visual", "B", 16),
-    ("Detail [v2]: x1", "Detail [v2]", "", "", 0),          # not tags: part of the name
-    ("Detail [visual] extra: x1", "Detail [visual] extra", "", "", 0),
+    ("Vocal_Enhance_1 [audio]: x0,0.3;0", "Vocal_Enhance_1", "audio", "", ""),
+    ("Body [group A, baked r32]: x1;0.25", "Body", "", "A", "r32"),
+    ("Skin [visual, group b, baked 16]: x1", "Skin", "visual", "B", "r16"),
+    # A compression level: the share of the group's change it keeps.
+    ("Lean [group A, baked 99.9%]: x1", "Lean", "", "A", "q999"),
+    ("Lean [group A, baked 95 %]: x1", "Lean", "", "A", "q950"),
+    ("Detail [v2]: x1", "Detail [v2]", "", "", ""),          # not tags: part of the name
+    ("Detail [visual] extra: x1", "Detail [visual] extra", "", "", ""),
+    ("Odd [group A, baked 100%]: x1", "Odd [group A, baked 100%]", "", "", ""),
 ])
 def test_tags_come_off_the_name(line, name, mode, group, baked):
     parsed = st.parse(line)[0]
@@ -169,3 +173,6 @@ def test_tags_text():
     assert st.tags_text("normal", "", 0) == ""
     assert st.tags_text("audio", "A", 32) == " [audio, group A, baked r32]"
     assert st.tags_text("", "", 32) == ""          # a bake belongs to a group
+    assert st.tags_text("", "A", "q999") == " [group A, baked 99.9%]"
+    assert st.tags_text("", "A", "q990", 0.7) == " [group A, baked 99%, weight 0.7]"
+    assert st.tags_text("", "A", "r8") == " [group A, baked r8]"

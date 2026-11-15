@@ -2335,6 +2335,12 @@ body.lb-scroll-locked {
 .__NS__ .lb-shrink-runs { margin: 4px 0 0; font-size: 12.5px; color: var(--lb-muted); }
 .__NS__ .lb-shrink-runs code { overflow-wrap: anywhere; }
 .__NS__ .lb-shrink-phase + .lb-shrink-phase { margin-top: 2px; }
+/* Compression: the levels, each measured -- share kept and size -- before
+   anything is built. */
+.__NS__ .lb-shrink-levels { margin: 10px 0 12px; }
+.__NS__ .lb-shrink-levels-head { margin: 0 0 4px; }
+.__NS__ .lb-measure { margin: 2px 0 6px; font-size: 12.5px; }
+.__NS__ .lb-matched { margin-top: 6px; }
 .__NS__ .lb-shrink-list {
   margin: 6px 0 0;
   padding: 0;
