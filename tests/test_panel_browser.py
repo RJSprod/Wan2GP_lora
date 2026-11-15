@@ -1590,6 +1590,8 @@ AV_SELECTED = list(AV_LORAS)
 AV_MULTIPLIERS = "0.8;0.5 0.6;0.6 0.7;0.7 1,1,0.875,0.875,0.25,0.25,0,0;0"
 #: Three at one strength, and one on a schedule no other runs.
 SHRINK_MULTIPLIERS = "0.8;0.8 0.6;0.6 0.7;0.7 1,1,0.875,0.875,0.25,0.25,0,0;0"
+#: Three whose strengths differ from phase to phase, and the scheduled one.
+PHASE_SHRINK_MULTIPLIERS = "0.8;0.5 0.6;0.6 0.3;0.7 1,1,0.875,0.875,0.25,0.25,0,0;0"
 
 
 @pytest.fixture(scope="module")
@@ -1852,6 +1854,74 @@ class TestListView:
         assert host.selected == list(AV_SELECTED)
         assert host.multipliers.split("\n")[0] == SHRINK_MULTIPLIERS
         assert page.locator(".lb-li-ghead").count() == 0
+        assert problems == []
+
+    def test_shrink_bakes_a_file_per_phase_where_strengths_differ(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host, PHASE_SHRINK_MULTIPLIERS)
+        page.locator('[data-lb="shrink"]').click()
+        page.wait_for_selector(".lb-dialog .lb-shrink-file", timeout=5000)
+        dialog = page.locator(".lb-dialog")
+        lead = dialog.locator(".lb-shrink-lead").inner_text()
+        assert lead.startswith("3 LoRAs into 2 files") and "WanGP loads 3 files instead of 4" in lead
+        assert dialog.locator(".lb-shrink-head strong").inner_text() == "One strength in each phase"
+        assert "3 LoRAs → 2 files, one per phase, rank 8" in dialog.locator(".lb-shrink-head").inner_text()
+        assert dialog.locator(".lb-shrink-phase").all_text_contents() == [
+            "Phase 1's file runs 1;0 · phase 1 only", "Phase 2's file runs 0;1 · phase 2 only"]
+        assert dialog.locator(".lb-shrink-file .lb-shrink-detail").all_text_contents() == [
+            "phase 1 0.8, phase 2 0.5", "phase 1 0.6, phase 2 0.6", "phase 1 0.3, phase 2 0.7"]
+        # These tiny LoRAs share few layers: two files at rank 8 outweigh them.
+        assert "once per phase" in dialog.locator(".lb-shrink-more").inner_text()
+        assert host.multipliers == PHASE_SHRINK_MULTIPLIERS
+
+        dialog.locator("button.lb-primary", has_text="Shrink 3 LoRAs").click()
+        settle(page, 800)
+        first, second, rest = host.selected
+        assert first.endswith(".r8.p1.safetensors") and second.endswith(".r8.p2.safetensors")
+        assert rest == "sched.safetensors"
+        tokens = tokens_by_lora(host)
+        assert (tokens[first], tokens[second]) == ("1;0", "0;1")
+        assert "#lora_weight A 0.8;0.5 both.safetensors" in host.multipliers
+        head = page.locator(".lb-li-ghead")
+        assert "3 LoRAs in a file per phase" in head.inner_text()
+        # Each phase's cell shows what that phase's own file runs.
+        assert head.locator(".lb-li-ph").all_text_contents() == ["1", "1"]
+        assert page.locator(".lb-li-member .lb-li-shared").all_text_contents() == [
+            "baked in at P1 0.8, P2 0.5", "baked in at P1 0.6, P2 0.6", "baked in at P1 0.3, P2 0.7"]
+        wait_until_built(page, host)
+        assert head.locator(".lb-bake-pill").inner_text().startswith("Shrunk r8")
+
+        page.locator(".lb-li-ghead .lb-li-name").click()
+        settle(page, 300)
+        editor = page.locator(".lb-li-editor")
+        sections = editor.locator(".lb-track-phase")
+        assert sections.locator(".lb-track-name").all_text_contents() == ["Phase 1 file", "Phase 2 file"]
+        # A phase's file is edited in its own phase; the other is locked at 0.
+        own = sections.nth(0).locator(".lb-phase-strip .lb-chip")
+        assert "lb-on" in own.nth(0).get_attribute("class") and own.nth(1).is_disabled()
+        other = sections.nth(1).locator(".lb-phase-strip .lb-chip")
+        assert other.nth(0).is_disabled() and "lb-on" in other.nth(1).get_attribute("class")
+        assert "WanGP loads a file per phase" in editor.locator(".lb-load").inner_text()
+
+        # Phase 1's file takes a pasted schedule in phase 1 only.
+        line(page, "sched.safetensors").locator(".lb-li-name").click()
+        settle(page, 300)
+        page.locator(".lb-li-editor button.lb-clip-copy").click()
+        page.locator(".lb-li-ghead .lb-li-name").click()
+        settle(page, 300)
+        page.locator(".lb-li-editor .lb-track-phase").nth(0).locator("button.lb-clip-paste").click()
+        settle(page, 800)
+        tokens = tokens_by_lora(host)
+        assert (tokens[first], tokens[second]) == ("1,1,0.875,0.875,0.25,0.25,0,0;0", "0;1")
+        assert "stays 0 in the others" in page.locator('[data-lb="status"]').inner_text()
+
+        # Unshrunk, each LoRA runs phase 1's schedule at its phase 1 weight,
+        # and phase 2 as it did.
+        page.locator(".lb-li-editor button.lb-unshrink").first.click()
+        settle(page, 800)
+        assert host.selected == list(AV_SELECTED)
+        assert tokens_by_lora(host)["both.safetensors"] == "0.8,0.8,0.7,0.7,0.2,0.2,0,0;0.5"
+        assert tokens_by_lora(host)["sound.safetensors"].endswith(";0.7")
         assert problems == []
 
     def test_a_deleted_built_file_leaves_its_recipe(self, av_panel):

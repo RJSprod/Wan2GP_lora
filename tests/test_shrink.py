@@ -49,7 +49,8 @@ def test_the_plan_bakes_one_strengths_together_and_each_shared_schedule_apart(pl
     plan = plan_of(plugin, state, [BOTH, PICTURE, SOUND, BIG], f"0.7;0.7 0.5 {SCHEDULE} {SCHEDULE}")
     flat, shaped = plan["bundles"]
     # One strength: baked in at it, the file at 1, the rank of the best LoRA in it.
-    assert (flat["kind"], flat["token"], flat["rank"], flat["loras"]) == ("flat", "1", 4, 2)
+    assert (flat["kind"], flat["token"], flat["rank"], flat["loras"]) == ("flat", "1;1", 4, 2)
+    assert not flat["phased"] and [file["phase"] for file in flat["files"]] == [0]
     assert [(member["id"], member["weight"]) for member in flat["members"]] == [(BOTH, 0.7), (PICTURE, 0.5)]
     # A schedule two share: baked in at 1, the file runs the schedule.
     assert (shaped["kind"], shaped["token"], shaped["rank"]) == ("shaped", SCHEDULE, 8)
@@ -341,3 +342,160 @@ def test_a_group_holding_one_is_not_baked(plugin, ic_state):
     assert "recognises" in plan["error"] and "ic-lora" in plan["error"]
     choices, mults, payload = act(plugin, {"type": "bake", "group": "A", "rank": 4}, ic_state, [BOTH, IC], text)
     assert "value" not in mults and payload["status_warn"] and "recognises" in payload["status"]
+
+
+# ------------------------------------------------------- a file per phase
+
+#: Three LoRAs whose phases differ: one file per phase, each holding all three.
+PHASED = "0.8;0.5 0.6;0.6 0.7;0.2"
+
+
+def _phase_files(selected):
+    return [dv.parse(value).track for value in selected]
+
+
+def test_loras_whose_phases_differ_get_a_file_per_phase(plugin, state):
+    plan = plan_of(plugin, state, [BOTH, PICTURE, SOUND], PHASED)
+    (bundle,) = plan["bundles"]
+    assert (bundle["kind"], bundle["phased"], bundle["loras"], bundle["rank"]) == ("flat", True, 3, 4)
+    # Phase 1's file runs in phase 1 only, phase 2's in phase 2 only.
+    assert bundle["files"] == [{"phase": 1, "token": "1;0"}, {"phase": 2, "token": "0;1"}]
+    assert [member["weights"] for member in bundle["members"]] == [[0.8, 0.5], [0.6, 0.6], [0.7, 0.2]]
+    assert (plan["files_before"], plan["files_after"]) == (3, 2)
+
+    selected, text, payload = shrink(plugin, state, [BOTH, PICTURE, SOUND], PHASED)
+    assert _phase_files(selected) == ["p1", "p2"]
+    lines = text.splitlines()
+    assert lines[0] == "1;0 0;1"
+    assert lines[1:4] == [f"#lora_group A {BOTH}", f"#lora_group A {PICTURE}", f"#lora_group A {SOUND}"]
+    assert f"#lora_weight A 0.8;0.5 {BOTH}" in lines and f"#lora_weight A 0.7;0.2 {SOUND}" in lines
+    assert payload["status"].startswith("Shrinking 3 LoRAs into 2 files (a file per phase")
+    (row,) = payload["active"]
+    assert (row["name"], row["shrink"]) == ("Shrunk A", True)
+    assert [(track["pinned_phase"], track["multiplier_raw"]) for track in row["phase_tracks"]] == [(1, "1;0"), (2, "0;1")]
+    assert row["group_token"] == "1;1"
+    assert [member["weights"] for member in row["members"]] == [[[0.8, 0.5]], [[0.6, 0.6]], [[0.7, 0.2]]]
+
+
+def test_each_phase_file_is_the_loras_at_that_phase_s_strengths(plugin, state, loras):
+    selected, text, _ = shrink(plugin, state, [BOTH, PICTURE, SOUND], PHASED)
+    # Every rank they have, so nothing is lost: each file exactly its phase.
+    choices, mults, _ = act(plugin, {"type": "bake", "group": "A", "rank": 8}, state, selected, text)
+    selected, text = native(choices, None), native(mults, None)
+    assert _phase_files(selected) == ["p1", "p2"] and text.splitlines()[0] == "1;0 0;1"
+    build_all(plugin)
+    for value, phase in zip(selected, (0, 1)):
+        got = effective_delta(str(loras / value), canonical=bk.canonical)
+        weights = [[0.8, 0.5], [0.6, 0.6], [0.7, 0.2]]
+        expected = _weighted(*[(loras / name, weights[index][phase])
+                               for index, name in enumerate([BOTH, PICTURE, SOUND])])
+        assert set(got) == set(expected)
+        for key, delta in expected.items():
+            np.testing.assert_allclose(got[key], delta, rtol=2e-2, atol=2e-3)
+
+
+def test_a_phase_file_never_runs_in_another_phase(plugin, state):
+    selected, text, _ = shrink(plugin, state, [BOTH, PICTURE, SOUND], PHASED)
+    p1, p2 = selected
+    # Its own phase moves...
+    _, mults, _ = act(plugin, {"type": "set_strength", "id": p1, "phase": 0, "value": 0.9}, state, selected, text)
+    assert native(mults, "").splitlines()[0] == "0.9;0 0;1"
+    # ...the other stays 0, whatever is set, pasted or typed.
+    _, mults, _ = act(plugin, {"type": "set_strength", "id": p1, "phase": 1, "value": 0.7}, state, selected, text)
+    assert "value" not in mults or native(mults, "").splitlines()[0] == "1;0 0;1"
+    _, mults, _ = act(plugin, {"type": "paste_schedule", "ids": [p2], "token": "0.7;0.3"}, state, selected, text)
+    assert native(mults, "").splitlines()[0] == "1;0 0;0.3"
+    typed = text.replace("1;0 0;1", "1;1 0.4;1", 1)
+    _, mults, _ = act(plugin, {"type": "view", "value": "list"}, state, selected, typed)
+    _, mults, _ = act(plugin, {"type": "set_strength", "id": p2, "phase": 1, "value": 0.8}, state, selected, typed)
+    assert native(mults, "").splitlines()[0] == "1;0 0;0.8"
+
+
+def test_unshrink_gives_each_lora_both_its_phases_back(plugin, state):
+    selected, text, _ = shrink(plugin, state, [BOTH, PICTURE, SOUND], PHASED)
+    choices, mults, _ = act(plugin, {"type": "unshrink", "group": "A"}, state, selected, text)
+    assert native(choices, None) == [BOTH, PICTURE, SOUND] and native(mults, None) == PHASED
+    # Phase 1's file at 0.5 halves what each brings to phase 1.
+    halved = text.replace("1;0 0;1", "0.5;0 0;1", 1)
+    _, mults, _ = act(plugin, {"type": "unshrink", "group": "A"}, state, selected, halved)
+    assert native(mults, None) == "0.4;0.5 0.3;0.6 0.35;0.2"
+
+
+def test_a_phase_nothing_brings_has_no_file(plugin, state):
+    selected, text, _ = shrink(plugin, state, [BOTH, PICTURE], "0.8;0 0.6;0")
+    assert _phase_files(selected) == ["p1"] and text.splitlines()[0] == "1;0"
+    _, mults, _ = act(plugin, {"type": "unshrink", "group": "A"}, state, selected, text)
+    assert native(mults, None) == "0.8;0 0.6;0"
+
+
+def test_a_schedule_inside_a_phase(plugin, state):
+    """The same steps in phase 1, different strengths in phase 2: a phase 1
+    file running those steps, a phase 2 file holding each LoRA's strength."""
+    tokens = "1,1,0.5;0.4 1,1,0.5;0.9 1,1,0.5;0.2"
+    plan = plan_of(plugin, state, [BOTH, PICTURE, SOUND], tokens)
+    (bundle,) = plan["bundles"]
+    assert (bundle["kind"], bundle["phased"]) == ("shaped", True)
+    assert bundle["files"] == [{"phase": 1, "token": "1,1,0.5;0"}, {"phase": 2, "token": "0;1"}]
+    selected, text, _ = shrink(plugin, state, [BOTH, PICTURE, SOUND], tokens)
+    assert text.splitlines()[0] == "1,1,0.5;0 0;1"
+    _, mults, _ = act(plugin, {"type": "unshrink", "group": "A"}, state, selected, text)
+    assert native(mults, None) == tokens
+
+
+def test_a_file_per_phase_is_made_only_where_it_means_fewer_files(plugin, state):
+    """Two LoRAs whose phases differ would be two files either way."""
+    plan = plan_of(plugin, state, [BOTH, PICTURE], "0.8;0.5 0.6;0.7")
+    assert plan["bundles"] == []
+    assert [piece["reason"] for piece in plan["kept"]] == [
+        "A file per phase would be 2 files for 2 LoRAs: no fewer than now."] * 2
+    # One phase with nothing in it: one file for the two.
+    plan = plan_of(plugin, state, [BOTH, PICTURE], "0.8;0 0.6;0")
+    (bundle,) = plan["bundles"]
+    assert bundle["files"] == [{"phase": 1, "token": "1;0"}]
+
+
+def test_profiles_and_stack_text_keep_a_file_per_phase(plugin, state):
+    selected, text, payload = shrink(plugin, state, [BOTH, PICTURE, SOUND], PHASED)
+    assert payload["stack_text"].splitlines() == [
+        "both [group A, baked r4, weight 0.8;0.5]: x1;1",
+        "picture [group A, baked r4, weight 0.6;0.6]: x1;1",
+        "sound [group A, baked r4, weight 0.7;0.2]: x1;1",
+    ]
+    choices, mults, _ = act(plugin, {"type": "stack_paste", "text": payload["stack_text"]}, state, [SOUND], "1;1")
+    assert native(choices, None) == selected and native(mults, None) == text
+    act(plugin, {"type": "profile_save", "name": "Phased"}, state, selected, text)
+    choices, mults, _ = act(plugin, {"type": "profile_recall", "name": "Phased"}, state, [SOUND], "1;1")
+    assert native(choices, None) == selected and native(mults, None) == text
+
+
+def test_compare_shows_each_lora_once_with_its_phases(plugin, state):
+    selected, text, _ = shrink(plugin, state, [BOTH, PICTURE, SOUND], PHASED)
+    phases = up.resolve_phases({"guidance_max_phases": 2, "lora_multiplier_phases": 2}, 2)
+    found = cmp.entries(up.Stack.from_native(selected, text), phases)
+    assert [(entry["key"], entry["phases"], entry["shrunk"]) for entry in found] == [
+        (BOTH, [[0.8], [0.5]], True), (PICTURE, [[0.6], [0.6]], True), (SOUND, [[0.7], [0.2]], True)]
+
+
+def test_deleted_phase_files_come_back_as_one_group(plugin, state, loras):
+    selected, text, _ = shrink(plugin, state, [BOTH, PICTURE, SOUND], PHASED)
+    build_all(plugin)
+    listed = serve(plugin, {"kind": "built", "in_use": [], "action": "delete_all"}, state)
+    assert listed["files"] == [] and sorted(recipe["id"] for recipe in listed["recipes"]) == sorted(selected)
+    # Settings that name both files and nothing else.
+    payload = payload_of(plugin, state, selected, "1;0 0;1")
+    (row,) = payload["active"]
+    assert row["shrink"] and [track["pinned_phase"] for track in row["phase_tracks"]] == [1, 2]
+    assert [member["weights"] for member in row["members"]] == [[[0.8, 0.5]], [[0.6, 0.6]], [[0.7, 0.2]]]
+    build_all(plugin)
+    assert all(os.path.isfile(loras / value) for value in selected)
+
+
+def test_one_phase_mode_has_one_file(plugin, state):
+    """LTX-2 in One Phase runs phase 1 alone: there is one phase to bake."""
+    instance = plugin._instance("t")
+    import json
+    choices, mults, _ = plugin._apply_action(instance, json.dumps({"type": "shrink"}), state,
+                                             [BOTH, PICTURE], "0.8 0.6", 1)
+    selected = native(choices, None)
+    assert len(selected) == 1 and dv.parse(selected[0]).track == ""
+    assert "#lora_weight A 0.8 " + BOTH in native(mults, "")

@@ -110,9 +110,10 @@ class StackFiles:
         for track in group.tracks:
             members = self.bakeable(group, track)
             if len(members) >= 2:
+                suffix = dv.SOUND_TRACK if track == sm.SOUND else (track if track in dv.PHASE_TRACKS else "")
                 found[track] = dv.bake_id(
-                    [(self.source(member)[0], self.sides(member), group.weight(member)) for member in members],
-                    rank, track=dv.SOUND_TRACK if track == sm.SOUND else "",
+                    [(self.source(member)[0], self.sides(member), group.weight(member, track)) for member in members],
+                    rank, track=suffix,
                 )
         return found
 
@@ -155,7 +156,7 @@ class StackFiles:
             path = self.path_of(source)
             if not path or not os.path.isfile(path):
                 return None
-            found.append((source, path, mode, display_name(source), group.weight(member)))
+            found.append((source, path, mode, display_name(source), group.weight(member, track or sm.ALL)))
         return found
 
     def bake_options(self, stack, letter: str) -> dict:
@@ -258,8 +259,11 @@ class StackFiles:
         if members is None or len(members) < 2:
             return None
         name = "Shrunk" if group.weighted else "Group"
-        label = f"{name} {group.letter}" + {sm.PICTURE: ", picture", sm.SOUND: ", sound"}.get(track, "")
-        return bd.bake_job(self.store, native_id, members, parsed.rank, self.sided, label, shrunk=group.weighted)
+        phase = dv.phase_of(track)
+        label = f"{name} {group.letter}" + (f", phase {phase}" if phase else
+                                            {sm.PICTURE: ", picture", sm.SOUND: ", sound"}.get(track, ""))
+        return bd.bake_job(self.store, native_id, members, parsed.rank, self.sided, label,
+                           shrunk=group.weighted, track=track if phase else "")
 
     def _recipe_members(self, recipe: dict) -> list[tuple[str, str, str, str, float]] | None:
         found = []
@@ -292,7 +296,8 @@ class StackFiles:
         if members is None or len(members) < 2:
             return None
         return bd.bake_job(self.store, native_id, members, rank, self.sided,
-                           str(recipe.get("label") or "Baked file"), shrunk=bool(recipe.get("shrink")))
+                           str(recipe.get("label") or "Baked file"), shrunk=bool(recipe.get("shrink")),
+                           track=str(recipe.get("track") or ""))
 
     def restore_groups(self, stack) -> bool:
         """Give a baked file the stack names without the lines that say what
@@ -302,7 +307,9 @@ class StackFiles:
             return False
         held = {value for group in sm.groups(stack).values() for value in group.files}
         named = {value for members in stack.groups.values() for value in members}
-        changed = False
+        # Each orphan bake, as its recipe says: members, weights, phase.  A
+        # group baked a file per phase comes back as one group with them all.
+        found: list[tuple[str, list[str], dict[str, float], bool, int]] = []
         for lora_id, _, _ in stack.user_entries():
             parsed = dv.parse(lora_id)
             if parsed is None or parsed.kind != "bake" or lora_id in held:
@@ -310,7 +317,7 @@ class StackFiles:
             try:
                 recipe = self.store.recipe(lora_id)
             except OSError:
-                return changed
+                return False
             if not recipe or recipe.get("kind") != "bake":
                 continue
             members, weights = [], {}
@@ -324,14 +331,36 @@ class StackFiles:
                     weights[native] = float(item.get("weight", 1.0))
                 except (TypeError, ValueError):
                     weights[native] = 1.0
-            if len(members) < 2 or any(stack.has_entry(member) or member in named for member in members):
+            if len(members) >= 2:
+                found.append((lora_id, members, weights, bool(recipe.get("shrink")), dv.phase_of(parsed.track)))
+        changed = False
+        done: set[str] = set()
+        for lora_id, members, weights, shrunk, phase in found:
+            if lora_id in done:
+                continue
+            files, per_phase = [lora_id], {phase: weights}
+            if phase:
+                # Its other phases' files: the same LoRAs, a phase of their own.
+                for other, others, other_weights, _, other_phase in found:
+                    if other not in done and other != lora_id and other_phase and other_phase not in per_phase \
+                            and others == members:
+                        files.append(other)
+                        per_phase[other_phase] = other_weights
+            done.update(files)
+            if any(stack.has_entry(member) or member in named for member in members):
                 continue
             letter = sm.next_letter(stack)
             if not letter:
                 break
-            stack.groups[letter] = members + [lora_id]
-            if recipe.get("shrink") or any(abs(weight - 1.0) > 1e-9 for weight in weights.values()):
-                stack.weights[letter] = weights
+            stack.groups[letter] = members + files
+            if phase:
+                count = max(per_phase)
+                stack.weights[letter] = {
+                    member: [per_phase.get(index, {}).get(member, 0.0) for index in range(1, count + 1)]
+                    for member in members
+                }
+            elif shrunk or any(abs(weight - 1.0) > 1e-9 for weight in weights.values()):
+                stack.weights[letter] = {member: [weight] for member, weight in weights.items()}
             named.update(members)
             changed = True
         return changed

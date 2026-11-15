@@ -1203,6 +1203,7 @@
 
   function phaseOf(row) {
     var count = Math.max(1, (row.phase_values || []).length);
+    if (row.pinned_phase && row.pinned_phase <= count) { return row.pinned_phase - 1; }
     var phase = S.selectedPhaseById[row.id];
     if (phase === undefined || phase < 0 || phase >= count) { phase = 0; }
     return phase;
@@ -1216,7 +1217,9 @@
 
   function rowsKey() {
     return S.rows.map(function (row) {
-      return rowKeyParts(row).concat(row.sound_track ? rowKeyParts(row.sound_track) : []).join(":");
+      return rowKeyParts(row).concat(row.sound_track ? rowKeyParts(row.sound_track) : [])
+        .concat((row.phase_tracks || []).reduce(function (all, track) { return all.concat(rowKeyParts(track)); }, []))
+        .join(":");
     }).join("|") + "#" + S.phases.effective + "#" + S.nameMode + "#" + S.steps
       + "#" + S.phaseSteps.join(",") + "#" + (S.schedulingEnabled ? "sched" : "nosched")
       + "#" + S.view + "#" + S.openRow + "#" + S.fullKey + "#" + (S.avSupported ? "av" : "")
@@ -1367,7 +1370,8 @@
     node.dataset.id = row.id;
 
     var tracks = tracksOf(row);
-    var single = tracks.length === 1;
+    // A phase file is always shown as one, even the only one a group has.
+    var single = tracks.length === 1 && !tracks[0].pinned_phase;
 
     if (!inline) { node.appendChild(buildRowThumb(row)); }
     var main = document.createElement("div");
@@ -1398,20 +1402,24 @@
     } else {
       // One LoRA, two strengths: each side gets the editor a LoRA has.
       tracks.forEach(function (track, index) {
-        var side = track.track === "sound" ? "sound" : "picture";
+        var pinned = track.pinned_phase || 0;
+        var side = pinned ? "phase" : (track.track === "sound" ? "sound" : "picture");
+        var title = pinned ? "Phase " + pinned + " file" : (side === "sound" ? "Sound" : "Picture");
         var section = document.createElement("div");
         section.className = "lb-track lb-track-" + side;
         section.dataset.id = track.id;
         var head = document.createElement("div");
         head.className = "lb-track-head";
-        head.appendChild(icon(side));
-        head.appendChild(span("lb-track-name", side === "sound" ? "Sound" : "Picture"));
+        if (!pinned) { head.appendChild(icon(side)); }
+        head.appendChild(span("lb-track-name", title));
+        if (pinned) { head.appendChild(span("lb-muted lb-track-note", "runs in phase " + pinned + " only")); }
         section.appendChild(head);
-        var sidePainters = buildStrengths(section, track, rowName(row) + " " + side, inline);
-        if (!inline) { appendClip(head, track, rowName(row) + " " + side, sidePainters, true); }
+        var trackLabel = rowName(row) + " " + (pinned ? "phase " + pinned : side);
+        var sidePainters = buildStrengths(section, track, trackLabel, inline);
+        if (!inline) { appendClip(head, track, trackLabel, sidePainters, true); }
         sidePainters.forEach(function (paint) {
           painters.push(function (next) {
-            var current = index === 0 ? next : next.sound_track;
+            var current = tracksOf(next)[index];
             if (current) { paint(current); }
           });
         });
@@ -1498,7 +1506,7 @@
     name.title = [row.civitai_name, row.name].filter(Boolean).join("\n");
     if (row.kind === "group") {
       name.title = rowName(row) + ": " + (row.members || []).map(rowName).join(", ");
-      name.appendChild(note((row.members || []).length + (row.shrink ? " LoRAs in one file" : " LoRAs move as one")));
+      name.appendChild(note((row.members || []).length + (row.shrink ? " LoRAs" + shrunkWhere(row) : " LoRAs move as one")));
     }
     if (row.system_managed) { name.appendChild(note("WanGP-managed")); }
     if (row.missing) { name.appendChild(note("Missing locally")); }
@@ -1564,7 +1572,11 @@
     line.appendChild(label);
     var text = document.createElement("span");
     text.className = "lb-off-text";
-    if (row.sound_track) {
+    if (row.phase_tracks && row.phase_tracks.length) {
+      text.textContent = row.phase_tracks.map(function (track) {
+        return "Phase " + track.pinned_phase + " file x" + (track.multiplier_raw || "");
+      }).join("  \u00b7  ");
+    } else if (row.sound_track) {
       var sound = row.sound_track;
       text.textContent = "Picture x" + (row.summary || row.multiplier_raw || "") +
         "  \u00b7  Sound x" + (sound.summary || sound.multiplier_raw || "");
@@ -1692,7 +1704,15 @@
         chip.appendChild(schedBadge(shown.text));
       }
       chip.title = shown.title;
+      if (row.pinned_phase && index !== row.pinned_phase - 1) {
+        // A phase file runs in its phase only: the others are not its own.
+        chip.disabled = true;
+        chip.classList.add("lb-chip-locked");
+        chip.title = "Phase " + row.pinned_phase + "'s file runs in phase " + row.pinned_phase +
+          " only: it is 0 in " + (S.phaseLabels[index] || ("phase " + (index + 1))).toLowerCase();
+      }
       chip.addEventListener("click", function () {
+        if (chip.disabled) { return; }
         if (S.selectedPhaseById[row.id] === index) { return; }
         S.selectedPhaseById[row.id] = index;
         // Switching chips is a view change: it must not rewrite a token.
@@ -1710,7 +1730,7 @@
         ? "One comma schedule with no ';' runs in both stages: stretched over each stage's steps"
         : "One comma schedule spans the whole run, so every phase uses it";
       strip.appendChild(sharedNote);
-    } else if (values.length > 1 && !scheduling) {
+    } else if (values.length > 1 && !scheduling && !row.pinned_phase) {
       // Linking acts on one strength, which a phase run per step does not
       // have, so it is not offered there.
       var linked = !!S.linked[row.id];
@@ -1919,9 +1939,18 @@
 
   /* ----------------------------------------------- strength and steps */
 
+  /* Where a shrunk group's LoRAs are: one file, or one per phase. */
+  function shrunkWhere(row) {
+    var phases = row.phase_tracks || [];
+    if (phases.length > 1) { return " in a file per phase"; }
+    return phases.length ? " in one file, phase " + phases[0].pinned_phase + " only" : " in one file";
+  }
+
   /* A LoRA's strengths: one set, or -- with separate picture and sound
-     strengths -- the picture's and the sound's, each an entry of its own. */
+     strengths -- the picture's and the sound's, each an entry of its own;
+     a shrunk group baked a file per phase has a file per phase. */
   function tracksOf(row) {
+    if (row.phase_tracks && row.phase_tracks.length) { return row.phase_tracks; }
     return row.sound_track ? [row, row.sound_track] : [row];
   }
 
@@ -2652,7 +2681,7 @@
   function sheetSubtitle(row) {
     if (row.kind === "group") {
       return plural((row.members || []).length, "LoRA", "LoRAs") +
-        (row.shrink ? " in one file" : row.separate ? ", picture and sound strengths" : ", one strength");
+        (row.shrink ? shrunkWhere(row) : row.separate ? ", picture and sound strengths" : ", one strength");
     }
     var streams = row.streams;
     if (!streams) { return ""; }
@@ -2746,7 +2775,8 @@
   function carryRowState(before, after) {
     var oldIds = {};
     var sides = function (row) {
-      return [[rowKey(row), row]].concat(row.sound_track ? [[rowKey(row) + "|sound", row.sound_track]] : []);
+      return [[rowKey(row), row]].concat(row.sound_track ? [[rowKey(row) + "|sound", row.sound_track]] : [])
+        .concat((row.phase_tracks || []).map(function (track) { return [rowKey(row) + "|" + track.track, track]; }));
     };
     before.forEach(function (row) {
       sides(row).forEach(function (pair) { oldIds[pair[0]] = pair[1].id; });
@@ -3007,7 +3037,7 @@
     name.appendChild(span("lb-li-label", rowName(row)));
     if (group) {
       name.appendChild(span("lb-li-sub", plural((row.members || []).length, "LoRA", "LoRAs") +
-        (row.shrink ? " in one file" : row.separate ? ", picture and sound strengths" : ", one strength")));
+        (row.shrink ? shrunkWhere(row) : row.separate ? ", picture and sound strengths" : ", one strength")));
       var bake = bakePill(row);
       if (bake) { name.appendChild(bake); }
     } else {
@@ -3093,6 +3123,18 @@
   function paintPhaseCells(cells, row) {
     cells.innerHTML = "";
     var count = listPhaseCount();
+    if (row.phase_tracks && row.phase_tracks.length) {
+      // A file per phase: each phase shows what its own file runs.
+      for (var at = 0; at < count; at += 1) {
+        var own = row.phase_tracks.filter(function (track) { return track.pinned_phase === at + 1; })[0];
+        var data = own ? ((own.phase_summary || [])[at] || { kind: "value", value: 0 }) : { kind: "value", value: 0 };
+        var shown = phaseCell(data, at, count);
+        shown.title = (own ? "Phase " + (at + 1) + "'s file \u00b7 " : "No file runs in phase " + (at + 1) + " \u00b7 ") +
+          shown.title;
+        cells.appendChild(shown);
+      }
+      return;
+    }
     if (row.sound_track) {
       // Two strengths: each phase shows the picture's above the sound's.
       for (var phase = 0; phase < count; phase += 1) {
@@ -3723,8 +3765,16 @@
      its sound's. */
   function memberWeights(member) {
     var weights = member.weights || [];
-    if (weights.length === 2) { return "picture " + fmt(weights[0]) + ", sound " + fmt(weights[1]); }
-    return weights.length ? fmt(weights[0]) : "1";
+    var phases = member.phases || [];
+    var one = function (value) {
+      if (Array.isArray(value)) {
+        // A file per phase: what it brings to each.
+        return value.map(function (item, index) { return "P" + (phases[index] || index + 1) + " " + fmt(item); }).join(", ");
+      }
+      return fmt(value);
+    };
+    if (weights.length === 2) { return "picture " + one(weights[0]) + "; sound " + one(weights[1]); }
+    return weights.length ? one(weights[0]) : "1";
   }
 
   function memberNote(member, group) {
@@ -3735,7 +3785,9 @@
     if (group.shrink) {
       if (mode !== "normal") { parts.push((MODE_LABEL[mode] || mode).toLowerCase()); }
       parts.push("baked in at " + memberWeights(member));
-      parts.push(buildState(group.bake) === "built" ? "inside the shrunk file" : "goes in once the file is built");
+      var perPhase = (group.phase_tracks || []).length > 1;
+      parts.push(buildState(group.bake) === "built" ? (perPhase ? "inside each phase's file" : "inside the shrunk file")
+        : (perPhase ? "goes in once the files are built" : "goes in once the file is built"));
       return parts.join(" · ");
     }
     if (member.empty) {
@@ -3794,6 +3846,7 @@
         "Load the members separately again");
     };
     var shrunk = !!row.shrink;
+    var perPhase = (row.phase_tracks || []).length > 1;
     if (!row.baked) {
       head.appendChild(span("lb-muted", "Not baked"));
       head.appendChild(span("lb-grow"));
@@ -3810,7 +3863,8 @@
       head.appendChild(makeButton("Change size…", "lb-btn", function () { openBakeDialog(row); }));
       head.appendChild(unbake());
       var several = (bake.files || []).length > 1;
-      line.textContent = (several ? "WanGP loads a file per side" : "WanGP loads one file") +
+      line.textContent = (perPhase ? "WanGP loads a file per phase, each running in its phase only"
+        : several ? "WanGP loads a file per side" : "WanGP loads one file") +
         (bake.bytes ? (several ? ", " + megabytes(bake.bytes) + " in all," : " of " + megabytes(bake.bytes)) : "") +
         " instead of " + count + ". It keeps " + keptText(bake) + " of their combined change. " +
         (shrunk ? "Each LoRA's own strength is baked in; this row's strength scales them all."
@@ -3821,7 +3875,8 @@
       head.appendChild(span("lb-grow"));
       head.appendChild(unbake());
       if (state === "building") {
-        line.appendChild(document.createTextNode("Building one file from the members' current settings · "));
+        line.appendChild(document.createTextNode("Building " + (perPhase ? "a file per phase" : "one file") +
+          " from the members' current settings · "));
         var pct = span("", (bake.pct || 0) + "%");
         pct.dataset.buildPct = bake.id || row.bake_id;
         line.appendChild(pct);
@@ -3933,7 +3988,10 @@
     (row.members || []).forEach(function (member) {
       (member.entries || [member.id]).forEach(function (id) { members.push(id); });
     });
-    requestMedia({ kind: "bake_plan", members: members, group: row.group }, function (plan) {
+    var request = { kind: "bake_plan", members: members, group: row.group };
+    // A shrunk group with a file per phase rebuilds every one of them.
+    if ((row.phase_tracks || []).length > 1) { request.phase_files = row.phase_tracks.length; }
+    requestMedia(request, function (plan) {
       if (S.dialog !== dialog.overlay) { return; }
       renderBakePlan(dialog, row, plan);
     });
@@ -3951,7 +4009,8 @@
     var ranks = plan.options.map(function (option) { return option.rank; });
     var current = row.baked && row.bake ? row.bake.rank : 0;
     var pick = ranks.indexOf(current) >= 0 ? current : plan.default_rank;
-    body.appendChild(paragraph((plan.files > 1 ? "Builds one LoRA per side, picture and sound, from "
+    body.appendChild(paragraph((plan.per_phase ? "Builds one LoRA per phase, each running in its phase only, from "
+      : plan.files > 1 ? "Builds one LoRA per side, picture and sound, from "
       : "Builds one LoRA from ") + listJoin(names) + ". It starts at the rank of the " +
       "highest-rank LoRA in the group; pick another size if you want one. The originals are not touched, and " +
       "Unbake goes back to them."));
@@ -3966,10 +4025,11 @@
       var title = (option.exact ? "Exact, rank " : "Rank ") + option.rank +
         (option.rank === plan.default_rank ? " · default" : "") +
         (option.rank === current ? " · now" : "");
-      var sub = option.exact
+      var sub = option.exact && !plan.per_phase
         ? "Same memory as now: WanGP already runs the group this way. Only worth it to hand someone one file."
         : (option.rank === plan.default_rank ? "Matches the highest rank in the group. " : "") +
-          (saves > 0 ? "Saves " + megabytes(saves) + "." : "");
+          (saves > 0 ? "Saves " + megabytes(saves) + "."
+            : plan.per_phase ? "More than the LoRAs take loaded separately." : "");
       options.appendChild(optionRow("lb-bake-pick", String(option.rank), option.rank === pick, title, sub,
         [megabytes(option.bytes), option.exact ? "exact" : "re-fit"], function () { pick = option.rank; }));
     });
@@ -4116,8 +4176,10 @@
      bake's members. */
   function builtFrom(file) {
     if (file.kind === "bake") {
+      var phase = /\.p([1-3])\.safetensors$/.exec(file.id || "");
       return (file.shrink ? "Shrunk file" : "Group bake") +
         (/\.sound\.safetensors$/.test(file.id) ? " (sound side)" : "") +
+        (phase ? " (phase " + phase[1] + " only)" : "") +
         ", rank " + file.rank + ": " + listJoin(file.members || []);
     }
     return (file.label || "") + " · " + (MODE_LABEL[file.mode] || file.mode || "");
@@ -6092,8 +6154,22 @@
   }
 
   function shrinkWhat(bundle) {
-    if (bundle.kind === "flat") { return "At one strength"; }
-    return bundle.schedule ? "Sharing a schedule" : "Sharing strengths per phase";
+    if (bundle.kind === "flat") { return bundle.phased ? "One strength in each phase" : "At one strength"; }
+    return bundle.phased ? "Sharing a schedule, a file per phase" : "Sharing a schedule";
+  }
+
+  /* How many files a bundle becomes: one, or one per phase. */
+  function shrinkFiles(bundle) {
+    return Math.max(1, (bundle.files || []).length);
+  }
+
+  /* What a LoRA brings to its file: one strength, or phase by phase. */
+  function shrinkStrength(bundle, piece) {
+    var weights = piece.weights || [];
+    if (bundle.phased) {
+      return weights.map(function (value, index) { return phaseName(index).toLowerCase() + " " + fmt(value); }).join(", ");
+    }
+    return bundle.kind === "flat" ? "at " + fmt(piece.weight !== undefined ? piece.weight : (weights[0] || 1)) : "";
   }
 
   function renderShrinkPlan(dialog, plan) {
@@ -6107,6 +6183,8 @@
     var bundles = plan.bundles || [];
     var kept = plan.kept || [];
     var loras = bundles.reduce(function (sum, bundle) { return sum + bundle.loras; }, 0);
+    var made = bundles.reduce(function (sum, bundle) { return sum + shrinkFiles(bundle); }, 0);
+    var phased = bundles.some(function (bundle) { return bundle.phased; });
     if (!bundles.length) {
       body.appendChild(paragraph("Nothing to shrink: no two LoRAs run at one strength, or share a schedule."));
     } else {
@@ -6114,7 +6192,7 @@
       var after = bundles.reduce(function (sum, bundle) { return sum + (bundle.bytes_after || 0); }, 0);
       var lead = paragraph("", "lb-shrink-lead");
       lead.appendChild(document.createElement("strong")).textContent =
-        plural(loras, "LoRA", "LoRAs") + " into " + plural(bundles.length, "file", "files");
+        plural(loras, "LoRA", "LoRAs") + " into " + plural(made, "file", "files");
       lead.appendChild(document.createTextNode(
         " · WanGP loads " + plural(plan.files_after, "file", "files") + " instead of " + plan.files_before +
         (before ? ", about " + megabytes(after) + " of LoRA weights instead of " + megabytes(before) : "") + "."));
@@ -6122,16 +6200,37 @@
       body.appendChild(paragraph("LoRAs at one strength are baked in at that strength, and their file runs at 1. " +
         "LoRAs that share a schedule are baked in at 1, and their file runs the schedule. Each file is fitted to " +
         "the rank of the highest-rank LoRA in it.", "lb-fine"));
+      if (phased) {
+        body.appendChild(paragraph("Where LoRAs' strengths differ from phase to phase, each phase gets a file of its " +
+          "own, baked at that phase's strengths. A phase's file runs in that phase only (at 0 in every other), so " +
+          "no phase's file can apply in another phase, and the LoRAs need not match phase for phase.", "lb-fine"));
+      }
+      if (after > before) {
+        body.appendChild(paragraph("These files take more memory than the LoRAs they replace" +
+          (phased ? " (a file per phase holds every LoRA once per phase)" : "") + ". Each step still runs one " +
+          "file where it ran several.", "lb-fine lb-shrink-more"));
+      }
       bundles.forEach(function (bundle) {
         var box = document.createElement("section");
         box.className = "lb-shrink-file";
         var head = document.createElement("div");
         head.className = "lb-shrink-head";
         head.appendChild(document.createElement("strong")).textContent = shrinkWhat(bundle);
-        head.appendChild(span("lb-muted", plural(bundle.loras, "LoRA", "LoRAs") + " → 1 file, rank " + bundle.rank +
-          (bundle.bytes_after ? " · " + megabytes(bundle.bytes_after) : "")));
+        var fileText = !bundle.phased ? "1 file"
+          : shrinkFiles(bundle) > 1 ? plural(shrinkFiles(bundle), "file", "files") + ", one per phase"
+          : "1 file, " + phaseName(((bundle.files || [])[0] || { phase: 1 }).phase - 1).toLowerCase() + " only";
+        head.appendChild(span("lb-muted", plural(bundle.loras, "LoRA", "LoRAs") + " → " + fileText +
+          ", rank " + bundle.rank + (bundle.bytes_after ? " · " + megabytes(bundle.bytes_after) : "")));
         box.appendChild(head);
-        if (bundle.kind !== "flat") {
+        if (bundle.phased) {
+          (bundle.files || []).forEach(function (file) {
+            var runs = paragraph("", "lb-shrink-runs lb-shrink-phase");
+            runs.appendChild(document.createTextNode(phaseName(file.phase - 1) + "'s file runs "));
+            runs.appendChild(codeText(file.token));
+            runs.appendChild(span("lb-muted", " · " + phaseName(file.phase - 1).toLowerCase() + " only"));
+            box.appendChild(runs);
+          });
+        } else if (bundle.kind !== "flat") {
           var runs = paragraph("", "lb-shrink-runs");
           runs.appendChild(document.createTextNode("Runs "));
           runs.appendChild(codeText(bundle.token));
@@ -6143,7 +6242,7 @@
           var item = document.createElement("li");
           item.appendChild(span("lb-shrink-name", shrinkName(piece)));
           var mode = piece.mode && piece.mode !== "normal" ? (MODE_LABEL[piece.mode] || piece.mode) : "";
-          var detail = [mode, bundle.kind === "flat" ? "at " + fmt(piece.weight) : ""].filter(Boolean).join(" · ");
+          var detail = [mode, shrinkStrength(bundle, piece)].filter(Boolean).join(" · ");
           if (detail) { item.appendChild(span("lb-shrink-detail", detail)); }
           list.appendChild(item);
         });

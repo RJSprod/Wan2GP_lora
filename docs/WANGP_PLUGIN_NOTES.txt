@@ -601,6 +601,28 @@ ALWAYS RUN THE NEGATIVE TEST
   puts those lines back from it. Reading recipes never creates the store or
   its link.
 
+  A file per phase: the planner classifies each LoRA phase by phase (in a run
+  of phases.capacity phases) -- a phase at one value is ONE with weight =
+  that value, any other phase is its exact step list with weight 1 -- and
+  bundles LoRAs with the same shapes. A bundle whose weights differ between
+  phases is "phased": its weight lines hold a value per phase
+  (#lora_weight A 0.8;0.5 <lora>) and it bakes one file per phase track
+  p1..p3 that some LoRA brings something to (bake id suffix .p1/.p2/.p3; the
+  hash covers the track, and each file's members carry that phase's weight).
+  A bundle is made only where it has more LoRAs than files. Each phase file's
+  token is pinned to its phase -- multiplier_codec.pin_token zeroes every
+  other phase -- by sm.pin_tracks after every action in _apply_action, and by
+  _paste_schedule as it pastes, so whatever is set, typed or pasted, a phase's
+  file never runs in another phase (mmgp skips a LoRA whose scale is 0 for a
+  step). sm.group_token composes each phase from its own file's token;
+  sm.member_token is a member's weight times that, phase by phase, and is
+  what unshrink, profiles, compare and the planner read. restore_groups merges
+  orphan phase bakes with the same members into one group with per-phase
+  weights. The group row carries phase_tracks (each file's row, with track,
+  pinned_phase, phase_summary) and group_token; the editor shows a section
+  per file with the other phases' chips locked, and the list's phase cells
+  come from each phase's own file.
+
   The open editor is laid out with container queries on .lb-rows (and on the
   full-screen sheet's body), never media queries: the panel is one column of
   WanGP's page, so the window's width says nothing about the room an editor

@@ -210,6 +210,7 @@ def entries(stack: up.Stack, phases: up.PhaseConfig, steps=(), known_ids=()) -> 
         if stack.is_system(position)
     ]
     system_ids = {entry[0] for entry in system}
+    shown: set[str] = set()
     for lora_id, on, token in system + stack.user_entries():
         lists = phase_lists(token, phases, steps)
         group = next((each for each in groups.values() if each.holds(lora_id)), None)
@@ -220,12 +221,17 @@ def entries(stack: up.Stack, phases: up.PhaseConfig, steps=(), known_ids=()) -> 
         else:
             covers = [lora_id]
         shrunk = baked and group is not None and group.weighted
+        if shrunk and group.phased:
+            # A file per phase: each LoRA once, at what it runs at in each.
+            if group.letter in shown:
+                continue
+            shown.add(group.letter)
         for member in covers:
             source, mode = sm.source_of(member, known_ids)
             sound = sm.is_sound_entry(member) or (baked and sm.is_sound_entry(lora_id))
             # A shrunk group's member runs at its weight times the file's
             # strength: shown so, and changed only by unshrinking.
-            raw = sm._weighted_token(token, group.weight(member)) if shrunk else token
+            raw = sm.member_token(stack, group, member) if shrunk else token
             add({
                 "key": source + ("|sound" if sound else ""),
                 "source": source,

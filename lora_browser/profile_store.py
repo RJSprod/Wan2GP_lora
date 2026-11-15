@@ -56,8 +56,9 @@ class ProfileEntry:
     group: str = ""
     #: Off because its mode leaves it nothing to apply, rather than by hand.
     skipped: bool = False
-    #: What it brings to its shrunk group's baked file; None outside one.
-    weight: float | None = None
+    #: What it brings to its shrunk group's baked file -- one weight, or one
+    #: per phase where the group has a file per phase; None outside one.
+    weight: float | list[float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -137,7 +138,10 @@ class Profile:
         )
 
 
-def _weight(value: Any) -> float | None:
+def _weight(value: Any) -> float | list[float] | None:
+    if isinstance(value, (list, tuple)):
+        values = [_weight(item) for item in value]
+        return values if values and all(isinstance(item, float) for item in values) else None
     if value is None or isinstance(value, bool):
         return None
     try:
