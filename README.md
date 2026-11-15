@@ -605,7 +605,8 @@ never touched: **Unbake** goes back to them and **Change size…** bakes again.
 Strength and schedule still apply live to the baked file, and changing a
 member's mode or the group's members bakes it again to match. LoRAs that are not
 plain low-rank pairs (DoRA, LoKr, full weight differences) cannot be baked, and
-the dialog says so.
+neither can a LoRA WanGP recognises by its file name (see
+[Shrinking a stack](#shrinking-a-stack)); the dialog says so.
 
 A group is stored as `#lora_group <letter> <lora>` lines in `loras_multipliers`;
 a baked group's lines also name its file
@@ -637,8 +638,22 @@ run the same:
   group's members come in at the group's strength, and anything baked or
   shrunk before comes in as its originals, so shrinking again plans everything
   afresh. **What stays as it is** is listed with why: LoRAs switched off,
-  WanGP's own, multipliers with `:` branches, LoRAs not on this machine, and
-  files a bake cannot combine (DoRA, LoKr, full weight differences).
+  WanGP's own, multipliers with `:` branches, LoRAs not on this machine,
+  files a bake cannot combine (DoRA, LoKr, full weight differences), and LoRAs
+  WanGP recognises by their file name — LTX-2's IC-LoRAs (`ic-lora`, whose
+  `-ref0.5` sets the reference scale), the LoRAs it would otherwise add itself
+  (`distilled-lora`, `union-control`, `in-outpainting`, `id-lora-celebvhq`),
+  and Wan 2.2's Lightning I2V accelerators. Inside a file with a name of its
+  own WanGP would not see them for what they are, and would even add its own
+  default beside them.
+
+Why one strength bakes in exactly: WanGP (mmgp) adds each LoRA to a layer as
+its change times its multiplier, `W + 0.5·ΔA + 0.7·ΔB`, so a file holding
+`0.5·ΔA + 0.7·ΔB` run at 1 is the same sum, at every step. What can differ is
+the rank: the file keeps the strongest directions of the combined change, and
+its row says how much of it it kept. A subtle LoRA beside strong ones is the
+first to fade — check a render with **Compare**, and give the file more rank
+with **Change size…** if it did.
 
 ```
  Shrink the stack

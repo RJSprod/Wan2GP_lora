@@ -84,6 +84,25 @@ class Derived:
     track: str = ""
 
 
+#: What WanGP looks for in a LoRA's file name to treat it as more than its
+#: weights: LTX-2's IC-LoRAs ("ic-lora", their reference scale read from
+#: "-ref0.5") and the LoRAs it adds itself unless one of yours is named like
+#: them (distilled, union control, in/outpainting, ID), and Wan 2.2's
+#: Lightning I2V accelerators, which pick the sampler.  Baked into a file
+#: with a name of its own, such a LoRA would lose that -- WanGP would even add
+#: its own default beside it -- so a bake or a shrink leaves it as it is.
+_RECOGNISED = ("ic-lora", "distilled-lora", "union-control", "in-outpainting", "id-lora-celebvhq")
+
+
+def recognised_by_name(lora_id: str) -> str:
+    """The part of ``lora_id``'s file name WanGP recognises it by, or ""."""
+    name = os.path.basename(normalize_id(lora_id)).lower()
+    found = next((signature for signature in _RECOGNISED if signature in name), "")
+    if not found and "i2v" in name and ("lightx2v" in name or "seko" in name):
+        found = "lightx2v" if "lightx2v" in name else "seko"
+    return found
+
+
 def is_derived(lora_id: str) -> bool:
     return normalize_id(lora_id).startswith(LINK_NAME + "/")
 

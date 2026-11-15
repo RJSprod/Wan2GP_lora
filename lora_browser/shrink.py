@@ -19,7 +19,9 @@ of the bar.  A group's members come with the group's strength; a group
 already baked, or shrunk before, comes as its members, so shrinking again
 re-plans everything from the originals.  Left as they are, and said why:
 LoRAs switched off, WanGP's own, multipliers in syntax that cannot be scaled,
-LoRAs not on this machine, and files a bake cannot combine (DoRA, LoKr...).
+LoRAs not on this machine, files a bake cannot combine (DoRA, LoKr...), and
+LoRAs WanGP recognises by their file name (``derived.recognised_by_name``):
+in a file with a name of its own, WanGP would no longer treat them so.
 
 The result is a shrunk group per file (``stack_modes``): ``#lora_group``
 lines naming its LoRAs, ``#lora_weight`` lines saying what each brings, and
@@ -34,6 +36,7 @@ import os
 from dataclasses import dataclass, field
 
 from . import bake as bk
+from . import derived as dv
 from . import multiplier_codec as codec
 from . import stack_modes as sm
 from .utils import display_name, format_number
@@ -181,8 +184,12 @@ def _piece(files, entry: str, token: str, holder: str, origin: str) -> Piece:
     piece = Piece(entry=entry, source=source, mode=mode, token=token, holder=holder, origin=origin,
                   name=display_name(source), rank=int(getattr(summary, "rank", 0) or 0))
     path = files.path_of(source)
+    recognised = dv.recognised_by_name(source)
     if files.empty(entry):
         piece.reason = "Its mode leaves it nothing to apply."
+    elif recognised:
+        piece.reason = (f"WanGP recognises it by its file name ('{recognised}'); "
+                        "inside a shrunk file it would not.")
     elif not path or not os.path.isfile(path):
         piece.reason = "Its file is not on this machine."
     else:

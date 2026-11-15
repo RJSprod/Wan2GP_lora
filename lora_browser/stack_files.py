@@ -132,6 +132,17 @@ class StackFiles:
                 ranks.append(summary.rank)
         return max(ranks, default=0)
 
+    def recognised(self, group: sm.Group) -> str:
+        """Why the group cannot be baked because WanGP recognises one of its
+        LoRAs by its file name, or ""."""
+        for member in group.members:
+            source = self.source(member)[0]
+            signature = dv.recognised_by_name(source)
+            if signature:
+                return (f"WanGP recognises {display_name(source)} by its file name ('{signature}'); "
+                        "baked into a file of its own, it would not. Take it out of the group to bake the rest.")
+        return ""
+
     def bakeable(self, group: sm.Group, track: str) -> list[str]:
         """A side's members that bring it something: a picture-only LoRA's
         sound half, in a group with separate strengths, brings nothing."""
@@ -152,6 +163,9 @@ class StackFiles:
         group = sm.groups(stack).get(letter)
         if group is None:
             return {"error": "That group is gone."}
+        recognised = self.recognised(group)
+        if recognised:
+            return {"error": recognised}
         plans = []
         for track in group.tracks:
             members = self._members(group, track)

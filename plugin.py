@@ -1555,6 +1555,10 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             group = sm.groups(stack).get(letter)
             if group is None or files.store is None:
                 return False
+            recognised = files.recognised(group)
+            if recognised:
+                instance.note(recognised, True)
+                return False
             try:
                 rank = int(action.get("rank") or files.default_rank(group) or 0)
             except (TypeError, ValueError):

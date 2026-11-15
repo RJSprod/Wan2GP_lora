@@ -5,6 +5,7 @@ when the test says so -- and the recipes kept for every built file."""
 import os
 
 import numpy as np
+import pytest
 
 from lora_browser import bake as bk
 from lora_browser import compare as cmp
@@ -292,3 +293,51 @@ def test_looking_for_a_recipe_makes_no_folder(plugin, state, loras):
     payload = payload_of(plugin, state, ["_lora_browser/_bakes/abcdef123456.r4.safetensors"], "1;1")
     assert payload["active"][0].get("kind") != "group"
     assert not os.path.lexists(loras / dv.LINK_NAME)
+
+
+# ------------------------------------------- LoRAs WanGP knows by name
+
+
+@pytest.mark.parametrize("name,signature", [
+    ("ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors", "ic-lora"),
+    ("styles/LTX-2.3-22B-IC-LoRA-HDR-0.9.safetensors", "ic-lora"),
+    ("ltx-2.3-22b-distilled-lora-384-1.1.safetensors", "distilled-lora"),
+    ("ltx-2.3-22b-in-outpainting-0.9.safetensors", "in-outpainting"),
+    ("ltx-2-id-lora-celebvhq.safetensors", "id-lora-celebvhq"),
+    ("Wan2.2-I2V-A14B-lightx2v-high.safetensors", "lightx2v"),
+    ("wan22_i2v_seko_low.safetensors", "seko"),
+    # Not what WanGP looks for: left to be shrunk like any other.
+    ("my_face_id-lora.safetensors", ""),
+    ("lightx2v_t2v_style.safetensors", ""),
+    ("detail_enhancer.safetensors", ""),
+])
+def test_what_wangp_recognises_by_name(name, signature):
+    assert dv.recognised_by_name(name) == signature
+
+
+IC = "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
+
+
+@pytest.fixture
+def ic_state(state, loras):
+    from tests.test_av_bridge import _write
+    _write(loras / IC, ["attn1.to_q"], 4, 9)
+    return dict(state, loras=state["loras"] + [IC])
+
+
+def test_a_lora_wangp_knows_by_name_stays_out_of_a_shrink(plugin, ic_state):
+    plan = plan_of(plugin, ic_state, [BOTH, PICTURE, IC], "0.7;0.7 0.5;0.5 0.9;0.9")
+    assert [member["id"] for member in plan["bundles"][0]["members"]] == [BOTH, PICTURE]
+    kept = {member["id"]: member["reason"] for member in plan["kept"]}
+    assert kept[IC].startswith("WanGP recognises it by its file name ('ic-lora')")
+    selected, text, _ = shrink(plugin, ic_state, [BOTH, PICTURE, IC], "0.7;0.7 0.5;0.5 0.9;0.9")
+    # Still selected under its own name, at its own strength.
+    assert selected[1] == IC and text.splitlines()[0] == "1;1 0.9;0.9"
+
+
+def test_a_group_holding_one_is_not_baked(plugin, ic_state):
+    text = f"0.7;0.7 0.7;0.7\n#lora_group A {BOTH}\n#lora_group A {IC}"
+    plan = serve(plugin, {"kind": "bake_plan", "members": [BOTH, IC], "group": "A"}, ic_state)
+    assert "recognises" in plan["error"] and "ic-lora" in plan["error"]
+    choices, mults, payload = act(plugin, {"type": "bake", "group": "A", "rank": 4}, ic_state, [BOTH, IC], text)
+    assert "value" not in mults and payload["status_warn"] and "recognises" in payload["status"]
