@@ -2181,3 +2181,57 @@ class TestCompare:
         choices, mults, payload = act(plugin, {"type": "compare_apply", "changes": {}}, state,
                                       ["a.safetensors"], "1", guidance=1)
         assert "value" not in mults and payload["compare"] is None
+
+
+class TestPasteSchedule:
+    """One LoRA's strength and schedule, every phase and step, pasted onto
+    others -- checked and settled the way a pasted stack is."""
+
+    @pytest.fixture(autouse=True)
+    def one_phase(self, plugin):
+        plugin.get_model_def = lambda model_type: {}
+
+    def _paste(self, plugin, state, ids, token, selected, text, steps=4):
+        return act(plugin, {"type": "paste_schedule", "ids": ids, "token": token, "from": "a"},
+                   state, selected, text, guidance=1, steps=steps)
+
+    def test_onto_one_lora(self, plugin, state):
+        choices, mults, payload = self._paste(plugin, state, ["b.safetensors"], "1,1,0.5,0.5",
+                                              ["a.safetensors", "b.safetensors"], "1,1,0.5,0.5 0.7")
+        assert mults["value"] == "1,1,0.5,0.5 1,1,0.5,0.5"
+        assert payload["status"] == "Pasted x1,1,0.5,0.5 from a onto 1 LoRA."
+        row = row_of(payload, "b.safetensors")
+        assert row["multiplier_raw"] == "1,1,0.5,0.5"
+
+    def test_onto_several_a_lora_switched_off_included(self, plugin, state):
+        text = "1 0.7 0.3\n#lora_off 2 0.4 sub/c.safetensors"
+        choices, mults, payload = self._paste(plugin, state, ["a.safetensors", "b.safetensors", "sub/c.safetensors"],
+                                              "0.2,0.4,0.6,0.8", ["a.safetensors", "b.safetensors"], text)
+        assert mults["value"] == ("0.2,0.4,0.6,0.8 0.2,0.4,0.6,0.8\n"
+                                  "#lora_off 2 0.2,0.4,0.6,0.8 sub/c.safetensors")
+        assert payload["status"].endswith("onto 3 LoRAs.")
+
+    def test_a_group_follows_its_lead(self, plugin, state):
+        text = "0.5 0.5\n#lora_group A a.safetensors\n#lora_group A b.safetensors"
+        _, mults, _ = self._paste(plugin, state, ["a.safetensors"], "1,0,1,0", ["a.safetensors", "b.safetensors"], text)
+        assert mults["value"].splitlines()[0] == "1,0,1,0 1,0,1,0"
+
+    def test_what_cannot_be_pasted_changes_nothing(self, plugin, state):
+        selected, text = ["a.safetensors", "b.safetensors"], "1 0.7"
+        for token, reason in (("x,1", "is not a multiplier WanGP can read"), ("", "there is nothing copied")):
+            choices, mults, payload = self._paste(plugin, state, ["b.safetensors"], token, selected, text)
+            assert "value" not in mults and payload["status_warn"] and reason in payload["status"]
+        # Already the same.
+        _, mults, payload = self._paste(plugin, state, ["b.safetensors"], "0.7", selected, text)
+        assert "value" not in mults and payload["status"] == "Nothing to paste: it already has x0.7."
+        # Not one of the stack's, or one WanGP manages.
+        _, mults, payload = self._paste(plugin, state, ["nothere.safetensors"], "0.3", selected, text)
+        assert "value" not in mults and payload["status_warn"]
+        _, mults, payload = self._paste(plugin, state, ["a.safetensors"], "0.3", selected, "1|0.7")
+        assert "value" not in mults and payload["status_warn"]
+
+    def test_spaces_in_what_was_copied_are_ignored(self, plugin, state):
+        _, mults, _ = self._paste(plugin, state, ["b.safetensors"], " 1, 0.5 ", ["a.safetensors", "b.safetensors"], "1 0.7")
+        # Two values over a four-step run: spread over the steps the way
+        # WanGP spreads them, so the editor shows each step.
+        assert mults["value"] == "1 1,1,0.5,0.5"

@@ -1882,6 +1882,63 @@ class TestListView:
         page.locator(".lb-dialog button.lb-primary").click()
         assert problems == []
 
+    def test_a_schedule_is_copied_and_pasted_onto_others(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host)
+        sched = AV_MULTIPLIERS.split()[3]
+        line(page, "sched.safetensors").locator(".lb-li-name").click()
+        settle(page, 300)
+        editor = page.locator(".lb-li-editor")
+        assert editor.locator(".lb-clip-label").inner_text() == "Strength and schedule"
+        editor.locator("button.lb-clip-copy").click()
+        assert page.locator('[data-lb="status"]').inner_text().startswith(
+            f"Copied sched.safetensors's strength and schedule, x{sched}")
+        # Its own Paste has nothing new to give it.
+        assert editor.locator("button.lb-clip-paste").is_disabled()
+
+        line(page, "picture.safetensors").locator(".lb-li-name").click()
+        settle(page, 300)
+        paste = page.locator(".lb-li-editor button.lb-clip-paste")
+        assert paste.get_attribute("title") == f"Paste x{sched} from sched.safetensors"
+        paste.click()
+        settle(page, 800)
+        assert tokens_by_lora(host)["picture.safetensors"] == sched
+        assert page.locator('[data-lb="status"]').inner_text() == f"Pasted x{sched} from sched.safetensors onto 1 LoRA."
+        # Now the same: nothing more to paste there.
+        assert page.locator(".lb-li-editor button.lb-clip-paste").is_disabled()
+
+        # Several at once, from Select.
+        page.locator(".lb-li-editor button.lb-done").click()
+        settle(page, 300)
+        page.locator('[data-lb="select"]').click()
+        line(page, "both.safetensors").click()
+        line(page, "sound.safetensors").click()
+        bulk = page.locator(".lb-bulk button.lb-bulk-paste")
+        assert bulk.inner_text().startswith("Paste x1,1,0.875")
+        bulk.click()
+        settle(page, 800)
+        tokens = tokens_by_lora(host)
+        assert tokens["both.safetensors"] == tokens["sound.safetensors"] == sched
+        assert page.locator('[data-lb="status"]').inner_text().endswith("onto 2 LoRAs.")
+        page.locator(".lb-bulk button", has_text="Done").click()
+        assert problems == []
+
+    def test_cards_copy_and_paste_from_their_top_line(self, av_panel):
+        """A card at rest is as tall as its picture: its Copy and Paste are
+        icons in its top line, not a line of their own."""
+        page, host, problems = av_panel
+        reset_av(page, host)
+        page.locator('[data-lb="viewsw"] button[data-view="cards"]').click()
+        settle(page, 600)
+        sched = page.locator('.lb-row[data-id="sched.safetensors"]')
+        assert sched.locator(".lb-clip-label").count() == 0
+        sched.locator(".lb-row-top button.lb-clip-copy").click()
+        picture = page.locator('.lb-row[data-id="picture.safetensors"]')
+        picture.locator(".lb-row-top button.lb-clip-paste").click()
+        settle(page, 800)
+        assert tokens_by_lora(host)["picture.safetensors"] == AV_MULTIPLIERS.split()[3]
+        assert problems == []
+
     def test_the_view_is_remembered(self, av_panel):
         page, host, problems = av_panel
         reset_av(page, host)

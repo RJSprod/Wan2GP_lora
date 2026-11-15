@@ -42,6 +42,10 @@ thumbnail browser and a real-time strength editor.
 - **Switch a LoRA off without losing it.** Every row has an on/off switch: off
   keeps the strength, the schedule and the LoRA's place in the list, and WanGP
   neither loads nor applies it. See [Switching a LoRA off](#switching-a-lora-off).
+- **Copy one LoRA's schedule onto others.** *Copy* at the end of a LoRA's
+  strengths takes its strength and schedule, every phase and step; *Paste* on
+  another LoRA gives it the same, and *Paste* in **Select** gives it to every
+  LoRA selected. See [Copying a schedule](#copying-a-schedule).
 - **Paste a whole stack as text.** *Paste stack* opens a box: paste one
   `name: x multiplier` line per LoRA, press Enter, and that is the stack —
   schedules and all. *Copy current stack* writes the same format back out. See
@@ -355,6 +359,29 @@ own picker — turns it back on.
 **Disable all** switches every LoRA off this way and **Enable all** brings them
 all back. WanGP-managed accelerator LoRAs have no switch and are left out of
 both. Stack profiles remember which LoRAs were off.
+
+### Copying a schedule
+
+Every LoRA's strengths end with **Strength and schedule — Copy · Paste** (on
+a card, whose height is its picture's, they are the two icons in its top
+line). **Copy** takes that LoRA's multiplier as WanGP holds it — every phase, every
+step — and **Paste** on another LoRA gives it exactly that. In **Select**, the
+bar's **Paste** gives it to every LoRA selected at once (both sides of one with
+separate picture and sound strengths, each of which also has its own Copy and
+Paste). Pasting onto a group sets the group's strength and schedule; onto a
+shrunk file, the file's — which scales everything in it.
+
+What is pasted is checked and settled the way a pasted stack is: a list
+written for another step count is spread over this run's steps as WanGP
+spreads it, a phase this mode does not run is kept for when it does, and
+WanGP's own LoRAs are never pasted onto. Paste is greyed out on a LoRA that
+already has what was copied. The copy lasts the visit (and this browser's
+next ones) and goes on the system clipboard too, where the browser allows, to
+paste into notes or WanGP's own multiplier box.
+
+LoRAs that share a schedule exactly go into one file when you
+[shrink](#shrinking-a-stack): pasting one schedule onto several is also a way
+to shrink them further.
 
 ### Pasting a stack as text
 
