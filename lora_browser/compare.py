@@ -219,9 +219,13 @@ def entries(stack: up.Stack, phases: up.PhaseConfig, steps=(), known_ids=()) -> 
             covers = group.track_members(group.track_of(lora_id)) or group.members
         else:
             covers = [lora_id]
+        shrunk = baked and group is not None and group.weighted
         for member in covers:
             source, mode = sm.source_of(member, known_ids)
             sound = sm.is_sound_entry(member) or (baked and sm.is_sound_entry(lora_id))
+            # A shrunk group's member runs at its weight times the file's
+            # strength: shown so, and changed only by unshrinking.
+            raw = sm._weighted_token(token, group.weight(member)) if shrunk else token
             add({
                 "key": source + ("|sound" if sound else ""),
                 "source": source,
@@ -232,11 +236,12 @@ def entries(stack: up.Stack, phases: up.PhaseConfig, steps=(), known_ids=()) -> 
                 "group": group.letter if group is not None else "",
                 "baked": baked,
                 # Group members move as one: an edit to one is an edit to all.
-                "link": f"{group.letter}|{group.track_of(member)}" if group is not None else "",
+                "link": f"{group.letter}|{group.track_of(member)}" if group is not None and not shrunk else "",
+                "shrunk": shrunk,
                 "on": bool(on),
                 "system": lora_id in system_ids,
-                "raw": token,
-                "phases": lists,
+                "raw": raw,
+                "phases": phase_lists(raw, phases, steps) if shrunk else lists,
             })
     return listed
 
@@ -282,6 +287,8 @@ def from_settings(settings: dict | None, model_def: dict | None, known_ids=()) -
     )
     found["model_type"] = str(settings.get("model_type") or settings.get("base_model_type") or "")
     found["listed"] = isinstance(loras, (list, tuple, str))
+    prompt = settings.get("prompt")
+    found["prompt"] = prompt if isinstance(prompt, str) else ""
     return found
 
 
@@ -313,7 +320,7 @@ def apply_edits(
     switched: dict[str, bool] = {}
     for key, change in (changes.items() if isinstance(changes, dict) else []):
         entry = current.get(str(key))
-        if entry is None or entry["system"] or not isinstance(change, dict):
+        if entry is None or entry["system"] or entry.get("shrunk") or not isinstance(change, dict):
             continue
         lists = clean_lists(change.get("phases"))
         if lists is not None and entry["phases"] is not None:

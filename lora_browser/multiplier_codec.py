@@ -79,6 +79,16 @@ SKIP_MARK = "#lora_skip"
 GROUP_MARK = "#lora_group"
 _GROUP_LINE = re.compile(r"^\s*#lora_group\s+([A-Z])\s+(\S.*?)\s*$")
 
+#: What each member brings to its group's baked file, where members bring
+#: different amounts: a shrunk stack's LoRAs, each at the strength it ran at.
+#: A group with these lines is baked with every member scaled by its weight,
+#: and the baked file runs at the group's own multiplier on top -- 1 for a
+#: shrink of single strengths.  One line per member, the LoRA last:
+#:
+#:     #lora_weight <letter> <weight> <lora>
+WEIGHT_MARK = "#lora_weight"
+_WEIGHT_LINE = re.compile(r"^\s*#lora_weight\s+([A-Z])\s+(\S+)\s+(\S.*?)\s*$")
+
 
 @dataclass
 class ParsedMultipliers:
@@ -184,6 +194,59 @@ def parse_groups(text: str) -> dict[str, list[str]]:
             if match.group(2) not in members:
                 members.append(match.group(2))
     return groups
+
+
+def parse_weights(text: str) -> dict[str, dict[str, float]]:
+    """``letter -> {lora: weight}`` for every ``#lora_weight`` line."""
+    weights: dict[str, dict[str, float]] = {}
+    for line in str(text or "").replace("\r", "").split("\n"):
+        match = _WEIGHT_LINE.match(line)
+        if match and is_finite_number(match.group(2)):
+            weights.setdefault(match.group(1), {})[match.group(3)] = float(match.group(2))
+    return weights
+
+
+def weight_lines(weights: dict[str, dict[str, float]] | None, groups: dict[str, list[str]] | None) -> list[str]:
+    """The weight lines of the groups being written, in their members' order."""
+    lines = []
+    for letter in sorted(weights or {}):
+        for lora_id in (groups or {}).get(letter, []):
+            if lora_id in weights[letter]:
+                lines.append(f"{WEIGHT_MARK} {letter} {format_number(weights[letter][lora_id])} {lora_id}")
+    return lines
+
+
+def scale_token(token: str, factor: float) -> str | None:
+    """Every value of a plain or scheduled token times ``factor``, its phases
+    and steps kept as they are; ``None`` for syntax that cannot be scaled."""
+    text = str(token or "").strip() or DEFAULT_TOKEN
+    factor = float(factor)
+    if abs(factor - 1.0) < 1e-12:
+        return text
+    if ":" in text:
+        return None
+    phases = []
+    for part in text.split(";"):
+        values = [value.strip() for value in part.split(",")]
+        if not values or not all(is_finite_number(value) for value in values):
+            return None
+        phases.append(",".join(format_number(float(value) * factor) for value in values))
+    return ";".join(phases)
+
+
+def token_values(token: str) -> list[list[float]] | None:
+    """Every value a plain or scheduled token spells, phase by phase; ``None``
+    for branch syntax or anything that is not numbers."""
+    text = str(token or "").strip() or DEFAULT_TOKEN
+    if ":" in text:
+        return None
+    phases = []
+    for part in text.split(";"):
+        values = [value.strip() for value in part.split(",")]
+        if not values or not all(is_finite_number(value) for value in values):
+            return None
+        phases.append([float(value) for value in values])
+    return phases
 
 
 def group_lines(groups: dict[str, list[str]] | None) -> list[str]:
@@ -363,6 +426,7 @@ def serialize(
     separator_index: int = -1,
     disabled: list[DisabledLora] | None = None,
     groups: dict[str, list[str]] | None = None,
+    weights: dict[str, dict[str, float]] | None = None,
 ) -> str:
     """Rebuild the native multiplier string.
 
@@ -370,8 +434,8 @@ def serialize(
     and then splits on single spaces, so ``"1 | 1"`` would tokenise into empty
     strings and fail validation.
 
-    Switched-off LoRAs follow, one comment line each, after every token, and
-    then the group lines.
+    Switched-off LoRAs follow, one comment line each, after every token, then
+    the group lines, then the weight lines of the groups that have them.
     """
     cleaned = [str(token).strip() or DEFAULT_TOKEN for token in tokens]
     if separator_index is None or separator_index < 0:
@@ -380,7 +444,7 @@ def serialize(
         index = min(max(int(separator_index), 0), len(cleaned))
         text = " ".join(cleaned[:index]) + "|" + " ".join(cleaned[index:])
 
-    lines = [disabled_line(entry) for entry in disabled or []] + group_lines(groups)
+    lines = [disabled_line(entry) for entry in disabled or []] + group_lines(groups) + weight_lines(weights, groups)
     return "\n".join(([text] if text else []) + lines)
 
 

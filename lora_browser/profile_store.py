@@ -20,6 +20,8 @@ copy or bake the current folder lacks, from the originals.
 
 from __future__ import annotations
 
+import math
+
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -54,6 +56,8 @@ class ProfileEntry:
     group: str = ""
     #: Off because its mode leaves it nothing to apply, rather than by hand.
     skipped: bool = False
+    #: What it brings to its shrunk group's baked file; None outside one.
+    weight: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -70,6 +74,8 @@ class ProfileEntry:
             payload["group"] = self.group
         if self.skipped:
             payload["skipped"] = True
+        if self.weight is not None:
+            payload["weight"] = self.weight
         return payload
 
 
@@ -112,6 +118,7 @@ class Profile:
                     mode=str(item.get("mode", "normal")) if item.get("mode") in MODES else "normal",
                     group=_letter(item.get("group")),
                     skipped=bool(item.get("skipped", False)),
+                    weight=_weight(item.get("weight")),
                 )
             )
         bakes = {}
@@ -128,6 +135,16 @@ class Profile:
             note=str(payload.get("note", "") or ""),
             bakes=bakes,
         )
+
+
+def _weight(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _letter(value: Any) -> str:

@@ -18,9 +18,10 @@ largest singular values give the best rank-k approximation there is
 reported as how much of the group's combined change the bake keeps.
 
 A rank at or above what the members add up to keeps everything, and is built
-by stacking the factors as they are.  The members' strength and schedule are
-not baked in: the group's multiplier applies to the baked file at run time,
-exactly as it applied to each member.
+by stacking the factors as they are.  A group's strength and schedule are not
+baked in: the group's multiplier applies to the baked file at run time,
+exactly as it applied to each member.  A member's ``weight`` is: a shrunk
+stack bakes each LoRA in at the strength it ran at, s_i above times w_i.
 
 numpy is the only dependency, and WanGP already ships it.
 """
@@ -72,9 +73,12 @@ class Member:
     """One LoRA in the group, and which of its sides the bake takes."""
 
     path: str
-    #: ``normal`` takes everything; ``visual``/``audio`` take one LTX-2 side.
+    #: ``normal`` takes everything; ``visual``/``audio`` take one LTX-2 side,
+    #: ``sound`` the sound side without the layers both sides share.
     mode: str = "normal"
     label: str = ""
+    #: What the member brings: its change times this.
+    weight: float = 1.0
 
 
 @dataclass
@@ -161,6 +165,34 @@ class Result:
     bytes: int
 
 
+def check(member: Member, *, sided: bool) -> str:
+    """Why this LoRA could not go into a bake, or ``""`` when it can: the
+    checks :func:`plan` makes, for one member, from its header alone."""
+    label = member.label or member.path
+    try:
+        lora = lf.read_header(member.path)
+    except lf.LoraFileError as error:
+        return f"{label}: {error}"
+    found = False
+    for tensor in lora.tensors:
+        module_name, role = lf.split_key(tensor.name)
+        if sided and not lf.keeps(lf.ltx2_side(module_name), member.mode):
+            continue
+        if role in ("dora", "lokr"):
+            return f"{label} is a {role.upper() if role == 'dora' else 'LoKr'} adapter; only plain LoRAs can be baked."
+        if role == "diff":
+            return f"{label} changes '{module_name}' directly rather than as a LoRA."
+        if role == "other":
+            return f"{label} carries '{tensor.name}', which is not part of a LoRA."
+        if role in ("down", "up"):
+            if len(tensor.shape) != 2:
+                return f"{label}: '{tensor.name}' is not a 2-D factor; only linear layers can be baked."
+            if tensor.dtype not in _READ and tensor.dtype != "BF16":
+                return f"{label} stores '{tensor.name}' as {tensor.dtype}, which a bake cannot read."
+            found = True
+    return "" if found else f"{label} changes nothing a bake could combine in its mode."
+
+
 def plan(members: list[Member], *, sided: bool) -> Plan:
     """Read every member's header and line their modules up.
 
@@ -171,6 +203,9 @@ def plan(members: list[Member], *, sided: bool) -> Plan:
     """
     if len(members) < 2:
         raise BakeError("A bake needs at least two LoRAs.")
+    for member in members:
+        if not np.isfinite(float(member.weight)):
+            raise BakeError(f"{member.label or member.path} has no usable strength.")
     files, modules, by_key, ranks = [], [], {}, []
     dtypes: Counter = Counter()
     for index, member in enumerate(members):
@@ -289,7 +324,7 @@ def bake(plan_: Plan, rank: int, path: str, metadata: dict[str, str] | None = No
                 writer.write(down_name, _encode(down, plan_.dtype))
                 writer.write(up_name, _encode(up, plan_.dtype))
                 writer.write(module.name + ".alpha", np.asarray(alpha, dtype="<f4").tobytes())
-                scales = {part.member: _scale(part) for part in module.factored}
+                scales = {part.member: _scale(part) * _weight(plan_, part.member) for part in module.factored}
                 # The new file applies its factors at alpha / k; a bias delta
                 # rides on the same scale, so it is divided back out below.
                 bias_scale = float(alpha) / k
@@ -300,7 +335,7 @@ def bake(plan_: Plan, rank: int, path: str, metadata: dict[str, str] | None = No
                 for part in module.parts:
                     if part.diff_b is not None:
                         delta = _load(part.diff_b, handles[part.member]).reshape(-1)
-                        total += delta * scales.get(part.member, 1.0)
+                        total += delta * scales.get(part.member, _weight(plan_, part.member))
                 writer.write(module.name + ".diff_b", _encode(total / bias_scale, plan_.dtype))
             if progress:
                 progress(done, len(jobs))
@@ -324,7 +359,7 @@ def _fit(module: _Module, k: int, handles, plan_: Plan):
     parts = module.factored
     downs = [_load(part.down, handles[part.member]) for part in parts]
     ups = [_load(part.up, handles[part.member]) for part in parts]
-    scales = [_scale(part) for part in parts]
+    scales = [_scale(part) * _weight(plan_, part.member) for part in parts]
     total = module.total_rank
 
     if k >= total:
@@ -362,6 +397,10 @@ def _energy(up: np.ndarray, down: np.ndarray) -> float:
 
 def _scale(part: _Part) -> float:
     return float(part.alpha) / part.rank if part.alpha is not None and part.rank else 1.0
+
+
+def _weight(plan_: Plan, member: int) -> float:
+    return float(plan_.members[member].weight)
 
 
 def _names(module: _Module) -> tuple[str, str]:

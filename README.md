@@ -46,12 +46,13 @@ thumbnail browser and a real-time strength editor.
   `name: x multiplier` line per LoRA, press Enter, and that is the stack —
   schedules and all. *Copy current stack* writes the same format back out. See
   [Pasting a stack as text](#pasting-a-stack-as-text).
-- **Compare two videos' recipes.** *Compare* opens the video selected in
-  WanGP's gallery beside the newest one, both playing together, with their
-  LoRAs lined up underneath: grey where both apply the same, green where a
-  side applies more, red where it applies less — per LoRA, and step by step.
-  Tune the newest one's weights right there and *Apply* them. See
-  [Comparing two videos](#comparing-two-videos).
+- **Compare any two videos' recipes.** *Compare* opens the video selected in
+  WanGP's gallery beside the newest one — or any two from the gallery, or
+  files dropped on either side — both playing together, with their prompts
+  and LoRAs lined up underneath: grey where both apply the same, green where
+  a side applies more, red where it applies less — per LoRA, and step by
+  step. Tune the right one's weights right there and *Apply* its LoRA values,
+  its prompt, or both. See [Comparing two videos](#comparing-two-videos).
 - **A list view for long stacks.** One line per LoRA — picture, name, what each
   phase applies and its switch — with a scheduled phase shown as how many steps
   it runs on. Click a line to open that LoRA's full editor under it; one is
@@ -69,6 +70,11 @@ thumbnail browser and a real-time strength editor.
   grouped, so they move as one, and a group can be baked into a single LoRA at
   a rank you choose to save memory — and unbaked again. See
   [Groups and bakes](#groups-and-bakes).
+- **Shrink a big stack.** *Shrink* bakes every LoRA that runs at one strength
+  into one file, each at its strength, and every set of LoRAs that share a
+  schedule into a file of their own that runs it — twenty LoRAs at one
+  strength and two schedules shared by five more become three files, applying
+  the same. *Unshrink* gives them back. See [Shrinking a stack](#shrinking-a-stack).
 - **Image previews first, video previews as a still.** A LoRA with only a video
   preview gets its *first frame* decoded server-side and cached; the video itself
   is never loaded in the browser.
@@ -404,33 +410,58 @@ Tuning a recipe means rendering variants and looking for what changed.
 window, with WanGP dimmed round its edges — that puts two recipes side by side:
 
 ```
- Gallery video  1 of 12   [×]   Newest video  three.mp4   Edited
+ Compare                          [ Play both ] [⟲] [×]
+ Gallery video             [×]   Newest video     Edited [×]
+ 1 of 12 · one.mp4               12 of 12 · three.mp4
  ┌───────────────────────┐      ┌───────────────────────┐
  │        video          │      │        video          │
  └───────────────────────┘      └───────────────────────┘
- [‹] [›]             [mute]                         [mute]
- [        Play both         ]  [⟲]
+ [‹] [›]             [mute]     [‹] [›]             [mute]
  Both 8 steps, One Phase   ▲ more weight   ▼ less weight   grey: the same
 
+ Prompt                                      Differs  [Show all]
+ [ a [red] fox in the snow ]      [ a [grey] fox in the snow [at] [dusk] ]
  Detail_Enhancer                                        Per step
- ┌ ▆ ▆ ▅ ▅ ▂ ▂ _ _ ──────┐      ┌ ● ▆ ▆ ▆ ▆ ▃ ▂ _ _ ────┐
- └ red where it is less ─┘      └ green where it is more┘
+ [ ▆ ▆ ▅ ▅ ▂ ▂ _ _    → ]      [ ● ▆ ▆ ▆ ▆ ▃ ▂ _ _ ]   ← gold fade: differs
  Neg_Blur                                            One strength
- [ −1 ▲         →  ]            [ ● [−] −2 ▼ [+] ]
+ [ −1 ▲             → ]      [ ● [−] −2 ▼ [+] ]
+ ── THE SAME ON BOTH SIDES (3) ─────────────────────────────────
+ Film_Grain                                    One strength · same
+ [ 0.6                ]      [ ● [−] 0.6 [+] ]
 ```
 
-- **The left is the video selected in the gallery**, read-only. ‹ › step
-  through the gallery without closing the pop-up. × clears it: drop a video
-  there, or *Browse…* for one — MP4, MOV, M4V, MKV or WebM, or a settings
-  JSON. The settings WanGP saved in the file are read in the browser, from the
-  bytes that hold them, and the video plays from the file itself.
-- **The right is the newest video in the gallery** — taken as it was when
-  the pop-up opened, so a render finishing meanwhile does not swap it — and
-  it is yours to edit. With no video yet, it is your settings as they are.
+- **It opens on the video selected in the gallery, left, and the newest,
+  right** — each taken as it was when it was picked, so a render finishing
+  meanwhile does not swap it. With no video yet, the right is your settings
+  as they are.
+- **Either side can be any video.** ‹ › step a side through the gallery
+  without closing the pop-up. × clears a side: drop a video there, or
+  *Browse…* for one — MP4, MOV, M4V, MKV or WebM, or a settings JSON — and a
+  file dropped on a side that shows a video takes its place. The settings
+  WanGP saved in the file are read in the browser, from the bytes that hold
+  them, and the video plays from the file itself. ⟲ takes a side from a file
+  back to the gallery.
+- **The left is read-only; the right is yours to edit.** Another video on
+  the right is another recipe, so edits made to the last one are dropped.
 - **Both videos play together**: *Play both*, *Restart*, and each its own
   mute. They loop, so a difference has time to show.
+- **The prompts come first**, side by side: a few lines each until *Show
+  all* (or a tap on one) opens them, with the words one has and the other
+  does not marked — in the accent colour, since green and red are about
+  weight. Prompts are not edited here.
 - **One row per LoRA**, its name once across both sides, both sides
-  scrolling as one. A LoRA is the file you know, whatever carried it: a
+  scrolling as one, and each side's values on one line — the right's switch
+  beside them, any tags under them — so they line up across. On a phone, the
+  right's value is the target: tap it for the tray, which has −/+ and the
+  slider.
+- **What differs comes first.** Every LoRA (and the prompt) that differs
+  between the two is listed at the top; what is the same on both sides comes
+  last, under a divider. The order is set when the two sides are picked, so a
+  row never moves away while you edit it.
+- **Gold means something differs**: the right side of every LoRA that
+  differs fades from gold at its left edge, over its green or red — those say
+  which way, gold says that it does. Editing recolours it at once. The gold is
+  a CSS variable too, `--lb-changed`. A LoRA is the file you know, whatever carried it: a
   visual-only copy, a sound half, a group or a bake line up with the LoRA
   itself, and say so in a small label.
 - **Colours are about weight, not about matching.** Grey: both apply the
@@ -449,11 +480,18 @@ window, with WanGP dimmed round its edges — that puts two recipes side by side
   a LoRA off. → on a left row puts that LoRA's value on the right, adding the
   LoRA if the right does not have it. Every edit recolours both sides at once;
   a group's members move as one.
-- **Apply** makes the right side, edits and all, your LoRAs and multipliers —
-  fitted to the guidance mode WanGP is in. Nothing changes before that:
-  looking, stepping through the gallery and editing are the pop-up's own.
-  *Reset* goes back to the newest video's recipe. Escape, × or a tap outside
-  closes it.
+- **Apply…** asks what to take from the right side:
+  - *LoRA values* — its LoRAs and multipliers, edits and all, fitted to the
+    guidance mode WanGP is in. Every phase is the right side's: nothing of
+    what was set before carries into a phase it does not spell out.
+  - *Prompt* — its prompt, into WanGP's prompt box (and its prompt wizard, the
+    way WanGP's own presets set one). Off when the right side has none.
+  - *Both*.
+
+  The line beside it says what was applied, or why not. Nothing changes
+  before that: looking, stepping through the gallery and editing are the
+  pop-up's own. *Reset* goes back to the right side's own recipe. Escape puts
+  the choice away; Escape again, × or a tap outside closes the pop-up.
 
 ### The list view
 
@@ -575,16 +613,91 @@ a baked group's lines also name its file
 `loras_choices` then holds. A group with separate picture and sound strengths
 lists each member as the halves it is selected as; nothing else marks it.
 
+### Shrinking a stack
+
+A big stack takes a lot of memory: WanGP keeps every LoRA's factors loaded.
+**Shrink**, above the active LoRAs, bakes the stack down into as few files as
+run the same:
+
+- **Every LoRA at one strength** — the same value in every phase and at every
+  step — goes into **one file**, each baked in at its strength, and that file
+  runs at **1**. A LoRA at 0.7 still brings 0.7; a LoRA at −1 still takes away.
+- **LoRAs that share exactly the same schedule** (or the same strengths per
+  phase) go into **a file per schedule**, each at 1, and that file runs the
+  schedule: the sum of LoRAs that each follow a schedule is that sum following
+  it. A LoRA with no other on its schedule stays as it is.
+- **Each file is fitted to the rank of the highest-rank LoRA in it**, the way
+  a bake starts. Once built, its row says how much of the combined change it
+  kept; **Change size…** builds it again at another rank.
+- **Modes count**: an audio-only LoRA goes in as its sound side, a visual-only
+  one as its picture side, and a LoRA with separate picture and sound
+  strengths as its picture half at the one and its sound half at the other.
+  Its two halves go in together or not at all.
+- **What goes in** is what runs: LoRAs that are on, on your side of the bar. A
+  group's members come in at the group's strength, and anything baked or
+  shrunk before comes in as its originals, so shrinking again plans everything
+  afresh. **What stays as it is** is listed with why: LoRAs switched off,
+  WanGP's own, multipliers with `:` branches, LoRAs not on this machine, and
+  files a bake cannot combine (DoRA, LoKr, full weight differences).
+
+```
+ Shrink the stack
+ 3 LoRAs into 1 file · WanGP loads 2 files instead of 4, about 410 MB of
+ LoRA weights instead of 1.2 GB.
+ ┌ At one strength   3 LoRAs → 1 file, rank 64 · 410 MB ┐
+ │ Detail_Enhancer                              at 0.8 │
+ │ Film_Grain                                   at 0.6 │
+ │ Neg_Blur                                      at −1 │
+ └──────────────────────────────────────────────────────┘
+ ▸ 1 LoRA stays as it is
+                                 [ Cancel ] [ Shrink 3 LoRAs ]
+```
+
+The dialog shows the plan first; nothing changes until **Shrink**. Each file
+then builds in the background — until it is ready, WanGP reports it missing if
+you generate, and the panel warns about exactly that. A shrunk file is a row of
+its own, *Shrunk A*, its LoRAs listed under it with the strength each brings.
+Its own strength scales them all. `×` takes one out (it runs on its own again,
+and the rest are baked again), and **Unshrink** gives every one back as a LoRA
+of its own at the strength it had — times the row's strength, if you changed
+it.
+
+A shrunk file is a group whose lines say what each LoRA brings to it:
+
+```
+1 1,1,0.5,0.5
+#lora_group A Detail_Enhancer.safetensors
+#lora_group A Film_Grain.safetensors
+#lora_group A _lora_browser/_bakes/3f9c21a07b4e.r64.safetensors
+#lora_weight A 0.8 Detail_Enhancer.safetensors
+#lora_weight A 0.6 Film_Grain.safetensors
+```
+
+so presets, the queue and every video's saved settings carry everything needed
+to build it again. **Copy current stack** writes the same as tags,
+`Detail_Enhancer [group A, baked r64, weight 0.8]: x1`, and pasting it back
+gives the shrunk file back; profiles keep it too. The compare view shows each
+shrunk LoRA at what it brings, and leaves it as it is: unshrink to change one.
+
 ### Built files
 
-Visual-only and audio-only copies and baked groups are kept in the plugin's own
-folder, under `derived/<LoRA folder>-<hash>/`, and linked into the model's LoRA
-folder as `_lora_browser/` — a symlink, a junction on Windows, or a plain
-folder where neither can be made — which is how WanGP finds them like any other
-LoRA. They never show in the thumbnail grid. **Built files** in the status bar
-lists them with what each was built from, its size and what uses it (this stack
-or a saved profile), and **Delete unused** removes the ones nothing uses.
-Anything deleted is built again from its originals if it is ever used again.
+Visual-only and audio-only copies, baked groups and shrunk files are kept in
+the plugin's own folder, under `derived/<LoRA folder>-<hash>/`, and linked into
+the model's LoRA folder as `_lora_browser/` — a symlink, a junction on Windows,
+or a plain folder where neither can be made — which is how WanGP finds them
+like any other LoRA. They never show in the thumbnail grid. **Built files** in
+the status bar lists them with what each was built from, its size and what uses
+it (this stack or a saved profile). **Delete** removes one; **Delete unused**
+removes those nothing uses; **Delete all but this stack's** removes every one
+this stack does not use, saved profiles' included.
+
+**Every built file's recipe is kept** — a copy's original and mode; a bake's
+or a shrink's LoRAs, what each brings, and its rank — in `recipes.json` beside
+the files, and deleting a file keeps it. Whenever a stack, a recalled profile,
+a preset or a video's settings names a deleted file again, it is built again
+from its originals. That works even where the settings lost the lines saying
+what a baked file holds: its recipe gives the group back. The Built files list
+shows the recipes kept for deleted files.
 
 ### Phases
 
@@ -638,10 +751,11 @@ model can apply in full are listed first.
 - The frontend addresses LoRAs by stable ID only; paths are resolved server-side
   and validated against the current model's LoRA root.
 - No LoRA's absolute path reaches the browser, and all display text is
-  inserted as text nodes rather than HTML. The compare view plays gallery
-  videos from the Gradio file URLs WanGP's own gallery uses, for the files
-  WanGP lists in it; a dropped file is read in the browser and only the
-  settings found in it, and its name, are sent.
+  inserted as text nodes rather than HTML — prompts in the compare view
+  included. The compare view plays gallery videos from the Gradio file URLs
+  WanGP's own gallery uses, for the files WanGP lists in it; a dropped file is
+  read in the browser and only the settings found in it, and its name, are
+  sent.
 
 ## The Civitai catalogue
 
@@ -771,6 +885,8 @@ lora_browser/
   stack_modes.py           modes, groups and bakes in the native stack
   stack_files.py           which built files a stack needs, and their state
   compare.py               two recipes side by side, and edits written back
+  shrink.py                a stack baked down: what goes into which file, and
+                           the shrunk groups that replace them
 assets/                    panel CSS and JavaScript
 ```
 

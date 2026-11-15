@@ -335,6 +335,8 @@
             'title="Make every LoRA visual only, audio only, or normal again">Audio / visual \u25BE</button>' +
           '<button type="button" class="lb-btn" data-lb="compare" aria-haspopup="dialog" ' +
             'title="Compare the LoRAs of the video selected in the gallery with the newest video\'s">Compare</button>' +
+          '<button type="button" class="lb-btn" data-lb="shrink" aria-haspopup="dialog" ' +
+            'title="Bake the stack down into as few files as run the same, so it takes less memory">Shrink</button>' +
           '<button type="button" class="lb-btn" data-lb="collapse-all" disabled ' +
             'title="Close the open LoRA - nothing in it changes">Collapse all</button>' +
           '<button type="button" class="lb-btn" data-lb="paste" aria-haspopup="dialog" aria-expanded="false" ' +
@@ -364,7 +366,7 @@
       search: pick("search"), zoom: pick("zoom"), zoomValue: pick("zoom-value"),
       zoomIn: pick("zoom-in"), zoomOut: pick("zoom-out"),
       gridWrap: pick("grid-wrap"), grid: pick("grid"),
-      activeTitle: pick("active-title"), collapseAll: pick("collapse-all"), compare: pick("compare"),
+      activeTitle: pick("active-title"), collapseAll: pick("collapse-all"), compare: pick("compare"), shrink: pick("shrink"),
       paste: pick("paste"), disableAll: pick("disable-all"),
       enableAll: pick("enable-all"), rows: pick("rows"), status: pick("status"),
       nativeToggle: pick("native"),
@@ -493,6 +495,7 @@
 
     el.collapseAll.addEventListener("click", collapseAll);
     el.compare.addEventListener("click", openCompare);
+    el.shrink.addEventListener("click", openShrinkDialog);
     el.paste.addEventListener("click", togglePaste);
     el.disableAll.addEventListener("click", function () { send({ type: "disable_all" }); });
     el.enableAll.addEventListener("click", function () { send({ type: "enable_all" }); });
@@ -1490,8 +1493,8 @@
     name.textContent = rowName(row);
     name.title = [row.civitai_name, row.name].filter(Boolean).join("\n");
     if (row.kind === "group") {
-      name.title = "Group " + row.group + ": " + (row.members || []).map(rowName).join(", ");
-      name.appendChild(note((row.members || []).length + " LoRAs move as one"));
+      name.title = rowName(row) + ": " + (row.members || []).map(rowName).join(", ");
+      name.appendChild(note((row.members || []).length + (row.shrink ? " LoRAs in one file" : " LoRAs move as one")));
     }
     if (row.system_managed) { name.appendChild(note("WanGP-managed")); }
     if (row.missing) { name.appendChild(note("Missing locally")); }
@@ -1500,7 +1503,7 @@
     top.appendChild(fullScreenButton(row, false));
 
     if (row.kind === "group") {
-      top.appendChild(makeButton("Ungroup", "lb-btn lb-ungroup", function () {
+      top.appendChild(row.shrink ? unshrinkButton(row) : makeButton("Ungroup", "lb-btn lb-ungroup", function () {
         send({ type: "ungroup", group: row.group });
       }, "Make these separate LoRAs again; each keeps the group's strength and schedule"));
     } else {
@@ -2421,7 +2424,7 @@
     bar.className = "lb-toolbar-row";
     if (!inSheet) { bar.appendChild(fullScreenButton(row, true)); }
     if (row.kind === "group") {
-      bar.appendChild(makeButton("Ungroup", "lb-btn lb-ungroup", function () {
+      bar.appendChild(row.shrink ? unshrinkButton(row) : makeButton("Ungroup", "lb-btn lb-ungroup", function () {
         send({ type: "ungroup", group: row.group });
       }, "Make these separate LoRAs again; each keeps the group's strength and schedule"));
     } else {
@@ -2541,7 +2544,7 @@
   function sheetSubtitle(row) {
     if (row.kind === "group") {
       return plural((row.members || []).length, "LoRA", "LoRAs") +
-        (row.separate ? ", picture and sound strengths" : ", one strength");
+        (row.shrink ? " in one file" : row.separate ? ", picture and sound strengths" : ", one strength");
     }
     var streams = row.streams;
     if (!streams) { return ""; }
@@ -2889,7 +2892,7 @@
     name.appendChild(span("lb-li-label", rowName(row)));
     if (group) {
       name.appendChild(span("lb-li-sub", plural((row.members || []).length, "LoRA", "LoRAs") +
-        (row.separate ? ", picture and sound strengths" : ", one strength")));
+        (row.shrink ? " in one file" : row.separate ? ", picture and sound strengths" : ", one strength")));
       var bake = bakePill(row);
       if (bake) { name.appendChild(bake); }
     } else {
@@ -2936,13 +2939,14 @@
     var name = document.createElement("button");
     name.type = "button";
     name.className = "lb-li-name";
-    name.title = "Edit Group " + group.group;
-    name.setAttribute("aria-label", rowName(member) + ", in Group " + group.group + ". Open the group");
+    name.title = "Open " + rowName(group);
+    name.setAttribute("aria-label", rowName(member) + ", in " + rowName(group) + ". Open it");
     name.appendChild(span("lb-li-label", rowName(member)));
     modePills(member).forEach(function (node) { name.appendChild(node); });
     if (member.missing) { name.appendChild(note("Missing locally")); }
     main.appendChild(name);
-    var shared = span("lb-li-shared", "moves with Group " + group.group);
+    var shared = span("lb-li-shared", group.shrink ? "baked in at " + memberWeights(member)
+      : "moves with Group " + group.group);
     shared.style.gridColumn = "span " + listPhaseCount();
     main.appendChild(shared);
     item.appendChild(main);
@@ -3081,17 +3085,18 @@
     var bake = row.bake;
     var state = buildState(bake);
     var node = span("lb-mode-pill lb-bake-pill");
+    var shrunk = !!row.shrink;
     if (state === "built") {
-      node.textContent = "Baked r" + bake.rank + (bake.bytes ? " · " + megabytes(bake.bytes) : "");
+      node.textContent = (shrunk ? "Shrunk r" : "Baked r") + bake.rank + (bake.bytes ? " · " + megabytes(bake.bytes) : "");
     } else if (state === "building") {
-      node.textContent = "Baking ";
+      node.textContent = shrunk ? "Shrinking " : "Baking ";
       var pct = span("", (bake.pct || 0) + "%");
       pct.dataset.buildPct = bake.id || row.bake_id;
       node.appendChild(pct);
     } else if (state === "queued") {
-      node.textContent = "Bake queued";
+      node.textContent = shrunk ? "Shrink queued" : "Bake queued";
     } else if (state === "failed") {
-      node.textContent = "Bake failed";
+      node.textContent = shrunk ? "Shrink failed" : "Bake failed";
       node.classList.add("lb-pill-warn");
       node.title = bake.error || "";
     } else {
@@ -3184,7 +3189,8 @@
     var box = document.createElement("div");
     box.className = "lb-row-extra";
     if (row.kind === "group") {
-      if (S.avSupported) { box.appendChild(strengthsLine(row)); }
+      // A shrunk group's sides are in its file at their own strengths.
+      if (S.avSupported && !row.shrink) { box.appendChild(strengthsLine(row)); }
       box.appendChild(bakeBlock(row));
       card.appendChild(box);
       return;
@@ -3474,7 +3480,8 @@
     select.appendChild(new Option("Group with…", ""));
     others.forEach(function (other) {
       if (other.kind === "group") {
-        select.appendChild(new Option("Add to Group " + other.group, "g:" + other.group));
+        // A shrunk group takes no new LoRA: shrink again instead.
+        if (!other.shrink) { select.appendChild(new Option("Add to Group " + other.group, "g:" + other.group)); }
         return;
       }
       var same = (other.multiplier_raw || "") === (row.multiplier_raw || "");
@@ -3571,10 +3578,12 @@
       var detail = memberNote(member, row);
       if (detail) { name.appendChild(span("lb-member-note", detail)); }
       item.appendChild(name);
-      if (S.avSupported) { item.appendChild(modeSeg(member, true)); }
+      if (S.avSupported && !row.shrink) { item.appendChild(modeSeg(member, true)); }
       var leave = makeButton("×", "lb-btn lb-icon", function () {
         send({ type: "group_leave", group: row.group, id: member.id });
-      }, "Take " + rowName(member) + " out of Group " + row.group);
+      }, row.shrink
+        ? "Take " + rowName(member) + " out: it runs on its own at the strength it had, and the rest are baked again"
+        : "Take " + rowName(member) + " out of Group " + row.group);
       leave.setAttribute("aria-label", leave.title);
       item.appendChild(leave);
       list.appendChild(item);
@@ -3582,11 +3591,25 @@
     return list;
   }
 
+  /* What a shrunk group's member brings: one weight, or its picture's and
+     its sound's. */
+  function memberWeights(member) {
+    var weights = member.weights || [];
+    if (weights.length === 2) { return "picture " + fmt(weights[0]) + ", sound " + fmt(weights[1]); }
+    return weights.length ? fmt(weights[0]) : "1";
+  }
+
   function memberNote(member, group) {
     var parts = [];
     var streams = member.streams;
     if (streams && streams.rank) { parts.push("Rank " + streams.rank); }
     var mode = member.mode || "normal";
+    if (group.shrink) {
+      if (mode !== "normal") { parts.push((MODE_LABEL[mode] || mode).toLowerCase()); }
+      parts.push("baked in at " + memberWeights(member));
+      parts.push(buildState(group.bake) === "built" ? "inside the shrunk file" : "goes in once the file is built");
+      return parts.join(" · ");
+    }
     if (member.empty) {
       parts.push("skipped: nothing to apply in " + MODE_LABEL[mode].toLowerCase());
     } else if (group.baked) {
@@ -3637,9 +3660,12 @@
     var bake = row.bake || {};
     var count = (row.members || []).length;
     var unbake = function () {
+      // A shrunk row has Unshrink in its toolbar already.
+      if (row.shrink) { return span(""); }
       return makeButton("Unbake", "lb-btn", function () { send({ type: "unbake", group: row.group }); },
         "Load the members separately again");
     };
+    var shrunk = !!row.shrink;
     if (!row.baked) {
       head.appendChild(span("lb-muted", "Not baked"));
       head.appendChild(span("lb-grow"));
@@ -3651,7 +3677,7 @@
     }
     var state = buildState(bake);
     if (state === "built") {
-      head.appendChild(span("lb-mode-pill lb-bake-pill", "Baked r" + bake.rank));
+      head.appendChild(span("lb-mode-pill lb-bake-pill", (shrunk ? "Shrunk r" : "Baked r") + bake.rank));
       head.appendChild(span("lb-grow"));
       head.appendChild(makeButton("Change size…", "lb-btn", function () { openBakeDialog(row); }));
       head.appendChild(unbake());
@@ -3659,9 +3685,11 @@
       line.textContent = (several ? "WanGP loads a file per side" : "WanGP loads one file") +
         (bake.bytes ? (several ? ", " + megabytes(bake.bytes) + " in all," : " of " + megabytes(bake.bytes)) : "") +
         " instead of " + count + ". It keeps " + keptText(bake) + " of their combined change. " +
-        "Strength and schedule still apply live.";
+        (shrunk ? "Each LoRA's own strength is baked in; this row's strength scales them all."
+          : "Strength and schedule still apply live.");
     } else if (state === "building" || state === "queued") {
-      head.appendChild(span("", (state === "building" ? "Baking" : "Bake queued") + " at rank " + bake.rank));
+      head.appendChild(span("", (state === "building" ? (shrunk ? "Shrinking" : "Baking")
+        : (shrunk ? "Shrink queued" : "Bake queued")) + " at rank " + bake.rank));
       head.appendChild(span("lb-grow"));
       head.appendChild(unbake());
       if (state === "building") {
@@ -3676,7 +3704,7 @@
           "WanGP reports it as missing.";
       }
     } else if (state === "failed") {
-      head.appendChild(span("lb-mode-pill lb-bake-pill lb-pill-warn", "Bake failed"));
+      head.appendChild(span("lb-mode-pill lb-bake-pill lb-pill-warn", shrunk ? "Shrink failed" : "Bake failed"));
       head.appendChild(span("lb-grow"));
       head.appendChild(makeButton("Retry", "lb-btn", function () {
         var failed = (bake.files || []).filter(function (file) { return file.state === "failed"; });
@@ -3685,14 +3713,15 @@
       }));
       head.appendChild(unbake());
       load.classList.add("lb-load-warn");
-      line.textContent = (bake.error || "The bake did not finish") + ". Unbake to load the members separately.";
+      line.textContent = (bake.error || "The bake did not finish") +
+        (shrunk ? ". Unshrink to load the LoRAs separately, each at its strength." : ". Unbake to load the members separately.");
     } else {
       head.appendChild(span("lb-mode-pill lb-bake-pill lb-pill-warn", "Not built"));
       head.appendChild(span("lb-grow"));
       head.appendChild(unbake());
       load.classList.add("lb-load-warn");
       line.textContent = state === "unavailable" ? "This model has no LoRA folder to build the baked file in."
-        : "The baked file is not built yet. If you generate now, WanGP reports it as missing.";
+        : "The " + (shrunk ? "shrunk" : "baked") + " file is not built yet. If you generate now, WanGP reports it as missing.";
     }
     return box;
   }
@@ -3770,7 +3799,7 @@
   function openBakeDialog(row) {
     var body = document.createElement("div");
     body.appendChild(paragraph("Reading the LoRAs…", "lb-muted"));
-    var dialog = openDialog((row.baked ? "Change the size of " : "Bake ") + "Group " + row.group, body,
+    var dialog = openDialog((row.baked ? "Change the size of " : "Bake ") + rowName(row), body,
       [{ label: "Cancel" }]);
     var members = [];
     (row.members || []).forEach(function (member) {
@@ -3850,9 +3879,10 @@
     loadBuilt(dialog, "");
   }
 
-  function loadBuilt(dialog, action) {
+  function loadBuilt(dialog, action, ids) {
     var request = { kind: "built", in_use: stackFileIds() };
     if (action) { request.action = action; }
+    if (ids) { request.ids = ids; }
     requestMedia(request, function (reply) {
       if (action) { send({ type: "ready" }); }          // the status bar's count
       if (S.dialog !== dialog.overlay) { return; }
@@ -3887,7 +3917,7 @@
       var table = document.createElement("table");
       table.className = "lb-table";
       var headRow = table.createTHead().insertRow();
-      ["File", "Built from", "Size", "Used by"].forEach(function (label) {
+      ["File", "Built from", "Size", "Used by", ""].forEach(function (label) {
         var cell = document.createElement("th");
         cell.scope = "col";
         cell.textContent = label;
@@ -3901,11 +3931,8 @@
         name.appendChild(codeText(text(file.id).split("/").pop()));
         name.title = file.id;
         var from = line.insertCell();
-        from.textContent = file.kind === "bake"
-          ? "Group bake" + (/\.sound\.safetensors$/.test(file.id) ? " (sound side)" : "") +
-            ", rank " + file.rank + ": " + listJoin(file.members || []) +
-            (file.kept !== null && file.kept !== undefined ? " · keeps " + keptText(file) : "")
-          : (file.label || "") + " · " + (MODE_LABEL[file.mode] || file.mode || "");
+        from.textContent = builtFrom(file) +
+          (file.kind === "bake" && file.kept !== null && file.kept !== undefined ? " · keeps " + keptText(file) : "");
         var size = line.insertCell();
         size.className = "lb-t-num";
         size.textContent = megabytes(file.bytes);
@@ -3915,18 +3942,57 @@
         } else {
           used.appendChild(span("lb-muted", "nothing"));
         }
+        var act = line.insertCell();
+        if (file.deletable) {
+          var remove = makeButton("Delete", "lb-btn lb-built-delete", function () {
+            remove.disabled = true;
+            loadBuilt(dialog, "delete", [file.id]);
+          }, "Delete this file; its recipe is kept, so it is built again if anything names it");
+          act.appendChild(remove);
+        }
       });
       wrap.appendChild(table);
       body.appendChild(wrap);
     }
-    body.appendChild(paragraph("Delete unused removes only files that neither this stack nor a saved profile " +
-      "uses. Anything deleted is built again from its originals if it is ever used again.", "lb-fine"));
+    var kept = reply.recipes || [];
+    if (kept.length) {
+      var book = document.createElement("details");
+      book.className = "lb-built-recipes";
+      book.appendChild(document.createElement("summary")).textContent =
+        "Recipes kept for " + plural(kept.length, "deleted file", "deleted files");
+      var list = document.createElement("ul");
+      kept.forEach(function (recipe) {
+        var item = document.createElement("li");
+        item.appendChild(codeText(text(recipe.id).split("/").pop()));
+        item.appendChild(document.createTextNode(" · " + builtFrom(recipe)));
+        list.appendChild(item);
+      });
+      book.appendChild(list);
+      body.appendChild(book);
+    }
+    body.appendChild(paragraph("Deleting a file keeps its recipe: when this stack, a profile or a video's " +
+      "settings names it again, it is built again from its originals. This stack's own files are not offered: " +
+      "they would be built again at once. Delete unused leaves the files saved profiles use, too.", "lb-fine"));
     var unused = reply.unused || 0;
+    var deletable = reply.deletable || 0;
     dialog.setActions([
       { label: "Delete unused (" + unused + ")", left: true, disabled: !unused, keepOpen: true,
         run: function (button) { button.disabled = true; loadBuilt(dialog, "delete_unused"); } },
+      { label: "Delete all but this stack's (" + deletable + ")", left: true, disabled: !deletable, keepOpen: true,
+        run: function (button) { button.disabled = true; loadBuilt(dialog, "delete_all"); } },
       { label: "Close", primary: true }
     ]);
+  }
+
+  /* What a built file holds, in words: a copy's original and mode, or a
+     bake's members. */
+  function builtFrom(file) {
+    if (file.kind === "bake") {
+      return (file.shrink ? "Shrunk file" : "Group bake") +
+        (/\.sound\.safetensors$/.test(file.id) ? " (sound side)" : "") +
+        ", rank " + file.rank + ": " + listJoin(file.members || []);
+    }
+    return (file.label || "") + " · " + (MODE_LABEL[file.mode] || file.mode || "");
   }
 
   function paintBuiltLink() {
@@ -4329,7 +4395,8 @@
     if (S.cmp) { return; }
     S.cmp = {
       changes: {}, added: {}, picked: {}, target: null, playing: false,
-      muted: { left: false, right: true }, file: null, note: "", applied: false,
+      muted: { left: false, right: true }, files: { left: null, right: null }, notes: { left: "", right: "" },
+      ticket: 0, showResult: false, applying: false, promptOpen: false, rightKey: null, fileSeq: 0,
       opened: false, node: null, parts: null, videos: {}, trayPaint: null
     };
     send({ type: "compare_open" });
@@ -4340,11 +4407,10 @@
     if (!cmp) { return; }
     S.cmp = null;
     document.removeEventListener("keydown", onCompareKey);
-    Object.keys(cmp.videos).forEach(function (which) {
-      var video = cmp.videos[which];
-      if (video) { video.pause(); }
+    ["left", "right"].forEach(function (which) {
+      if (cmp.videos[which]) { cmp.videos[which].pause(); }
+      if (cmp.files[which] && cmp.files[which].url) { URL.revokeObjectURL(cmp.files[which].url); }
     });
-    if (cmp.file && cmp.file.url) { URL.revokeObjectURL(cmp.file.url); }
     if (cmp.node) {
       cmp.node.remove();
       lockScroll(false);
@@ -4355,7 +4421,28 @@
 
   function onCompareKey(event) {
     if (event.key !== "Escape" || !S.cmp || S.modal || S.dialog) { return; }
+    if (S.cmp.applying && S.cmp.parts) {
+      S.cmp.applying = false;
+      paintCmpFoot();
+      S.cmp.parts.apply.focus();
+      return;
+    }
     closeCompare();
+  }
+
+  /* What a side shows, as one string: another one is another recipe. */
+  function cmpSideKey(view, which) {
+    var side = view[which];
+    var file = side.source === "file" ? S.cmp.files[which] : null;
+    return [side.source, side.index, side.name, file ? file.seq : ""].join("|");
+  }
+
+  function cmpResetDraft(cmp) {
+    cmp.changes = {};
+    cmp.added = {};
+    cmp.picked = {};
+    cmp.target = null;
+    cmp.showResult = false;
   }
 
   function paintCompare() {
@@ -4368,6 +4455,11 @@
       return;
     }
     cmp.opened = true;
+    // Edits belong to the recipe they were made on: another video on the
+    // right starts again from its own.
+    var rightKey = cmpSideKey(view, "right");
+    if (cmp.rightKey !== null && cmp.rightKey !== rightKey) { cmpResetDraft(cmp); }
+    cmp.rightKey = rightKey;
     if (!cmp.node) { buildCompare(); }
     paintCmpMedia(view);
     paintCmpLegend(view);
@@ -4389,11 +4481,19 @@
     box.setAttribute("aria-modal", "true");
     box.setAttribute("aria-label", "Compare LoRAs");
 
+    // The title, the transport and the close button share one line: the
+    // rows need the height.
     var head = document.createElement("div");
     head.className = "lb-cmp-head";
     var title = document.createElement("h2");
     title.textContent = "Compare";
     head.appendChild(title);
+    var play = makeButton("Play both", "lb-btn lb-cmp-play", function () { cmpPlay(false); });
+    var restart = makeButton("", "lb-btn lb-cmp-restart", function () { cmpPlay(true); }, "Restart both");
+    restart.setAttribute("aria-label", "Restart both from the start");
+    restart.appendChild(cmpIcon("restart"));
+    head.appendChild(play);
+    head.appendChild(restart);
     var close = makeButton("×", "lb-btn lb-cmp-close", function () { closeCompare(); }, "Close compare");
     close.setAttribute("aria-label", "Close compare");
     head.appendChild(close);
@@ -4406,16 +4506,6 @@
     media.appendChild(left);
     media.appendChild(right);
     box.appendChild(media);
-
-    var transport = document.createElement("div");
-    transport.className = "lb-cmp-transport";
-    var play = makeButton("Play both", "lb-btn lb-cmp-play", function () { cmpPlay(false); });
-    var restart = makeButton("", "lb-btn lb-cmp-restart", function () { cmpPlay(true); }, "Restart both");
-    restart.setAttribute("aria-label", "Restart both from the start");
-    restart.appendChild(cmpIcon("restart"));
-    transport.appendChild(play);
-    transport.appendChild(restart);
-    box.appendChild(transport);
 
     var legend = document.createElement("div");
     legend.className = "lb-cmp-legend";
@@ -4430,27 +4520,37 @@
     tray.hidden = true;
     box.appendChild(tray);
 
+    // Apply asks what to take from the right: its LoRA values, its prompt,
+    // or both.
+    var choices = document.createElement("div");
+    choices.className = "lb-cmp-choices";
+    choices.hidden = true;
+    choices.setAttribute("role", "group");
+    choices.setAttribute("aria-label", "Apply to your settings");
+    choices.appendChild(span("lb-cmp-choices-label", "Apply the right side's"));
+    var choiceButtons = {};
+    [["loras", "LoRA values"], ["prompt", "Prompt"], ["both", "Both"]].forEach(function (choice) {
+      var button = makeButton(choice[1], "lb-btn lb-cmp-choice", function () { cmpApply(choice[0]); },
+        choice[0] === "both" ? "Its prompt and its LoRA values" : "Only its " + choice[1].toLowerCase());
+      button.dataset.what = choice[0];
+      choices.appendChild(button);
+      choiceButtons[choice[0]] = button;
+    });
+    box.appendChild(choices);
+
     var foot = document.createElement("div");
     foot.className = "lb-cmp-foot";
     var status = span("lb-cmp-status");
     status.setAttribute("role", "status");
     var reset = makeButton("Reset", "lb-btn", function () {
-      cmp.changes = {};
-      cmp.added = {};
-      cmp.picked = {};
-      cmp.target = null;
-      cmp.applied = false;
+      cmpResetDraft(cmp);
       paintCompare();
-    }, "Back to the newest video's recipe");
-    var apply = makeButton("Apply", "lb-btn lb-primary lb-cmp-apply", function () {
-      var added = Object.keys(cmp.added).map(function (key) {
-        var entry = cmp.added[key];
-        return { id: entry.add_id || entry.source, phases: entry.phases, on: entry.on };
-      });
-      send({ type: "compare_apply", changes: cmp.changes, added: added });
-      cmp.applied = true;
+    }, "Back to the right side's own recipe");
+    var apply = makeButton("Apply…", "lb-btn lb-primary lb-cmp-apply", function () {
+      cmp.applying = !cmp.applying;
       paintCmpFoot();
-    }, "Make the right side your settings, edits and all");
+      if (cmp.applying) { choiceButtons.loras.focus(); }
+    }, "Put the right side's LoRA values, prompt, or both, in your settings");
     foot.appendChild(status);
     foot.appendChild(reset);
     foot.appendChild(apply);
@@ -4463,9 +4563,23 @@
     cmp.node = overlay;
     cmp.parts = {
       left: left, right: right, play: play, legend: legend, rows: rows, tray: tray,
-      status: status, reset: reset, apply: apply
+      status: status, reset: reset, apply: apply, choices: choices, choiceButtons: choiceButtons
     };
     close.focus();
+  }
+
+  function cmpApply(what) {
+    var cmp = S.cmp;
+    var added = Object.keys(cmp.added).map(function (key) {
+      var entry = cmp.added[key];
+      return { id: entry.add_id || entry.source, phases: entry.phases, on: entry.on };
+    });
+    cmp.ticket += 1;
+    cmp.showResult = true;
+    cmp.applying = false;
+    send({ type: "compare_apply", what: what, changes: cmp.changes, added: added, ticket: cmp.ticket });
+    paintCmpFoot();
+    cmp.parts.apply.focus();
   }
 
   var CMP_ICONS = {
@@ -4494,7 +4608,7 @@
 
   /* A side's column: what it is, its video, and its controls. The video is
      rebuilt only when the side shows another one, so playback carries on
-     through every edit. */
+     through every edit. A file dropped anywhere on it takes its place. */
   function cmpColumn(which) {
     var col = document.createElement("div");
     col.className = "lb-cmp-col lb-cmp-" + which;
@@ -4507,21 +4621,19 @@
     col.appendChild(label);
     col.appendChild(screen);
     col.appendChild(controls);
-    if (which === "left") {
-      col.addEventListener("dragover", function (event) {
-        event.preventDefault();
-        col.classList.add("lb-cmp-over");
-      });
-      col.addEventListener("dragleave", function (event) {
-        if (!col.contains(event.relatedTarget)) { col.classList.remove("lb-cmp-over"); }
-      });
-      col.addEventListener("drop", function (event) {
-        event.preventDefault();
-        col.classList.remove("lb-cmp-over");
-        var files = event.dataTransfer && event.dataTransfer.files;
-        if (files && files.length) { cmpLoadFile(files[0]); }
-      });
-    }
+    col.addEventListener("dragover", function (event) {
+      event.preventDefault();
+      col.classList.add("lb-cmp-over");
+    });
+    col.addEventListener("dragleave", function (event) {
+      if (!col.contains(event.relatedTarget)) { col.classList.remove("lb-cmp-over"); }
+    });
+    col.addEventListener("drop", function (event) {
+      event.preventDefault();
+      col.classList.remove("lb-cmp-over");
+      var files = event.dataTransfer && event.dataTransfer.files;
+      if (files && files.length) { cmpLoadFile(which, files[0]); }
+    });
     return col;
   }
 
@@ -4543,9 +4655,9 @@
 
   function cmpMedia(view, which) {
     var side = view[which];
-    var cmp = S.cmp;
-    if (which === "left" && side.source === "file" && cmp.file) {
-      return { key: "file:" + cmp.file.name, urls: cmp.file.url ? [cmp.file.url] : [], kind: cmp.file.url ? "video" : "none" };
+    var file = S.cmp.files[which];
+    if (side.source === "file" && file) {
+      return { key: "file:" + file.seq + ":" + file.name, urls: file.url ? [file.url] : [], kind: file.url ? "video" : "none" };
     }
     if (side.source === "gallery" && side.url) {
       var urls = [galleryUrl(side.name), side.url].filter(function (url, index, all) {
@@ -4572,6 +4684,28 @@
     node.src = urls[0];
   }
 
+  function cmpHeading(view, which) {
+    var side = view[which];
+    if (side.source === "file") { return "Your file"; }
+    if (side.source === "current") { return "Your settings now"; }
+    if (side.source === "none") { return which === "left" ? "Left video" : "Right video"; }
+    return side.index === view.count - 1 ? "Newest video" : "Gallery video";
+  }
+
+  function cmpSub(view, which) {
+    var side = view[which];
+    if (side.source === "gallery") { return (side.index + 1) + " of " + view.count + " · " + side.name; }
+    if (side.source === "file") { return side.name; }
+    if (side.source === "current") { return "No video in the gallery yet"; }
+    return "Drop or browse a video";
+  }
+
+  /* Where a side goes back to from a file or a cleared one: the left to
+     the video selected in the gallery, the right to the newest. */
+  function cmpHome(view, which) {
+    return which === "left" ? view.selected : view.count - 1;
+  }
+
   function paintCmpMedia(view) {
     ["left", "right"].forEach(function (which) {
       var cmp = S.cmp;
@@ -4581,24 +4715,21 @@
       var screen = col.querySelector(".lb-cmp-screen");
       var controls = col.querySelector(".lb-cmp-controls");
       var media = cmpMedia(view, which);
+      var heading = cmpHeading(view, which);
 
       // What the side is.
       label.innerHTML = "";
       var words = document.createElement("div");
       words.className = "lb-cmp-words";
-      var heading = which === "left"
-        ? (side.source === "file" ? "Your file" : "Gallery video")
-        : (side.source === "current" ? "Your settings now" : "Newest video");
       words.appendChild(document.createElement("strong")).textContent = heading;
-      var sub = which === "left"
-        ? (side.source === "gallery" ? (side.index + 1) + " of " + view.count
-          : side.source === "file" ? side.name : "Drop or browse a video")
-        : (side.source === "gallery" ? side.name : "No video yet");
-      words.appendChild(span("lb-cmp-sub", sub));
+      // A file being read for a side showing a video says how it went here;
+      // an empty side says so in its drop zone.
+      var caption = side.source !== "none" && cmp.notes[which] ? cmp.notes[which] : cmpSub(view, which);
+      words.appendChild(span("lb-cmp-sub", caption)).title = caption;
       label.appendChild(words);
       if (which === "right" && cmpEdits() > 0) { label.appendChild(span("lb-cmp-badge", "Edited")); }
-      if (which === "left" && side.source !== "none") {
-        var clear = makeButton("×", "lb-btn lb-cmp-icon lb-cmp-clear", cmpClearLeft,
+      if (side.source !== "none") {
+        var clear = makeButton("×", "lb-btn lb-cmp-icon lb-cmp-clear", function () { cmpClear(which); },
           "Clear this video, to drop or browse another");
         clear.setAttribute("aria-label", clear.title);
         label.appendChild(clear);
@@ -4634,53 +4765,59 @@
           image.alt = heading;
           screen.appendChild(image);
           cmpLoad(image, media.urls, screen);
-        } else if (which === "left" && side.source === "none") {
-          screen.appendChild(cmpDropZone());
+        } else if (side.source === "none") {
+          screen.appendChild(cmpDropZone(which));
         } else {
-          screen.appendChild(span("lb-cmp-blank", which === "right" ? "Your settings as WanGP has them" : "No video"));
+          screen.appendChild(span("lb-cmp-blank", side.source === "current" ? "Your settings as WanGP has them"
+            : (side.source === "file" ? "Settings only, no video" : "No video")));
         }
       }
-      if (which === "left" && side.source === "none") {
+      if (side.source === "none") {
         var note = screen.querySelector(".lb-cmp-drop-note");
-        if (note) { note.textContent = cmp.note || "MP4, MOV, MKV or WebM, or a settings JSON"; }
+        if (note) { note.textContent = cmp.notes[which] || "MP4, MOV, MKV or WebM, or a settings JSON"; }
       }
 
-      // Its controls.
+      // Its controls: the gallery either way, or a file.
       controls.innerHTML = "";
-      if (which === "left") {
-        if (side.source === "none") {
-          var browse = document.createElement("label");
-          browse.className = "lb-btn lb-cmp-browse";
-          browse.textContent = "Browse…";
-          var input = document.createElement("input");
-          input.type = "file";
-          input.accept = CMP_ACCEPT;
-          input.className = "lb-cmp-file";
-          input.addEventListener("change", function () {
-            if (input.files && input.files[0]) { cmpLoadFile(input.files[0]); }
-          });
-          browse.appendChild(input);
-          controls.appendChild(browse);
-          if (view.count) {
-            controls.appendChild(cmpIconButton("restart", "Back to the video selected in the gallery", function () {
-              send({ type: "compare_left", index: view.selected });
+      if (side.source === "none") {
+        var browse = document.createElement("label");
+        browse.className = "lb-btn lb-cmp-browse";
+        browse.textContent = "Browse…";
+        var input = document.createElement("input");
+        input.type = "file";
+        input.accept = CMP_ACCEPT;
+        input.className = "lb-cmp-file";
+        input.setAttribute("aria-label", "Browse for a video for the " + which + " side");
+        input.addEventListener("change", function () {
+          if (input.files && input.files[0]) { cmpLoadFile(which, input.files[0]); }
+        });
+        browse.appendChild(input);
+        controls.appendChild(browse);
+        if (view.count) {
+          controls.appendChild(cmpIconButton("restart",
+            which === "left" ? "Back to the video selected in the gallery" : "Back to the newest video", function () {
+              cmpPick(which, cmpHome(view, which));
             }));
-          }
-        } else if (view.count) {
-          var at = side.source === "gallery" ? side.index : view.selected;
-          controls.appendChild(cmpIconButton("prev", "Previous video in the gallery", function () {
-            send({ type: "compare_left", index: (at - 1 + view.count) % view.count });
-          }));
-          controls.appendChild(cmpIconButton("next", "Next video in the gallery", function () {
-            send({ type: "compare_left", index: (at + 1) % view.count });
-          }));
         }
+      } else if (side.source === "gallery" && view.count) {
+        var at = side.index;
+        controls.appendChild(cmpIconButton("prev", "Previous video in the gallery", function () {
+          cmpPick(which, (at - 1 + view.count) % view.count);
+        }));
+        controls.appendChild(cmpIconButton("next", "Next video in the gallery", function () {
+          cmpPick(which, (at + 1) % view.count);
+        }));
+      } else if (view.count) {
+        controls.appendChild(cmpIconButton("restart",
+          which === "left" ? "Back to the video selected in the gallery" : "Back to the newest video", function () {
+            cmpPick(which, cmpHome(view, which));
+          }));
       }
       controls.appendChild(span("lb-grow"));
       if (cmp.videos[which]) {
         var muted = !!cmp.muted[which];
         var mute = cmpIconButton(muted ? "muted" : "sound",
-          (muted ? "Unmute " : "Mute ") + (which === "left" ? "the left video" : "the right video"), function () {
+          (muted ? "Unmute " : "Mute ") + "the " + which + " video", function () {
             cmp.muted[which] = !cmp.muted[which];
             if (cmp.videos[which]) { cmp.videos[which].muted = cmp.muted[which]; }
             paintCmpMedia(S.compareView);
@@ -4694,21 +4831,26 @@
     S.cmp.parts.play.textContent = S.cmp.playing ? "Pause both" : "Play both";
   }
 
-  function cmpDropZone() {
+  function cmpDropZone(which) {
     var zone = document.createElement("div");
     zone.className = "lb-cmp-drop";
     zone.appendChild(document.createElement("strong")).textContent = "Drop a video here";
-    zone.appendChild(span("lb-cmp-drop-note", S.cmp.note || "MP4, MOV, MKV or WebM, or a settings JSON"));
+    zone.appendChild(span("lb-cmp-drop-note", S.cmp.notes[which] || "MP4, MOV, MKV or WebM, or a settings JSON"));
     return zone;
   }
 
-  function cmpClearLeft() {
+  function cmpPick(which, index) {
+    S.cmp.notes[which] = "";
+    send({ type: "compare_pick", side: which, index: index });
+  }
+
+  function cmpClear(which) {
     var cmp = S.cmp;
-    if (cmp.videos.left) { cmp.videos.left.pause(); }
-    if (cmp.file && cmp.file.url) { URL.revokeObjectURL(cmp.file.url); }
-    cmp.file = null;
-    cmp.note = "";
-    send({ type: "compare_left_clear" });
+    if (cmp.videos[which]) { cmp.videos[which].pause(); }
+    if (cmp.files[which] && cmp.files[which].url) { URL.revokeObjectURL(cmp.files[which].url); }
+    cmp.files[which] = null;
+    cmp.notes[which] = "";
+    send({ type: "compare_clear", side: which });
   }
 
   function cmpPlay(restart) {
@@ -4734,25 +4876,28 @@
   /* WanGP writes the settings a video was made with into the file: an MP4's
      comment tag, a Matroska file's COMMENT tag. They are read here, in the
      browser, reading only the bytes that hold them. */
-  function cmpLoadFile(file) {
+  function cmpLoadFile(which, file) {
     var cmp = S.cmp;
     if (!cmp || !file) { return; }
-    cmp.note = "Reading " + file.name + "…";
+    cmp.notes[which] = "Reading " + file.name + "…";
     paintCompare();
     readFileSettings(file).then(function (settings) {
       if (S.cmp !== cmp) { return; }
       if (!settings) {
-        cmp.note = "No saved settings found in " + file.name + ".";
+        cmp.notes[which] = "No saved settings found in " + file.name + ".";
         paintCompare();
         return;
       }
-      if (cmp.file && cmp.file.url) { URL.revokeObjectURL(cmp.file.url); }
-      cmp.file = { name: file.name, url: CMP_VIDEO.test(file.name) ? URL.createObjectURL(file) : "" };
-      cmp.note = "";
-      send({ type: "compare_left_file", name: file.name, settings: settings });
+      if (cmp.files[which] && cmp.files[which].url) { URL.revokeObjectURL(cmp.files[which].url); }
+      cmp.fileSeq += 1;
+      cmp.files[which] = {
+        name: file.name, seq: cmp.fileSeq, url: CMP_VIDEO.test(file.name) ? URL.createObjectURL(file) : ""
+      };
+      cmp.notes[which] = "";
+      send({ type: "compare_file", side: which, name: file.name, settings: settings });
     }, function () {
       if (S.cmp !== cmp) { return; }
-      cmp.note = "Could not read " + file.name + ".";
+      cmp.notes[which] = "Could not read " + file.name + ".";
       paintCompare();
     });
   }
@@ -4923,9 +5068,11 @@
     return list;
   }
 
-  function cmpRowsData(view) {
+  /* One row per LoRA either side has. ``unedited``: the right as its recipe
+     has it, before any edit here. */
+  function cmpRowsData(view, unedited) {
     var left = view.left.recipe ? view.left.recipe.entries : [];
-    var right = cmpRight(view);
+    var right = unedited ? (view.right.recipe ? view.right.recipe.entries : []) : cmpRight(view);
     var keys = [];
     var byLeft = {};
     var byRight = {};
@@ -5023,6 +5170,42 @@
     return node;
   }
 
+  /* Whether a row differs between the sides: in what either applies at any
+     step, or in its mode. Nothing differs where a side has no recipe. */
+  function cmpRowChanged(view, row, segments) {
+    if (!view.left.recipe || !view.right.recipe) { return false; }
+    if (row.left && row.right) {
+      if ((row.left.mode || "") !== (row.right.mode || "")) { return true; }
+      if (!row.left.phases || !row.right.phases) {
+        return !!(row.left.phases || row.right.phases) || row.left.raw !== row.right.raw;
+      }
+    }
+    return !(segments || cmpSegments(view, row)).every(function (segment) {
+      return segment.compared && segment.left.every(function (value, index) {
+        return cmpRel(segment.right[index], value) === 0;
+      });
+    });
+  }
+
+  function cmpPromptChanged(view) {
+    return !!(view.left.recipe && view.right.recipe) && cmpPrompt(view, "left") !== cmpPrompt(view, "right");
+  }
+
+  /* What differs first, what is the same last -- decided when the two sides
+     are picked, so a row being edited does not move away under the finger. */
+  function cmpOrder(view) {
+    var cmp = S.cmp;
+    var pair = cmpSideKey(view, "left") + "||" + cmpSideKey(view, "right");
+    if (!cmp.order || cmp.order.pair !== pair) {
+      var rank = {};
+      cmpRowsData(view, true).forEach(function (row, index) {
+        rank[row.key] = { index: index, changed: cmpRowChanged(view, row) };
+      });
+      cmp.order = { pair: pair, rank: rank, prompt: cmpPromptChanged(view) };
+    }
+    return cmp.order;
+  }
+
   function paintCmpRows() {
     var cmp = S.cmp;
     var view = S.compareView;
@@ -5031,17 +5214,179 @@
     var active = document.activeElement;
     var focused = active && holder.contains(active) && active.dataset ? active.dataset.focus : "";
     holder.innerHTML = "";
+    var order = cmpOrder(view);
     var rows = cmpRowsData(view);
+    var place = function (row) {
+      return order.rank[row.key] || { index: 1e6, changed: true };
+    };
+    rows.sort(function (a, b) { return place(a).index - place(b).index; });
+    var changed = rows.filter(function (row) { return place(row).changed; });
+    var same = rows.filter(function (row) { return !place(row).changed; });
+    var prompt = cmpPromptRow(view);
+    var put = function (node) {
+      holder.appendChild(node);
+      if (node === prompt) { cmpFitPrompt(prompt); }
+    };
+    if (prompt && order.prompt) { put(prompt); }
+    changed.forEach(function (row) { put(cmpRow(view, row)); });
+    var restCount = same.length + (prompt && !order.prompt ? 1 : 0);
+    if (restCount && (changed.length || (prompt && order.prompt))) {
+      var divider = document.createElement("div");
+      divider.className = "lb-cmp-divider";
+      divider.setAttribute("role", "separator");
+      divider.appendChild(span("", "The same on both sides"));
+      divider.appendChild(span("lb-cmp-divider-count", String(restCount)));
+      holder.appendChild(divider);
+    }
+    if (prompt && !order.prompt) { put(prompt); }
+    same.forEach(function (row) { put(cmpRow(view, row)); });
     if (!rows.length) {
       holder.appendChild(paragraph(view.left.recipe || view.right.recipe
         ? "Neither recipe has a LoRA." : "Nothing to compare yet.", "lb-cmp-empty"));
     }
-    rows.forEach(function (row) { holder.appendChild(cmpRow(view, row)); });
     holder.scrollTop = scroll;
     if (focused) {
       var again = holder.querySelector('[data-focus="' + cssEscape(focused) + '"]');
       if (again) { again.focus(); }
     }
+  }
+
+  /* ------------------------------------------------------- the prompts */
+
+  function cmpPrompt(view, which) {
+    var recipe = view[which].recipe;
+    return recipe && typeof recipe.prompt === "string" && recipe.prompt.trim() ? recipe.prompt : "";
+  }
+
+  function cmpWhere(view, which) {
+    var source = view[which].source;
+    return source === "current" ? "your settings" : (source === "file" ? "this file" : "this video");
+  }
+
+  /* Which words of each prompt the other does not have, by their longest
+     common run of words. Each side is a list of words and the spaces between
+     them; ``null`` where the prompts are too long to weigh word by word. */
+  var CMP_DIFF_LIMIT = 250000;
+
+  function cmpWordDiff(left, right) {
+    var split = function (value) { return value.split(/(\s+)/).filter(function (part) { return part !== ""; }); };
+    var leftParts = split(left);
+    var rightParts = split(right);
+    var words = function (parts) {
+      var out = [];
+      parts.forEach(function (part, index) { if (!/^\s+$/.test(part)) { out.push(index); } });
+      return out;
+    };
+    var a = words(leftParts);
+    var b = words(rightParts);
+    if ((a.length + 1) * (b.length + 1) > CMP_DIFF_LIMIT) { return null; }
+    var width = b.length + 1;
+    var table = new Uint16Array((a.length + 1) * width);
+    for (var i = a.length - 1; i >= 0; i -= 1) {
+      for (var j = b.length - 1; j >= 0; j -= 1) {
+        table[i * width + j] = leftParts[a[i]] === rightParts[b[j]]
+          ? table[(i + 1) * width + j + 1] + 1
+          : Math.max(table[(i + 1) * width + j], table[i * width + j + 1]);
+      }
+    }
+    var leftMarked = {};
+    var rightMarked = {};
+    var x = 0;
+    var y = 0;
+    while (x < a.length || y < b.length) {
+      if (x < a.length && y < b.length && leftParts[a[x]] === rightParts[b[y]]) {
+        x += 1;
+        y += 1;
+      } else if (y >= b.length || (x < a.length && table[(x + 1) * width + y] >= table[x * width + y + 1])) {
+        leftMarked[a[x]] = true;
+        x += 1;
+      } else {
+        rightMarked[b[y]] = true;
+        y += 1;
+      }
+    }
+    var shape = function (parts, marked) {
+      return parts.map(function (part, index) { return { text: part, differs: !!marked[index] }; });
+    };
+    return { left: shape(leftParts, leftMarked), right: shape(rightParts, rightMarked) };
+  }
+
+  /* Both prompts, a few lines each until opened, with the words they do
+     not share marked. Read only: Apply takes the right one. */
+  function cmpPromptRow(view) {
+    var cmp = S.cmp;
+    var left = cmpPrompt(view, "left");
+    var right = cmpPrompt(view, "right");
+    if (!left && !right) { return null; }
+    var diff = left && right && left !== right ? cmpWordDiff(left, right) : null;
+    var node = document.createElement("div");
+    node.className = "lb-cmp-row lb-cmp-prompt-row" + (cmp.promptOpen ? " lb-cmp-open" : "");
+    node.dataset.key = "#prompt";
+    var head = document.createElement("div");
+    head.className = "lb-cmp-row-head";
+    head.appendChild(span("lb-cmp-name", "Prompt"));
+    var note = !left ? "Only on the right" : (!right ? "Only on the left" : (left === right ? "The same" : "Differs"));
+    if (diff) {
+      var count = diff.right.filter(function (part) { return part.differs; }).length +
+        diff.left.filter(function (part) { return part.differs; }).length;
+      if (!count) { note = "Differs in spacing"; }
+    }
+    head.appendChild(span("lb-cmp-note", note));
+    var toggle = focusKey(makeButton(cmp.promptOpen ? "Show less" : "Show all", "lb-btn lb-cmp-more", function () {
+      cmp.promptOpen = !cmp.promptOpen;
+      paintCmpRows();
+    }), "#prompt");
+    toggle.setAttribute("aria-expanded", cmp.promptOpen ? "true" : "false");
+    head.appendChild(toggle);
+    node.appendChild(head);
+    var cells = document.createElement("div");
+    cells.className = "lb-cmp-cells";
+    ["left", "right"].forEach(function (which) {
+      var text = which === "left" ? left : right;
+      var cell = document.createElement("div");
+      cell.className = "lb-cmp-cell lb-cmp-cell-" + which + " lb-cmp-prompt" +
+        (which === "right" && cmpPromptChanged(view) ? " lb-cmp-changed" : "");
+      if (!text) {
+        cell.classList.add("lb-cmp-missing");
+        cell.appendChild(span("lb-cmp-missing-text", view[which].recipe ? "No prompt" : "No settings"));
+      } else {
+        var body = document.createElement("div");
+        body.className = "lb-cmp-prompt-text";
+        (diff ? diff[which] : [{ text: text, differs: false }]).forEach(function (part) {
+          if (part.differs) {
+            var mark = document.createElement("mark");
+            mark.className = "lb-cmp-word";
+            mark.textContent = part.text;
+            body.appendChild(mark);
+          } else {
+            body.appendChild(document.createTextNode(part.text));
+          }
+        });
+        // A tap on a prompt opens or closes both; selecting its text does not.
+        body.addEventListener("click", function () {
+          var selection = window.getSelection ? String(window.getSelection()) : "";
+          if (selection) { return; }
+          if (!cmp.promptOpen && !node.classList.contains("lb-cmp-cut")) { return; }
+          cmp.promptOpen = !cmp.promptOpen;
+          paintCmpRows();
+        });
+        cell.appendChild(body);
+      }
+      cells.appendChild(cell);
+    });
+    node.appendChild(cells);
+    return node;
+  }
+
+  /* Show all only where a closed prompt is cut short. */
+  function cmpFitPrompt(node) {
+    if (S.cmp.promptOpen) { return; }
+    var cut = Array.prototype.some.call(node.querySelectorAll(".lb-cmp-prompt-text"), function (body) {
+      return body.scrollHeight > body.clientHeight + 1;
+    });
+    node.classList.toggle("lb-cmp-cut", cut);
+    var toggle = node.querySelector(".lb-cmp-more");
+    if (toggle) { toggle.hidden = !cut; }
   }
 
   function cmpRow(view, row) {
@@ -5057,14 +5402,17 @@
     var cells = document.createElement("div");
     cells.className = "lb-cmp-cells";
     cells.appendChild(cmpCell(view, row, segments, "left"));
-    cells.appendChild(cmpCell(view, row, segments, "right"));
+    var right = cmpCell(view, row, segments, "right");
+    // Gold: something about this LoRA differs, whichever way.
+    if (cmpRowChanged(view, row, segments)) { right.classList.add("lb-cmp-changed"); }
+    cells.appendChild(right);
     node.appendChild(cells);
     return node;
   }
 
   function cmpNote(view, row, segments) {
     if (!row.left && view.left.recipe) { return "Only on the right"; }
-    if (!row.right && view.right.recipe) { return view.left.source === "file" ? "Only in your file" : "Only in the gallery video"; }
+    if (!row.right && view.right.recipe) { return "Only on the left"; }
     var anyStep = segments.some(function (segment) { return segment.perStep; });
     var bothStep = segments.some(function (segment) { return segment.leftPerStep && segment.rightPerStep; });
     var text = !anyStep ? "One strength" : (bothStep ? "Per step" : "One strength vs per step");
@@ -5080,7 +5428,11 @@
     var words = [];
     if (entry.system) { words.push("WanGP's"); }
     if (entry.mode) { words.push(entry.mode); }
-    if (entry.group) { words.push("Group " + entry.group + (entry.baked ? ", baked" : "")); }
+    if (entry.shrunk) {
+      words.push("Shrunk " + entry.group);
+    } else if (entry.group) {
+      words.push("Group " + entry.group + (entry.baked ? ", baked" : ""));
+    }
     if (entry.added) { words.push("Added"); }
     return words;
   }
@@ -5095,7 +5447,7 @@
 
     if (!recipe) {
       cell.classList.add("lb-cmp-missing");
-      cell.appendChild(span("lb-cmp-missing-text", which === "left" ? "No settings to compare" : "No recipe"));
+      cell.appendChild(span("lb-cmp-missing-text", view[which].source === "none" ? "No video yet" : "No settings to compare"));
       return cell;
     }
     // Whether this side is ahead or behind, where every compared value agrees.
@@ -5109,39 +5461,42 @@
 
     if (!entry) {
       cell.classList.add("lb-cmp-missing");
-      cell.appendChild(span("lb-cmp-missing-text", which === "left" ? "Not in this video" : "Not in this recipe"));
+      cell.appendChild(span("lb-cmp-missing-text", "Not in " + cmpWhere(view, which)));
       return cell;
     }
     if (!entry.on) { cell.classList.add("lb-cmp-off"); }
-    var editable = which === "right" && !entry.system && !!entry.phases;
+    var editable = which === "right" && !entry.system && !entry.shrunk && !!entry.phases;
 
-    var top = document.createElement("div");
-    top.className = "lb-cmp-cell-top";
-    if (editable) {
-      top.appendChild(cmpSwitch(entry));
-    } else if (!entry.on) {
-      top.appendChild(span("lb-cmp-tag", "Off"));
-    }
-    cmpBadges(entry).forEach(function (word) { top.appendChild(span("lb-cmp-tag", word)); });
-    if (editable && !entry.on) { top.appendChild(span("lb-cmp-tag", "Off, counts as 0")); }
-    if (top.firstChild) { cell.appendChild(top); }
-
+    // One line: the right's switch, the values, the left's "use this value".
+    var main = document.createElement("div");
+    main.className = "lb-cmp-main";
+    if (editable) { main.appendChild(cmpSwitch(entry)); }
     if (!entry.phases) {
       // Syntax the panel keeps as it is: shown, not compared.
-      cell.appendChild(codeText(entry.raw));
-      return cell;
+      main.appendChild(codeText(entry.raw));
+    } else {
+      var line = document.createElement("div");
+      line.className = "lb-cmp-segs";
+      segments.forEach(function (segment, phase) {
+        line.appendChild(cmpSegment(view, row, segment, phase, which, editable, segments.length));
+      });
+      main.appendChild(line);
     }
-    var line = document.createElement("div");
-    line.className = "lb-cmp-segs";
-    segments.forEach(function (segment, phase) {
-      line.appendChild(cmpSegment(view, row, segment, phase, which, editable, segments.length));
-    });
-    cell.appendChild(line);
-
     if (which === "left" && cmpCanUse(view, row)) {
       var use = focusKey(cmpIconButton("use", "Use this value on the right", function () { cmpUseLeft(view, row); }), row.key + "#use");
       use.classList.add("lb-cmp-use");
-      cell.appendChild(use);
+      main.appendChild(use);
+    }
+    cell.appendChild(main);
+
+    // What else to know, under the values, where it moves nothing out of line.
+    var words = cmpBadges(entry);
+    if (!entry.on) { words.unshift(editable ? "Off, counts as 0" : "Off"); }
+    if (words.length) {
+      var tags = document.createElement("div");
+      tags.className = "lb-cmp-tags";
+      words.forEach(function (word) { tags.appendChild(span("lb-cmp-tag", word)); });
+      cell.appendChild(tags);
     }
     return cell;
   }
@@ -5343,7 +5698,7 @@
       if (patch.on !== undefined) { change.on = patch.on; }
       cmp.changes[target.key] = change;
     });
-    cmp.applied = false;
+    cmp.showResult = false;
   }
 
   function cmpCurrent(key) {
@@ -5407,14 +5762,14 @@
         mode: "", group: "", link: "", system: false, added: true, on: true, phases: lists, raw: ""
       };
     }
-    cmp.applied = false;
+    cmp.showResult = false;
     cmpRepaint();
   }
 
   function cmpCanUse(view, row) {
     if (!view.right.recipe || !row.left || !row.left.phases || row.left.system) { return false; }
     if (!row.right) { return true; }
-    if (row.right.system || !row.right.phases) { return false; }
+    if (row.right.system || row.right.shrunk || !row.right.phases) { return false; }
     return !row.right.on || JSON.stringify(row.left.phases) !== JSON.stringify(row.right.phases);
   }
 
@@ -5540,12 +5895,164 @@
   function paintCmpFoot() {
     var cmp = S.cmp;
     var view = S.compareView;
+    var parts = cmp.parts;
     var edits = cmpEdits();
-    cmp.parts.status.textContent = cmp.applied ? "Applied to your settings."
-      : edits ? plural(edits, "LoRA", "LoRAs") + " edited"
-        : (view.right.source === "current" ? "Right: your settings now" : "Right: the newest video’s recipe");
-    cmp.parts.reset.disabled = !edits;
-    cmp.parts.apply.disabled = !view.right.recipe;
+    var recipe = view.right.recipe;
+    var result = view.result;
+    var text;
+    var warn = false;
+    if (cmp.showResult) {
+      // What Apply did, once its answer is in.
+      if (result && result.ticket === cmp.ticket) {
+        text = result.text;
+        warn = !!result.warn;
+      } else {
+        text = "Applying\u2026";
+      }
+    } else if (edits) {
+      text = plural(edits, "LoRA", "LoRAs") + " edited";
+    } else {
+      text = recipe ? "Edit the right side, then apply it" : "The right side has no settings";
+    }
+    parts.status.textContent = text;
+    parts.status.classList.toggle("lb-warn", warn);
+    parts.reset.disabled = !edits;
+    parts.apply.disabled = !recipe;
+    if (!recipe) { cmp.applying = false; }
+    parts.apply.setAttribute("aria-expanded", cmp.applying ? "true" : "false");
+    parts.choices.hidden = !cmp.applying;
+    var prompt = cmpPrompt(view, "right");
+    var noPrompt = !prompt ? "The right side has no prompt"
+      : (view.prompt_writable === false ? "This WanGP build does not let the panel set the prompt" : "");
+    var buttons = parts.choiceButtons;
+    buttons.loras.disabled = !recipe;
+    buttons.prompt.disabled = !!noPrompt;
+    buttons.both.disabled = !!noPrompt || !recipe;
+    buttons.prompt.title = noPrompt || "Only its prompt";
+    buttons.both.title = noPrompt || "Its prompt and its LoRA values";
+  }
+
+  /* ----------------------------------------------------------- shrink */
+
+  /* Shrink bakes the stack down into as few files as run the same: one for
+     everything at one strength, each baked in at its strength, and one per
+     schedule several LoRAs share. The plan comes from the plugin -- it reads
+     the files -- and nothing changes until Shrink is pressed. */
+  function openShrinkDialog() {
+    var body = document.createElement("div");
+    body.appendChild(paragraph("Working out what can be baked together…", "lb-muted"));
+    S.shrinkDialog = openDialog("Shrink the stack", body, [{ label: "Cancel" }]);
+    send({ type: "shrink_plan" });
+  }
+
+  function onShrinkPlan(plan) {
+    var dialog = S.shrinkDialog;
+    if (!dialog || S.dialog !== dialog.overlay) { return; }
+    renderShrinkPlan(dialog, plan);
+  }
+
+  function unshrinkButton(row) {
+    var button = makeButton("Unshrink", "lb-btn lb-unshrink", function () {
+      send({ type: "unshrink", group: row.group });
+    }, "Load these LoRAs separately again, each at the strength it had");
+    return button;
+  }
+
+  function shrinkName(piece) {
+    var item = S.byId[piece.source];
+    return item ? displayName(item) : (piece.name || piece.source);
+  }
+
+  function shrinkWhat(bundle) {
+    if (bundle.kind === "flat") { return "At one strength"; }
+    return bundle.schedule ? "Sharing a schedule" : "Sharing strengths per phase";
+  }
+
+  function renderShrinkPlan(dialog, plan) {
+    var body = dialog.body;
+    body.innerHTML = "";
+    if (plan.error) {
+      body.appendChild(paragraph(plan.error));
+      dialog.setActions([{ label: "Close", primary: true }]);
+      return;
+    }
+    var bundles = plan.bundles || [];
+    var kept = plan.kept || [];
+    var loras = bundles.reduce(function (sum, bundle) { return sum + bundle.loras; }, 0);
+    if (!bundles.length) {
+      body.appendChild(paragraph("Nothing to shrink: no two LoRAs run at one strength, or share a schedule."));
+    } else {
+      var before = bundles.reduce(function (sum, bundle) { return sum + (bundle.bytes_before || 0); }, 0);
+      var after = bundles.reduce(function (sum, bundle) { return sum + (bundle.bytes_after || 0); }, 0);
+      var lead = paragraph("", "lb-shrink-lead");
+      lead.appendChild(document.createElement("strong")).textContent =
+        plural(loras, "LoRA", "LoRAs") + " into " + plural(bundles.length, "file", "files");
+      lead.appendChild(document.createTextNode(
+        " · WanGP loads " + plural(plan.files_after, "file", "files") + " instead of " + plan.files_before +
+        (before ? ", about " + megabytes(after) + " of LoRA weights instead of " + megabytes(before) : "") + "."));
+      body.appendChild(lead);
+      body.appendChild(paragraph("LoRAs at one strength are baked in at that strength, and their file runs at 1. " +
+        "LoRAs that share a schedule are baked in at 1, and their file runs the schedule. Each file is fitted to " +
+        "the rank of the highest-rank LoRA in it.", "lb-fine"));
+      bundles.forEach(function (bundle) {
+        var box = document.createElement("section");
+        box.className = "lb-shrink-file";
+        var head = document.createElement("div");
+        head.className = "lb-shrink-head";
+        head.appendChild(document.createElement("strong")).textContent = shrinkWhat(bundle);
+        head.appendChild(span("lb-muted", plural(bundle.loras, "LoRA", "LoRAs") + " → 1 file, rank " + bundle.rank +
+          (bundle.bytes_after ? " · " + megabytes(bundle.bytes_after) : "")));
+        box.appendChild(head);
+        if (bundle.kind !== "flat") {
+          var runs = paragraph("", "lb-shrink-runs");
+          runs.appendChild(document.createTextNode("Runs "));
+          runs.appendChild(codeText(bundle.token));
+          box.appendChild(runs);
+        }
+        var list = document.createElement("ul");
+        list.className = "lb-shrink-list";
+        (bundle.members || []).forEach(function (piece) {
+          var item = document.createElement("li");
+          item.appendChild(span("lb-shrink-name", shrinkName(piece)));
+          var mode = piece.mode && piece.mode !== "normal" ? (MODE_LABEL[piece.mode] || piece.mode) : "";
+          var detail = [mode, bundle.kind === "flat" ? "at " + fmt(piece.weight) : ""].filter(Boolean).join(" · ");
+          if (detail) { item.appendChild(span("lb-shrink-detail", detail)); }
+          list.appendChild(item);
+        });
+        box.appendChild(list);
+        body.appendChild(box);
+      });
+    }
+    if (kept.length) {
+      var rest = document.createElement("details");
+      rest.className = "lb-shrink-kept";
+      if (!bundles.length) { rest.open = true; }
+      rest.appendChild(document.createElement("summary")).textContent =
+        plural(kept.length, "LoRA stays", "LoRAs stay") + " as " + (kept.length === 1 ? "it is" : "they are");
+      var reasons = document.createElement("ul");
+      reasons.className = "lb-shrink-list";
+      kept.forEach(function (piece) {
+        var item = document.createElement("li");
+        item.appendChild(span("lb-shrink-name", shrinkName(piece)));
+        item.appendChild(span("lb-shrink-detail", piece.reason || ""));
+        reasons.appendChild(item);
+      });
+      rest.appendChild(reasons);
+      body.appendChild(rest);
+    }
+    if (bundles.length) {
+      body.appendChild(paragraph("The originals stay where they are. Each shrunk file is built in the background; " +
+        "until it is, WanGP reports it missing if you generate. Unshrink, on each shrunk row, loads the LoRAs " +
+        "separately again.", "lb-fine"));
+      dialog.setActions([
+        { label: "Cancel" },
+        { label: "Shrink " + plural(loras, "LoRA", "LoRAs"), primary: true, run: function () { send({ type: "shrink" }); } }
+      ]);
+      var go = dialog.overlay.querySelector(".lb-dialog-foot .lb-primary");
+      if (go) { go.focus(); }
+    } else {
+      dialog.setActions([{ label: "Close", primary: true }]);
+    }
   }
 
   /* --------------------------------------------------------- inspect */
@@ -5902,6 +6409,7 @@
     // The answer to a paste is about the paste, even when a newer payload
     // overtook the one carrying it.
     if (payload.paste_report) { onPasteReport(payload.paste_report); }
+    if (payload.shrink_plan) { onShrinkPlan(payload.shrink_plan); }
     // Ignore a stale async response that lost the race with a newer sync.
     if (payload.revision !== undefined && payload.revision < S.revision) { return; }
 

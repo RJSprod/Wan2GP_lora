@@ -34,6 +34,7 @@ from .lora_browser import compare as cmp
 from .lora_browser import derived as dv
 from .lora_browser import lora_files as lf
 from .lora_browser import schedule as sch
+from .lora_browser import shrink as sk
 from .lora_browser import stack_modes as sm
 from .lora_browser import stack_text
 from .lora_browser import ui_payloads as up
@@ -159,10 +160,21 @@ class InstanceState:
         self.paste_report: dict | None = None
         #: LTX-2: the model's LoRAs have a picture side and a sound side.
         self.sided = False
-        #: The compare view, while it is open: which video each side shows.
-        #: The right side's settings are a copy taken when it opened, so a
-        #: video finishing meanwhile does not swap the recipe being edited.
+        #: The compare view, while it is open: which video each side shows,
+        #: each with the settings it had when it was picked, so a video
+        #: finishing meanwhile does not swap the recipe being compared.
         self.compare: dict | None = None
+        #: A prompt the compare view applied, for the action's prompt output;
+        #: and whether this WanGP gave the panel that output at all.
+        self.pending_prompt: str | None = None
+        self.prompt_writable = False
+        #: What a shrink would make of the stack, for the Shrink dialog --
+        #: carried by the next payload only, the one answering the question.
+        self.shrink_report: dict | None = None
+
+    def take_prompt(self) -> str | None:
+        prompt, self.pending_prompt = self.pending_prompt, None
+        return prompt
 
     def next_revision(self) -> int:
         self.revision += 1
@@ -175,6 +187,10 @@ class InstanceState:
 
     def take_paste_report(self) -> dict | None:
         report, self.paste_report = self.paste_report, None
+        return report
+
+    def take_shrink_report(self) -> dict | None:
+        report, self.shrink_report = self.shrink_report, None
         return report
 
     def note(self, message: str, warn: bool = False) -> None:
@@ -218,7 +234,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         for component in (
             "loras_choices", "loras_multipliers", "guidance_phases", "state",
             "lset_name", "main", "num_inference_steps", "sample_solver",
-            "num_inference_steps2",
+            "num_inference_steps2", "prompt", "fill_wizard_prompt_trigger",
         ):
             self.request_component(component)
 
@@ -345,9 +361,16 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         num_inference_steps = components.get("num_inference_steps")
         sample_solver = components.get("sample_solver")
         num_inference_steps2 = components.get("num_inference_steps2")
+        # The prompt box, for the compare view's Apply; and the trigger WanGP's
+        # presets fire so its prompt wizard re-reads a prompt they set.
+        prompt_box = components.get("prompt")
+        wizard_trigger = components.get("fill_wizard_prompt_trigger")
+        prompt_outputs = [prompt_box] + ([wizard_trigger] if wizard_trigger is not None else []) \
+            if prompt_box is not None else []
 
         instance_id = getattr(loras_multipliers, "_id", id(loras_multipliers))
         instance = self._instance(instance_id)
+        instance.prompt_writable = prompt_box is not None
 
         namespace = f"wgp-lora-browser-{instance_id}"
         ids = {
@@ -408,7 +431,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         def act(action_json, state_value, selected, multipliers, *extra):
             return self._apply_action(
                 instance, action_json, state_value, selected, multipliers, *unpack(extra)
-            )
+            ) + self._prompt_updates(instance, state_value, len(prompt_outputs))
 
         def serve_media(request_json, state_value):
             return self._serve_media(instance, request_json, state_value)
@@ -464,7 +487,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         action_btn.click(
             fn=act,
             inputs=[action_box] + sync_inputs,
-            outputs=[loras_choices, loras_multipliers, payload_box],
+            outputs=[loras_choices, loras_multipliers, payload_box] + prompt_outputs,
             show_progress="hidden",
         )
 
@@ -550,6 +573,12 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         instance.lora_dir = lora_dir
         instance.inventory_ids = inventory.ids
         instance.sided = up.is_ltx2(model_def)
+        # A baked file named without the lines saying what it holds gets them
+        # back from its recipe, so it is a group again -- and can be rebuilt.
+        try:
+            self._stack_files(instance, inventory).restore_groups(stack)
+        except OSError:
+            pass
         up.remember_hidden_phases(stack, phases, instance.phase_memory)
         up.forget_superseded_phases(stack, instance.hidden_phases)
         # Bring the region editor back in line with the native tokens before
@@ -668,13 +697,14 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 "stack_text": stack_text.format_stack(
                     [
                         (entry.id, entry.multiplier, self._text_mode(entry, entries), entry.group,
-                         bakes.get(entry.group, 0))
+                         bakes.get(entry.group, 0), entry.weight)
                         for entry in entries if entry.enabled
                     ],
                     name_index,
                 ),
                 # Set only on the payload answering a pasted stack.
                 "paste_report": instance.take_paste_report(),
+                "shrink_plan": instance.take_shrink_report(),
                 # Two recipes side by side, while the compare view is open.
                 "compare": self._compare_view(instance, state_value, inventory, model_type),
                 "signature": signature,
@@ -722,8 +752,22 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         extension = os.path.splitext(str(path or ""))[1].lower()
         return "image" if extension in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif") else "video"
 
+    @staticmethod
+    def _compare_pick(files, settings, index) -> dict:
+        """One of the gallery's files for a side, with the settings it was made
+        with as they are now: a side does not change under the person
+        comparing it."""
+        index = max(0, min(int(index), len(files) - 1))
+        found = settings[index] if index < len(settings) else None
+        return {"source": "gallery", "index": index, "path": files[index],
+                "settings": copy.deepcopy(found) if isinstance(found, dict) else None}
+
     def _compare_action(self, instance, action, state_value, stack, inventory, phases, model_type, live) -> bool:
-        """Open, steer and apply the compare view. Only Apply moves native state."""
+        """Open, steer and apply the compare view. Only Apply moves native state.
+
+        Either side shows any of the gallery's videos, or a file dropped on it;
+        the right one is the one edited and applied.
+        """
         kind = str(action.get("type", ""))
         files, settings, chosen = self._gallery(state_value)
         if kind == "compare_close":
@@ -731,12 +775,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             return False
         if kind == "compare_open":
             if files:
-                newest = settings[-1] if len(settings) == len(files) else None
-                right = {
-                    "source": "gallery", "index": len(files) - 1, "path": files[-1],
-                    "settings": copy.deepcopy(newest) if isinstance(newest, dict) else None,
-                }
-                left = {"source": "gallery", "index": chosen}
+                left = self._compare_pick(files, settings, chosen)
+                right = self._compare_pick(files, settings, len(files) - 1)
             else:
                 # No video yet: the right side is what WanGP has now.
                 selected, multipliers, guidance, steps, sampler, steps2 = live
@@ -750,59 +790,116 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             return False
         if instance.compare is None:
             return False
-        if kind == "compare_left":
+        if kind == "compare_apply":
+            return self._compare_apply(instance, action, stack, inventory, phases)
+        side = str(action.get("side", ""))
+        if side not in ("left", "right"):
+            return False
+        if kind == "compare_pick":
             if not files:
                 return False
             try:
                 index = int(action.get("index", 0))
             except (TypeError, ValueError):
                 return False
-            instance.compare["left"] = {"source": "gallery", "index": max(0, min(index, len(files) - 1))}
-            return False
-        if kind == "compare_left_clear":
-            instance.compare["left"] = {"source": "none"}
-            return False
-        if kind == "compare_left_file":
+            instance.compare[side] = self._compare_pick(files, settings, index)
+        elif kind == "compare_clear":
+            instance.compare[side] = {"source": "none"}
+        elif kind == "compare_file":
             found = action.get("settings")
             if not isinstance(found, dict) or len(json.dumps(found)) > cmp.MAX_SETTINGS_BYTES:
                 instance.note("That file has no settings the panel can read.", True)
                 return False
-            instance.compare["left"] = {"source": "file", "name": display_name(action.get("name") or "")[:200],
-                                        "settings": found}
-            return False
-        if kind == "compare_apply":
-            return self._compare_apply(instance, action, stack, inventory, phases)
+            instance.compare[side] = {"source": "file", "name": display_name(action.get("name") or "")[:200],
+                                      "settings": found}
         return False
 
     def _compare_apply(self, instance, action, stack, inventory, phases) -> bool:
-        """The right side, edits and all, as WanGP's LoRAs and multipliers."""
+        """The right side's LoRA values, edits and all, its prompt, or both, as
+        WanGP's settings. Returns whether the LoRAs moved; a prompt goes out
+        through its own component (``take_prompt``).
+
+        What it did is the status, and the view's ``result`` too -- with the
+        ticket the browser sent, so the pop-up shows the answer to its own
+        Apply and not an older one.
+        """
+        ticket = action.get("ticket")
+        ticket = ticket if isinstance(ticket, int) and not isinstance(ticket, bool) else None
+
+        def answer(text: str, warn: bool) -> None:
+            instance.note(text, warn)
+            instance.compare["result"] = {"ticket": ticket, "text": text, "warn": warn}
+
         right = instance.compare.get("right") or {}
         found = right.get("settings")
-        if not isinstance(found, dict):
-            instance.note("The newest video has no settings to apply.", True)
+        what = str(action.get("what") or "loras")
+        if what not in ("loras", "prompt", "both"):
+            answer("Nothing was applied.", True)
             return False
-        model_type = str(found.get("model_type") or "")
-        model_def = self._model_def(model_type) if model_type else {}
-        recipe = cmp.from_settings(found, model_def, inventory.ids)
-        own_phases = up.resolve_phases(model_def, found.get("guidance_phases", 1))
-        result = cmp.apply_edits(
-            recipe["selected"], recipe["multipliers"], own_phases,
-            action.get("changes"), action.get("added"), recipe["steps"], inventory.ids,
-        )
-        # Into the guidance mode WanGP is in now.
-        up.fit_phase_structure(result, phases, {})
-        stack.ids, stack.tokens = result.ids, result.tokens
-        stack.separator_index, stack.disabled, stack.groups = result.separator_index, result.disabled, result.groups
-        missing = [
-            lora_id for lora_id, _, _ in stack.user_entries()
-            if inventory.get(lora_id) is None and not dv.is_derived(lora_id)
-        ]
-        if missing:
-            names = ", ".join(display_name(lora_id) for lora_id in missing[:3])
-            instance.note(f"Applied. {len(missing)} of its LoRAs are not in this model's list: {names}", True)
-        else:
-            instance.note("Applied the right side to your settings.")
-        return True
+        if not isinstance(found, dict):
+            answer("The right side has no settings to apply.", True)
+            return False
+        parts = []
+        warn = ""
+        if what in ("prompt", "both"):
+            prompt = found.get("prompt")
+            if not isinstance(prompt, str) or not prompt.strip():
+                answer("The right side has no prompt to apply.", True)
+                return False
+            if not instance.prompt_writable:
+                answer("This WanGP build does not let the panel set the prompt.", True)
+                return False
+            instance.pending_prompt = prompt
+            parts.append("prompt")
+        changed = False
+        if what in ("loras", "both"):
+            model_type = str(found.get("model_type") or "")
+            model_def = self._model_def(model_type) if model_type else {}
+            recipe = cmp.from_settings(found, model_def, inventory.ids)
+            own_phases = up.resolve_phases(model_def, found.get("guidance_phases", 1))
+            result = cmp.apply_edits(
+                recipe["selected"], recipe["multipliers"], own_phases,
+                action.get("changes"), action.get("added"), recipe["steps"], inventory.ids,
+            )
+            # The right side is the truth for these now, as a paste is: nothing
+            # remembered about how they were set before -- a phase 2 of the
+            # last recipe, a timeline -- may fill in what this one says.
+            for lora_id in set(result.ids) | {lora_id for lora_id, _, _ in result.user_entries()}:
+                instance.phase_memory.pop(lora_id, None)
+                instance.hidden_phases.pop(lora_id, None)
+                for key in [key for key in instance.schedules if key[0] == lora_id]:
+                    del instance.schedules[key]
+            # Into the guidance mode WanGP is in now, keeping what a narrower
+            # mode cuts for when it widens again.
+            up.fit_phase_structure(result, phases, instance.hidden_phases)
+            stack.ids, stack.tokens = result.ids, result.tokens
+            stack.separator_index, stack.disabled, stack.groups = result.separator_index, result.disabled, result.groups
+            stack.weights = result.weights
+            missing = [
+                lora_id for lora_id, _, _ in stack.user_entries()
+                if inventory.get(lora_id) is None and not dv.is_derived(lora_id)
+            ]
+            if missing:
+                names = ", ".join(display_name(lora_id) for lora_id in missing[:3])
+                warn = f" {len(missing)} of its LoRAs are not in this model's list: {names}"
+            parts.append("LoRA values")
+            changed = True
+        answer(f"Applied the right side's {' and '.join(parts)} to your settings.{warn}", bool(warn))
+        return changed
+
+    def _prompt_updates(self, instance, state_value, outputs: int) -> tuple:
+        """What the prompt components are given after an action: nothing, or
+        the prompt Apply chose -- set the way WanGP's own presets set it, so
+        its prompt wizard reads the new prompt rather than keep its own."""
+        prompt = instance.take_prompt()
+        if prompt is None or outputs <= 0:
+            return tuple(gr.update() for _ in range(max(0, outputs)))
+        if isinstance(state_value, dict):
+            state_value["apply_success"] = 1
+        updates = [gr.update(value=prompt)]
+        if outputs > 1:
+            updates.append(gr.update(value=f"lora-browser-{instance.next_revision()}"))
+        return tuple(updates)
 
     def _compare_view(self, instance, state_value, inventory, model_type) -> dict | None:
         """Both sides of the compare view, as the browser draws them."""
@@ -843,6 +940,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             "model_type": model_type,
             "left": side(instance.compare.get("left") or {}),
             "right": side(instance.compare.get("right") or {}),
+            # What the last Apply did, and whether Apply can set the prompt.
+            "result": instance.compare.get("result"),
+            "prompt_writable": instance.prompt_writable,
         }
 
     def _profile_entries(self, stack: up.Stack, files: StackFiles) -> tuple[list[ProfileEntry], dict[str, int]]:
@@ -867,6 +967,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                     id=source, multiplier=token, enabled=on, mode=mode,
                     group=group.letter if group else member_of.get(member, ""),
                     skipped=(not on) and lora_id in skipped,
+                    weight=group.weight(member) if group is not None and group.weighted else None,
                 ))
         return entries, bakes
 
@@ -875,7 +976,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         """Rebuild the user side of the stack from profile-style entries:
         modes as built copies, groups as group lines, bakes as baked files.
         Anything not on disk yet is built by the next payload."""
-        native, skipped, groups, seen = [], set(), {}, set()
+        native, skipped, groups, seen, weights = [], set(), {}, set(), {}
         for entry in entries:
             lora_id = dv.split_id(entry.id, entry.mode) if files.sided else entry.id
             if lora_id in seen:
@@ -886,8 +987,12 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 skipped.add(lora_id)
             if entry.group:
                 groups.setdefault(entry.group, []).append(lora_id)
+                if entry.weight is not None:
+                    weights.setdefault(entry.group, {})[lora_id] = float(entry.weight)
         stack.set_user_entries(native, skipped)
         stack.groups = {letter: members for letter, members in groups.items() if len(members) >= 2}
+        # A shrunk group's members bring their weights to its baked file.
+        stack.weights = {letter: found for letter, found in weights.items() if letter in stack.groups}
         for letter, rank in bakes.items():
             group = sm.groups(stack).get(letter)
             if group is not None and not group.baked:
@@ -1021,6 +1126,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         if kind in ("set_mode", "set_mode_all", "group_create", "group_add", "group_leave",
                     "ungroup", "bake", "unbake", "group_separate"):
             return self._mode_action(instance, action, stack, self._stack_files(instance, inventory))
+
+        if kind in ("shrink_plan", "shrink", "unshrink"):
+            return self._shrink_action(instance, action, stack, self._stack_files(instance, inventory))
 
         if kind == "build_retry":
             self._builder.retry(normalize_id(action.get("id")))
@@ -1466,6 +1574,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             return changed
 
         if kind == "unbake":
+            group = sm.groups(stack).get(letter)
+            if group is not None and group.weighted:
+                return self._shrink_action(instance, {"type": "unshrink", "group": letter}, stack, files)
             if not sm.unbake(stack, letter):
                 return False
             sm.settle(stack, files.empty)
@@ -1476,6 +1587,43 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         if kind == "group_separate":
             return self._group_separate(instance, stack, files, letter, bool(action.get("value")))
         return False
+
+    def _shrink_action(self, instance, action, stack, files: StackFiles) -> bool:
+        """Plan a shrink, carry it out, or undo one group of it."""
+        kind = action["type"]
+        if kind == "unshrink":
+            letter = str(action.get("group", "") or "").upper()
+            group = sm.groups(stack).get(letter)
+            if group is None or not group.weighted:
+                return False
+            count = len({files.source(member)[0] for member in group.members})
+            if not sm.unshrink(stack, letter):
+                return False
+            sm.settle(stack, files.empty)
+            instance.note(f"Unshrunk: WanGP loads those {count} LoRAs separately again, each at the strength "
+                          "it had. The shrunk file stays under Built files until you delete it.")
+            return True
+        if files.store is None:
+            instance.note("This model has no LoRA folder to build the shrunk files in.", True)
+            instance.shrink_report = {"error": "This model has no LoRA folder to build the shrunk files in."}
+            return False
+        result = sk.plan(stack, files)
+        if kind == "shrink_plan":
+            instance.shrink_report = result.to_dict()
+            return False
+        if not result.bundles:
+            instance.note("Nothing to shrink: no two LoRAs run at one strength, or share a schedule.", True)
+            return False
+        made = sk.apply(stack, result, files)
+        if not made:
+            return False
+        sm.settle(stack, files.empty)
+        loras = sum(bundle.loras for bundle in result.bundles)
+        files_word = "file" if len(made) == 1 else "files"
+        instance.note(f"Shrinking {loras} LoRAs into {len(made)} {files_word}. Until "
+                      f"{'it is' if len(made) == 1 else 'they are'} built, WanGP reports "
+                      f"{'it' if len(made) == 1 else 'them'} as missing if you generate.")
+        return True
 
     def _group_separate(self, instance, stack, files: StackFiles, letter: str, separate: bool) -> bool:
         """Give a group a picture strength and a sound strength, or one again.
@@ -1625,6 +1773,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         files = self._stack_files(instance, inventory)
         entries, problems, first_line = [], [], {}
         groups: dict[str, list[str]] = {}
+        #: What each LoRA of a shrunk group brings to its file.
+        weights: dict[str, dict[str, float]] = {}
         #: The multiplier each side of a group was first given, and where.
         group_token: dict[tuple[str, str], tuple[str, int]] = {}
         bakes: dict[str, int] = {}
@@ -1671,6 +1821,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             if line.group:
                 group_token.setdefault(key, (token, line.number))
                 groups.setdefault(line.group, []).append(native)
+                if line.weight is not None:
+                    weights.setdefault(line.group, {})[native] = float(line.weight)
                 if line.baked:
                     bakes[line.group] = max(bakes.get(line.group, 0), line.baked)
             entries.append((native, True, token))
@@ -1719,11 +1871,20 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 del instance.schedules[key]
         stack.set_user_entries(entries, set())
         stack.groups = {letter: members for letter, members in groups.items() if len(members) >= 2}
+        stack.weights = {}
         sm.repair(stack, files.known)
+        # A shrunk group's weights, once the groups have their shapes; one
+        # that comes without a baked file is its LoRAs at what they brought.
+        stack.weights = {letter: {member: found[member] for member in stack.groups[letter] if member in found}
+                         for letter, found in weights.items() if letter in stack.groups}
         for letter, rank in bakes.items():
             group = sm.groups(stack).get(letter)
             if group is not None:
                 sm.set_bakes(stack, letter, files.bake_ids(group, rank))
+        for letter in list(stack.weights):
+            group = sm.groups(stack).get(letter)
+            if group is not None and not group.baked:
+                sm.unshrink(stack, letter)
         sm.settle(stack, files.empty)
 
         unrun = sum(1 for _, _, token in entries if stack_text.phase_count(token) > phases.effective)
@@ -1998,11 +2159,22 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         used = self._profile_references(files)
         listed = store.files() if (os.path.isdir(store.root) or os.path.isdir(store.link)) else []
         unused = [item["id"] for item in listed if item["id"] not in in_stack and item["id"] not in used]
-        if request.get("action") == "delete_unused":
-            removed = store.delete(unused)
-            instance.note(f"Deleted {removed} unused built file{'s' if removed != 1 else ''}.")
+        action = request.get("action")
+        if action in ("delete_unused", "delete", "delete_all"):
+            # Never this stack's: it would only be built again at once.
+            if action == "delete_unused":
+                targets = unused
+            elif action == "delete_all":
+                targets = [item["id"] for item in listed if item["id"] not in in_stack]
+            else:
+                wanted = {normalize_id(value) for value in (request.get("ids") or [])}
+                targets = [item["id"] for item in listed if item["id"] in wanted and item["id"] not in in_stack]
+            removed = store.delete(targets)
+            instance.note(f"Deleted {removed} built file{'s' if removed != 1 else ''}. "
+                          + ("Its recipe is kept" if removed == 1 else "Their recipes are kept")
+                          + ": whatever names one again builds it again.")
             listed = store.files()
-            unused = []
+            unused = [item["id"] for item in listed if item["id"] not in in_stack and item["id"] not in used]
         rows = []
         for item in listed:
             users = (["this stack"] if item["id"] in in_stack else []) + used.get(item["id"], [])
@@ -2011,12 +2183,27 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 "mode": item.get("mode", ""), "rank": item.get("rank", 0), "kept": item.get("kept"),
                 "exact": item.get("exact"), "label": item.get("label", ""), "linked": bool(item.get("linked")),
                 "members": [member.get("name", "") for member in item.get("members", []) or []],
+                "shrink": bool(item.get("shrink")),
                 "used_by": users,
+                "deletable": item["id"] not in in_stack,
+            })
+        # Recipes of files no longer on disk: built again whenever named.
+        on_disk = {item["id"] for item in listed}
+        kept = []
+        for derived_id, recipe in sorted(store.recipes().items()):
+            if derived_id in on_disk or not isinstance(recipe, dict):
+                continue
+            kept.append({
+                "id": derived_id, "kind": recipe.get("kind", ""), "mode": recipe.get("mode", ""),
+                "rank": recipe.get("rank", 0), "label": recipe.get("label", ""), "shrink": bool(recipe.get("shrink")),
+                "members": [member.get("name", "") for member in recipe.get("members", []) or []
+                            if isinstance(member, dict)],
             })
         folder = os.path.relpath(store.root, os.path.dirname(PLUGIN_DIR)).replace("\\", "/")
         return {
             "kind": "built", "files": rows, "unused": len(unused), "folder": folder,
             "link": f"{dv.LINK_NAME}/", "linked": store.linked if listed else True,
+            "deletable": sum(1 for row in rows if row["deletable"]), "recipes": kept,
         }
 
     def _serve_bake_plan(self, instance, request, state_value) -> dict:

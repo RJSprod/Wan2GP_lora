@@ -222,3 +222,65 @@ def test_a_failed_bake_leaves_nothing(tmp_path, rng, monkeypatch):
     with pytest.raises(RuntimeError):
         bk.bake(plan, 4, str(out))
     assert not out.exists() and not (tmp_path / "baked.safetensors.part").exists()
+
+
+# ---------------------------------------------------------------- weights
+
+
+def _scaled(delta, factor):
+    return {key: value * factor for key, value in delta.items()}
+
+
+def test_weighted_members_bake_in_at_their_strength(tmp_path, rng):
+    """A shrink bakes each LoRA in at the strength it ran at: at full rank the
+    file is exactly their weighted sum -- a negative weight included."""
+    a, b = _two_members(tmp_path, rng, alpha_a=8.0, alpha_b=None, header_b="4")
+    plan = bk.plan([bk.Member(str(a), weight=0.7), bk.Member(str(b), weight=-0.5)], sided=False)
+    out = tmp_path / "shrunk.safetensors"
+    result = bk.bake(plan, plan.combined_rank, str(out))
+    assert result.exact
+    expected = _sum(_scaled(_dense(a), 0.7), _scaled(_dense(b), -0.5))
+    got = _dense(out)
+    assert set(got) == set(expected)
+    for key in expected:
+        np.testing.assert_allclose(got[key], expected[key], rtol=1e-5, atol=1e-6)
+
+
+def test_weighted_members_at_a_lower_rank_fit_their_weighted_sum(tmp_path, rng):
+    a, b = _two_members(tmp_path, rng)
+    plan = bk.plan([bk.Member(str(a), weight=0.25), bk.Member(str(b), weight=1.5)], sided=False)
+    out = tmp_path / "shrunk.safetensors"
+    rank = 6
+    bk.bake(plan, rank, str(out))
+    expected = _sum(_scaled(_dense(a), 0.25), _scaled(_dense(b), 1.5))
+    got = _dense(out)
+    for key, dense in expected.items():
+        singular = np.linalg.svd(dense, compute_uv=False)
+        error = np.linalg.norm(got[key] - dense)
+        assert error == pytest.approx(np.sqrt(np.sum(singular[rank:] ** 2)), rel=1e-4, abs=1e-6)
+
+
+def test_a_weighted_member_brings_its_bias_at_its_weight(tmp_path, rng):
+    a, b = tmp_path / "a.safetensors", tmp_path / "b.safetensors"
+    name = "blocks.0.attn1.to_q"
+    bias_a, bias_b = rng.standard_normal(OUT).astype(np.float32), rng.standard_normal(OUT).astype(np.float32)
+    write_lora(a, _module_tensors(name, *lora_pair(rng, OUT, IN, 4), alpha=8.0) + [(f"{name}.diff_b", "F32", bias_a)])
+    write_lora(b, _module_tensors(name, *lora_pair(rng, OUT, IN, 4)) + [(f"{name}.diff_b", "F32", bias_b)])
+    plan = bk.plan([bk.Member(str(a), weight=0.5), bk.Member(str(b), weight=0.2)], sided=False)
+    out = tmp_path / "shrunk.safetensors"
+    bk.bake(plan, 3, str(out))
+    arrays, _, _ = read_tensors(out)
+    rank = arrays[f"{name}.lora_A.weight"].shape[0]
+    scale = float(arrays[f"{name}.alpha"]) / rank
+    np.testing.assert_allclose(arrays[f"{name}.diff_b"] * scale, 0.5 * 2 * bias_a + 0.2 * bias_b, rtol=1e-5, atol=1e-5)
+
+
+def test_check_says_why_one_lora_cannot_be_baked(tmp_path, rng):
+    good, dora = tmp_path / "good.safetensors", tmp_path / "dora.safetensors"
+    write_lora(good, _module_tensors("blocks.0.attn1.to_q", *lora_pair(rng, OUT, IN, 4)))
+    write_lora(dora, _module_tensors("blocks.0.attn1.to_q", *lora_pair(rng, OUT, IN, 4))
+               + [("blocks.0.attn1.to_q.dora_scale", "F32", np.ones((1, OUT)))])
+    assert bk.check(bk.Member(str(good)), sided=False) == ""
+    assert "DORA" in bk.check(bk.Member(str(dora), label="Dora"), sided=False)
+    assert "Dora" in bk.check(bk.Member(str(dora), label="Dora"), sided=False)
+    assert bk.check(bk.Member(str(tmp_path / "gone.safetensors"), label="Gone"), sided=False).startswith("Gone")
