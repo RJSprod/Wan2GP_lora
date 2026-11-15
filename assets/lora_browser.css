@@ -2340,3 +2340,30 @@ body.lb-scroll-locked {
 .__NS__ .lb-built-recipes summary { cursor: pointer; font-weight: 600; }
 .__NS__ .lb-built-recipes ul { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; }
 .__NS__ button.lb-btn.lb-built-delete { min-height: 30px; padding: 2px 10px; }
+
+/* ------------------------------------------------ copying a schedule */
+
+/* The end of each strength section: copy this strength and schedule, or
+   paste the one copied. */
+.__NS__ .lb-clip { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; }
+.__NS__ .lb-clip-label { flex: 1 1 auto; min-width: 0; color: var(--lb-muted); font-size: 11.5px; }
+.__NS__ .lb-clip button.lb-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 34px;
+  padding: 2px 10px;
+  font-size: 12.5px;
+}
+.__NS__ .lb-clip .lb-ic svg,
+.__NS__ .lb-bulk-paste .lb-ic svg { width: 15px; height: 15px; }
+.__NS__ button.lb-btn.lb-bulk-paste { display: inline-flex; align-items: center; gap: 5px; }
+@container (max-width: 480px) {
+  .__NS__ .lb-clip button.lb-btn { min-height: 44px; padding: 2px 14px; }
+}
+/* On a card: icons only, in its top line or a side's head -- a card at rest
+   is as tall as its picture. */
+.__NS__ .lb-top-clip:empty { display: none; }
+.__NS__ .lb-clip.lb-clip-compact { display: inline-flex; flex: 0 0 auto; gap: 4px; }
+.__NS__ .lb-track-head .lb-clip.lb-clip-compact { margin-left: auto; }
+.__NS__ .lb-clip.lb-clip-compact button.lb-btn.lb-icon { min-height: 30px; padding: 4px 7px; gap: 0; }

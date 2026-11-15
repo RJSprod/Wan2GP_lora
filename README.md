@@ -42,6 +42,10 @@ thumbnail browser and a real-time strength editor.
 - **Switch a LoRA off without losing it.** Every row has an on/off switch: off
   keeps the strength, the schedule and the LoRA's place in the list, and WanGP
   neither loads nor applies it. See [Switching a LoRA off](#switching-a-lora-off).
+- **Copy one LoRA's schedule onto others.** *Copy* at the end of a LoRA's
+  strengths takes its strength and schedule, every phase and step; *Paste* on
+  another LoRA gives it the same, and *Paste* in **Select** gives it to every
+  LoRA selected. See [Copying a schedule](#copying-a-schedule).
 - **Paste a whole stack as text.** *Paste stack* opens a box: paste one
   `name: x multiplier` line per LoRA, press Enter, and that is the stack —
   schedules and all. *Copy current stack* writes the same format back out. See
@@ -356,6 +360,29 @@ own picker — turns it back on.
 all back. WanGP-managed accelerator LoRAs have no switch and are left out of
 both. Stack profiles remember which LoRAs were off.
 
+### Copying a schedule
+
+Every LoRA's strengths end with **Strength and schedule — Copy · Paste** (on
+a card, whose height is its picture's, they are the two icons in its top
+line). **Copy** takes that LoRA's multiplier as WanGP holds it — every phase, every
+step — and **Paste** on another LoRA gives it exactly that. In **Select**, the
+bar's **Paste** gives it to every LoRA selected at once (both sides of one with
+separate picture and sound strengths, each of which also has its own Copy and
+Paste). Pasting onto a group sets the group's strength and schedule; onto a
+shrunk file, the file's — which scales everything in it.
+
+What is pasted is checked and settled the way a pasted stack is: a list
+written for another step count is spread over this run's steps as WanGP
+spreads it, a phase this mode does not run is kept for when it does, and
+WanGP's own LoRAs are never pasted onto. Paste is greyed out on a LoRA that
+already has what was copied. The copy lasts the visit (and this browser's
+next ones) and goes on the system clipboard too, where the browser allows, to
+paste into notes or WanGP's own multiplier box.
+
+LoRAs that share a schedule exactly go into one file when you
+[shrink](#shrinking-a-stack): pasting one schedule onto several is also a way
+to shrink them further.
+
 ### Pasting a stack as text
 
 **Paste stack**, above the active rows, opens a box with the cursor already in
@@ -605,7 +632,8 @@ never touched: **Unbake** goes back to them and **Change size…** bakes again.
 Strength and schedule still apply live to the baked file, and changing a
 member's mode or the group's members bakes it again to match. LoRAs that are not
 plain low-rank pairs (DoRA, LoKr, full weight differences) cannot be baked, and
-the dialog says so.
+neither can a LoRA WanGP recognises by its file name (see
+[Shrinking a stack](#shrinking-a-stack)); the dialog says so.
 
 A group is stored as `#lora_group <letter> <lora>` lines in `loras_multipliers`;
 a baked group's lines also name its file
@@ -637,8 +665,22 @@ run the same:
   group's members come in at the group's strength, and anything baked or
   shrunk before comes in as its originals, so shrinking again plans everything
   afresh. **What stays as it is** is listed with why: LoRAs switched off,
-  WanGP's own, multipliers with `:` branches, LoRAs not on this machine, and
-  files a bake cannot combine (DoRA, LoKr, full weight differences).
+  WanGP's own, multipliers with `:` branches, LoRAs not on this machine,
+  files a bake cannot combine (DoRA, LoKr, full weight differences), and LoRAs
+  WanGP recognises by their file name — LTX-2's IC-LoRAs (`ic-lora`, whose
+  `-ref0.5` sets the reference scale), the LoRAs it would otherwise add itself
+  (`distilled-lora`, `union-control`, `in-outpainting`, `id-lora-celebvhq`),
+  and Wan 2.2's Lightning I2V accelerators. Inside a file with a name of its
+  own WanGP would not see them for what they are, and would even add its own
+  default beside them.
+
+Why one strength bakes in exactly: WanGP (mmgp) adds each LoRA to a layer as
+its change times its multiplier, `W + 0.5·ΔA + 0.7·ΔB`, so a file holding
+`0.5·ΔA + 0.7·ΔB` run at 1 is the same sum, at every step. What can differ is
+the rank: the file keeps the strongest directions of the combined change, and
+its row says how much of it it kept. A subtle LoRA beside strong ones is the
+first to fade — check a render with **Compare**, and give the file more rank
+with **Change size…** if it did.
 
 ```
  Shrink the stack

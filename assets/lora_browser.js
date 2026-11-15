@@ -1392,7 +1392,9 @@
     var painters = [];
     if (single) {
       if (inline) { main.appendChild(editorHeading("Strength")); }
-      painters = buildStrengths(main, row, rowName(row));
+      painters = buildStrengths(main, row, rowName(row), inline);
+      var holder = !inline ? main.querySelector(".lb-top-clip") : null;
+      if (holder) { appendClip(holder, row, rowName(row), painters, true); }
     } else {
       // One LoRA, two strengths: each side gets the editor a LoRA has.
       tracks.forEach(function (track, index) {
@@ -1405,7 +1407,9 @@
         head.appendChild(icon(side));
         head.appendChild(span("lb-track-name", side === "sound" ? "Sound" : "Picture"));
         section.appendChild(head);
-        buildStrengths(section, track, rowName(row) + " " + side).forEach(function (paint) {
+        var sidePainters = buildStrengths(section, track, rowName(row) + " " + side, inline);
+        if (!inline) { appendClip(head, track, rowName(row) + " " + side, sidePainters, true); }
+        sidePainters.forEach(function (paint) {
           painters.push(function (next) {
             var current = index === 0 ? next : next.sound_track;
             if (current) { paint(current); }
@@ -1500,6 +1504,8 @@
     if (row.missing) { name.appendChild(note("Missing locally")); }
     top.appendChild(name);
 
+    // Copy and Paste, for a card's one strength (filled in by buildRow).
+    top.appendChild(span("lb-top-clip"));
     top.appendChild(fullScreenButton(row, false));
 
     if (row.kind === "group") {
@@ -1960,15 +1966,17 @@
 
   /* Phase buttons, then One strength or Per step -- a phase is one or the
      other -- then that one's controls; returns what repaints them. */
-  function buildStrengths(main, row, label) {
+  function buildStrengths(main, row, label, withClip) {
     var painters = [];
     if (row.multiplier_kind === "advanced") {
       main.appendChild(buildPreserved(row));
+      if (withClip) { appendClip(main, row, label, painters); }
       return painters;
     }
     if (!rowEditable(row)) {
       // A schedule this guidance mode cannot show: kept as it is, read-only.
       main.appendChild(buildKeptSchedule(row));
+      if (withClip) { appendClip(main, row, label, painters); }
       return painters;
     }
     var phase = phaseOf(row);
@@ -2019,8 +2027,108 @@
       var fill = fillButton(row, phase);
       if (fill) { box.appendChild(fill); }
     }
+    if (withClip) { appendClip(box, row, label, painters); }
     main.appendChild(box);
     return painters;
+  }
+
+  /* --------------------------------------- copying and pasting a schedule */
+
+  /* One LoRA's strength and schedule -- its multiplier as WanGP holds it,
+     every phase and step -- copied to paste onto others. It lasts the visit
+     (and this browser's next ones), and goes on the system clipboard too
+     where the browser allows, to paste into notes or WanGP's own box. */
+  var CLIP_KEY = "lb-schedule-clip";
+
+  function clipboard() {
+    if (S.clip === undefined) {
+      S.clip = null;
+      try {
+        var saved = JSON.parse(window.localStorage.getItem(CLIP_KEY) || "null");
+        if (saved && typeof saved.token === "string" && saved.token) {
+          S.clip = { token: saved.token, from: text(saved.from) };
+        }
+      } catch (error) { /* nothing saved, or storage is off */ }
+    }
+    return S.clip;
+  }
+
+  function shortToken(token) {
+    var value = text(token);
+    return value.length > 22 ? value.slice(0, 21) + "…" : value;
+  }
+
+  function copySchedule(track, name) {
+    var token = text(track.multiplier_raw).trim();
+    if (!token) { return; }
+    S.clip = { token: token, from: name };
+    try { window.localStorage.setItem(CLIP_KEY, JSON.stringify(S.clip)); } catch (error) { /* this visit only */ }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(token).catch(function () {});
+      }
+    } catch (error) { /* not offered on this page */ }
+    setStatus("Copied " + name + "'s strength and schedule, x" + token +
+      ". Paste it on another LoRA, or on several from Select.");
+    paintClips();
+    paintBulk();
+  }
+
+  function pasteSchedule(ids) {
+    var clip = clipboard();
+    if (!clip || !ids.length) { return; }
+    send({ type: "paste_schedule", ids: ids, token: clip.token, from: clip.from });
+  }
+
+  function appendClip(holder, track, name, painters, compact) {
+    var line = document.createElement(compact ? "span" : "div");
+    line.className = compact ? "lb-clip lb-clip-compact" : "lb-clip";
+    if (!compact) { line.appendChild(span("lb-clip-label", "Strength and schedule")); }
+    var copy = makeButton(compact ? "" : "Copy", "lb-btn lb-clip-copy" + (compact ? " lb-icon" : ""), function (event) {
+      event.stopPropagation();
+      copySchedule(track, name);
+    }, "Copy " + name + "'s strength and schedule, every phase and step, to paste on other LoRAs");
+    copy.insertBefore(icon("copy"), copy.firstChild);
+    copy.setAttribute("aria-label", "Copy " + name + "'s strength and schedule");
+    var paste = makeButton(compact ? "" : "Paste", "lb-btn lb-clip-paste" + (compact ? " lb-icon" : ""), function (event) {
+      event.stopPropagation();
+      pasteSchedule([paste.dataset.clipFor]);
+    });
+    paste.insertBefore(icon("paste"), paste.firstChild);
+    paste.setAttribute("aria-label", "Paste the copied strength and schedule onto " + name);
+    paste.dataset.clipFor = track.id;
+    paste.dataset.clipToken = text(track.multiplier_raw);
+    if (track.system_managed) {
+      paste.disabled = true;
+      paste.title = "WanGP manages this LoRA";
+      paste.dataset.clipLocked = "1";
+    } else {
+      paintClipPaste(paste);
+    }
+    line.appendChild(copy);
+    line.appendChild(paste);
+    holder.appendChild(line);
+    // Copy takes what the LoRA has now, edits and all.
+    painters.push(function (next) {
+      track = next;
+      paste.dataset.clipFor = next.id;
+      paste.dataset.clipToken = text(next.multiplier_raw);
+      paintClipPaste(paste);
+    });
+  }
+
+  function paintClipPaste(button) {
+    if (button.dataset.clipLocked) { return; }
+    var clip = clipboard();
+    var same = !!clip && clip.token === button.dataset.clipToken;
+    button.disabled = !clip || same;
+    button.title = !clip ? "Copy a LoRA's strength and schedule first"
+      : same ? "It already has x" + clip.token
+      : "Paste x" + clip.token + (clip.from ? " from " + clip.from : "");
+  }
+
+  function paintClips() {
+    document.querySelectorAll("." + NS + " .lb-clip-paste").forEach(paintClipPaste);
   }
 
   /* One strength or Per step. Per step starts with every step at the
@@ -2683,7 +2791,14 @@
       'stroke-width="1.4" stroke-linecap="round"/></svg>',
     link: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6.6 9.4l2.8-2.8M5.4 7.1L3.8 8.7a2.6 2.6 0 0 0 3.6 ' +
       '3.6L9 10.7M10.6 8.9l1.6-1.6a2.6 2.6 0 0 0-3.6-3.6L7 5.3" fill="none" stroke="currentColor" ' +
-      'stroke-width="1.6" stroke-linecap="round"/></svg>'
+      'stroke-width="1.6" stroke-linecap="round"/></svg>',
+    copy: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.2" y="5.2" width="8.3" height="8.3" rx="1.4" ' +
+      'fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10.8 3.4V3.2a1.2 1.2 0 0 0-1.2-1.2H3.2A1.2 1.2 0 0 0 ' +
+      '2 3.2v6.4a1.2 1.2 0 0 0 1.2 1.2h.2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
+    paste: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.8" y="3" width="10.4" height="11.2" rx="1.4" ' +
+      'fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="5.6" y="1.6" width="4.8" height="2.8" rx="0.8" ' +
+      'fill="currentColor"/><path d="M5.4 8.2h5.2M5.4 10.9h3.6" stroke="currentColor" stroke-width="1.4" ' +
+      'stroke-linecap="round"/></svg>'
   };
 
   function icon(name) {
@@ -3169,6 +3284,19 @@
         : "Select two or more LoRAs that are not in a group yet");
     group.disabled = !canGroup;
     bar.appendChild(group);
+    var clip = clipboard();
+    var targets = [];
+    rows.forEach(function (row) {
+      if (row.system_managed) { return; }
+      tracksOf(row).forEach(function (track) { targets.push(track.id); });
+    });
+    var paste = makeButton(clip ? "Paste x" + shortToken(clip.token) : "Paste schedule", "lb-btn lb-bulk-paste",
+      function () { pasteSchedule(targets); },
+      clip ? "Give every selected LoRA " + (clip.from ? clip.from + "'s" : "the copied") + " strength and schedule, x" + clip.token
+        : "Copy a LoRA's strength and schedule first");
+    paste.insertBefore(icon("paste"), paste.firstChild);
+    paste.disabled = !clip || !targets.length;
+    bar.appendChild(paste);
     bar.appendChild(span("lb-grow"));
     bar.appendChild(makeButton("Select all", "lb-btn", function () {
       S.rows.forEach(function (row) { S.selected[rowKey(row)] = true; });

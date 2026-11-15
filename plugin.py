@@ -1204,6 +1204,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         if kind == "stack_paste":
             return self._paste_stack(instance, action, stack, inventory, phases, context)
 
+        if kind == "paste_schedule":
+            return self._paste_schedule(instance, action, stack, phases, context)
+
         if kind.startswith("profile_"):
             return self._profile_action(instance, action, stack, inventory, phases, model_type)
 
@@ -1554,6 +1557,10 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         if kind == "bake":
             group = sm.groups(stack).get(letter)
             if group is None or files.store is None:
+                return False
+            recognised = files.recognised(group)
+            if recognised:
+                instance.note(recognised, True)
                 return False
             try:
                 rank = int(action.get("rank") or files.default_rank(group) or 0)
@@ -1927,6 +1934,60 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         instance.note(" ".join([message] + notes), bool(problems) or bool(unrun))
         report.update(ok=not problems, loaded=loaded, notes=notes)
         return self._stack_snapshot(stack) != before
+
+    def _paste_schedule(self, instance, action, stack, phases, context) -> bool:
+        """One LoRA's strength and schedule -- its multiplier, every phase and
+        step -- onto others: a LoRA, a group (its lead, which the members
+        follow), a shrunk file, or one side of a LoRA with two strengths.
+
+        The token is checked as a pasted stack's are, and settled the same
+        way, so this mode is never handed a token it refuses."""
+        token = "".join(str(action.get("token") or "").split())
+        problem = (stack_text.token_problem(token) or self._paste_phase_problem(token, phases)) if token \
+            else "there is nothing copied"
+        if problem:
+            instance.note(f"Nothing pasted: {problem}.", True)
+            return False
+        managed = {lora_id for position, lora_id in enumerate(stack.ids) if stack.is_system(position)}
+        targets = []
+        for value in action.get("ids") or []:
+            lora_id = normalize_id(value)
+            if lora_id and lora_id not in managed and stack.has_entry(lora_id) and lora_id not in targets:
+                targets.append(lora_id)
+        if not targets:
+            instance.note("Nothing pasted: pick a LoRA of yours to paste onto.", True)
+            return False
+        moved = 0
+        for lora_id in targets:
+            position = stack.index_of(lora_id)
+            entry = stack.disabled_entry(lora_id) if position < 0 else None
+            current = stack.tokens[position] if position >= 0 else (entry.token if entry else "")
+            if current == token:
+                continue
+            if position >= 0:
+                stack.tokens[position] = token
+            elif entry is not None:
+                entry.token = token
+            # The pasted multiplier is the truth for it now: nothing
+            # remembered about how it was set before may fill it in.
+            instance.phase_memory.pop(lora_id, None)
+            instance.hidden_phases.pop(lora_id, None)
+            for key in [key for key in instance.schedules if key[0] == lora_id]:
+                del instance.schedules[key]
+            moved += 1
+        source = str(action.get("from") or "").strip()
+        if not moved:
+            instance.note("Nothing to paste: " + ("it already has" if len(targets) == 1 else "they already have")
+                          + f" x{token}.")
+            return False
+        entering = up.entering_two_phases(stack, phases)
+        up.fit_phase_structure(stack, phases, instance.hidden_phases)
+        up.sync_schedules(stack, phases, instance.schedules, context)
+        up.fill_stages_from_stage_1(stack, entering, phases, instance.phase_memory, instance.schedules, context)
+        up.refit_schedules(stack, phases, instance.schedules, instance.phase_memory, context)
+        what = "1 LoRA" if moved == 1 else f"{moved} LoRAs"
+        instance.note(f"Pasted x{token}" + (f" from {source[:80]}" if source else "") + f" onto {what}.")
+        return True
 
     @staticmethod
     def _paste_phase_problem(token: str, phases: up.PhaseConfig) -> str:
