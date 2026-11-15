@@ -81,6 +81,13 @@ thumbnail browser and a real-time strength editor.
   phase**, each running in its own phase only, so they need not match each
   other phase for phase. *Unshrink* gives them back. See
   [Shrinking a stack](#shrinking-a-stack).
+- **A LoRA beside its shrunk file.** Add a LoRA that is baked into a shrunk
+  file again on its own, to push it further; unshrinking keeps the copy
+  beside it as a *double*, off and locked, until the other is gone. A shrunk
+  file — or each phase's file — can be used visual or audio only, as a copy
+  of the built file, without baking anything again. See
+  [A LoRA beside its shrunk file](#a-lora-beside-its-shrunk-file) and
+  [A shrunk file visual or audio only](#a-shrunk-file-visual-or-audio-only).
 - **Low, Medium or High compression.** Before anything is built, the panel
   measures every layer of the LoRAs and shows what each level keeps of their
   combined change and how much it weighs. Each level is the smallest file that
@@ -724,7 +731,42 @@ its own, *Shrunk A*, its LoRAs listed under it with the strength each brings.
 Its own strength scales them all. `×` takes one out (it runs on its own again,
 and the rest are baked again), and **Unshrink** gives every one back as a LoRA
 of its own at the strength it had — times the row's strength, if you changed
-it.
+it. **Shrink** waits while the stack is shrunk: unshrink it first, and the next
+Shrink plans everything afresh from the originals.
+
+#### A LoRA beside its shrunk file
+
+A LoRA baked into a shrunk file can be added again **on its own, beside the
+file** — to push it further than the file does, or schedule it differently. Its
+tile shows the group's letter while it is only inside the file; a click (or
+**Add on its own too** in the tile's menu) adds it as a LoRA of its own, with a
+strength of its own, and it applies twice: once inside the file at what it
+brought, once beside it. WanGP's own LoRA picker does the same.
+
+WanGP cannot select one LoRA twice, so **unshrinking** brings the copy inside
+the file back as the LoRA, at what it brought, and the copy beside it becomes a
+**double**: kept, off, *Double · not applied*, its switch locked. Remove it, or
+remove the other copy — then the double is a LoRA of its own again, off where
+it was with its own strength, and its switch works. Taking the LoRA out of the
+shrunk file with `×` does the same. Stack text and profiles keep a LoRA inside
+the file and beside it as two lines.
+
+#### A shrunk file visual or audio only
+
+On LTX-2, each of a shrunk group's files — phase 1's, phase 2's, or its one
+file — can be used **visual or audio only**: *File applies to · Normal · Visual
+· Audio* in its section. That is a copy of the built file keeping only its
+picture side or its sound side (`…p1.audio.safetensors`), made from the file
+itself in a moment — nothing is baked again — and it runs in the file's place,
+in its phase only. The group's line says so (*P1 audio only*). **Normal** goes
+back to the file as it is; **Change size…** keeps each file's choice.
+
+Every copy's recipe names the file it was made from, and that file's recipe
+names its LoRAs: delete either, and settings that name the copy — a preset, a
+video's — build the shrunk file again from the LoRAs, then the copy from it.
+Stack text writes the choice as a tag, `file p1 audio`, and profiles keep it.
+Unshrinking gives the LoRAs back as they were shrunk; the files' choices were
+the files' own.
 
 #### A file per phase
 

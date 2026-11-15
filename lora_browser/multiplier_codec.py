@@ -63,7 +63,7 @@ DEFAULT_TOKEN = "1"
 #: ones, so it comes back where it was.  The LoRA goes last, so a name with
 #: spaces in it reads back whole; a multiplier never has one.
 DISABLED_MARK = "#lora_off"
-_DISABLED_LINE = re.compile(r"^\s*#lora_(off|skip)\s+(\d+)\s+(\S+)\s+(\S.*?)\s*$")
+_DISABLED_LINE = re.compile(r"^\s*#lora_(off|skip|double)\s+(\d+)\s+(\S+)\s+(\S.*?)\s*$")
 
 #: A LoRA the panel switched off because its visual-only or audio-only mode
 #: leaves it nothing to apply -- a LoRA that only changes the picture, set to
@@ -71,6 +71,12 @@ _DISABLED_LINE = re.compile(r"^\s*#lora_(off|skip)\s+(\d+)\s+(\S+)\s+(\S.*?)\s*$
 #: the different mark is what lets a mode that gives it something back switch
 #: it on again, where a LoRA switched off by hand stays off.
 SKIP_MARK = "#lora_skip"
+
+#: A LoRA the stack holds twice: added on its own beside a baked file that
+#: already holds it, then the file was taken apart.  WanGP cannot select one
+#: LoRA twice, so this copy stays off -- and cannot be switched on -- until
+#: the other is gone.  Written like ``#lora_off``.
+DOUBLE_MARK = "#lora_double"
 
 #: LoRAs that move together, sharing one multiplier: one line per LoRA in the
 #: group, in order.  A baked group also lists the file it was baked into.
@@ -164,6 +170,8 @@ class DisabledLora:
     at: int = 0
     #: Off because its mode leaves it nothing to apply, not by hand.
     skip: bool = False
+    #: Off because the same LoRA is in the stack already (``DOUBLE_MARK``).
+    double: bool = False
 
 
 def parse_disabled(text: str) -> list[DisabledLora]:
@@ -174,14 +182,14 @@ def parse_disabled(text: str) -> list[DisabledLora]:
         if match:
             entries.append(DisabledLora(
                 id=match.group(4), token=match.group(3), at=int(match.group(2)),
-                skip=match.group(1) == "skip",
+                skip=match.group(1) == "skip", double=match.group(1) == "double",
             ))
     return entries
 
 
 def disabled_line(entry: DisabledLora) -> str:
     token = str(entry.token or "").strip() or DEFAULT_TOKEN
-    mark = SKIP_MARK if entry.skip else DISABLED_MARK
+    mark = DOUBLE_MARK if getattr(entry, "double", False) else (SKIP_MARK if entry.skip else DISABLED_MARK)
     return f"{mark} {max(0, int(entry.at))} {token} {entry.id}"
 
 

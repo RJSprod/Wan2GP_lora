@@ -21,7 +21,10 @@ queue, a generated video's settings -- names it like any other:
 
 A bake's size is ``r32`` -- every layer re-fitted to rank 32 -- or ``q990``
 -- a compression level: the smallest file keeping 99.0% of the combined
-change, each layer at a rank of its own.
+change, each layer at a rank of its own.  A shrunk file may also be used
+visual or audio only: ``<bake>.visual.safetensors`` is a copy of the built
+file keeping its picture side, made from the file itself -- nothing is
+baked again -- and its recipe names the file it came from.
 
 ``visual`` and ``audio`` are the visual-only and audio-only copies; a
 shrunk group whose LoRAs run different strengths per phase is baked a file
@@ -73,8 +76,10 @@ PHASE_TRACKS = ("p1", "p2", "p3")
 _SPLIT = re.compile(r"^_lora_browser/(?!_bakes/)(?P<stem>.+)\.(?P<mode>visual|audio|sound)\.safetensors$")
 _BAKE = re.compile(
     r"^_lora_browser/_bakes/(?P<hash>[0-9a-f]{6,64})\.(?:r(?P<rank>[1-9]\d{0,4})|q(?P<quality>[1-9]\d{2}))"
-    r"(?:\.(?P<track>sound|p[1-3]))?\.safetensors$"
+    r"(?:\.(?P<track>sound|p[1-3]))?(?:\.(?P<mode>visual|audio))?\.safetensors$"
 )
+#: The modes a baked file can be copied in.
+FILE_MODES = ("visual", "audio")
 _SIZE = re.compile(r"^(?:r?(?P<rank>[1-9]\d{0,4})|q(?P<quality>[1-9]\d{2}))$")
 
 
@@ -132,6 +137,13 @@ class Derived:
         """``r32`` or ``q990``, as the id spells it."""
         return f"q{self.quality}" if self.quality else (f"r{self.rank}" if self.rank else "")
 
+    @property
+    def base(self) -> str:
+        """A bake's own file: its id without a visual or audio mode."""
+        if self.kind == "bake" and self.mode:
+            return self.id[: -len(f".{self.mode}.safetensors")] + ".safetensors"
+        return self.id
+
 
 #: What WanGP looks for in a LoRA's file name to treat it as more than its
 #: weights: LTX-2's IC-LoRAs ("ic-lora", their reference scale read from
@@ -166,6 +178,7 @@ def parse(lora_id: str) -> Derived | None:
         return Derived(
             "bake", value, hash=match.group("hash"), rank=int(match.group("rank") or 0),
             quality=int(match.group("quality") or 0), track=match.group("track") or "",
+            mode=match.group("mode") or "",
         )
     return None
 
@@ -176,7 +189,7 @@ def stem_of(lora_id: str) -> str:
     value = normalize_id(lora_id)
     parsed = parse(value)
     if parsed is not None:
-        return parsed.stem if parsed.kind == "split" else parsed.id
+        return parsed.stem if parsed.kind == "split" else parsed.base
     stem, extension = os.path.splitext(value)
     return stem if extension.lower() in _ORIGINAL_EXTENSIONS else value
 
@@ -231,6 +244,40 @@ def bake_id(members, size, track: str = "") -> str:
         raise ValueError(f"not a bake size: {size!r}")
     suffix = f".{track}" if track == SOUND_TRACK or track in PHASE_TRACKS else ""
     return f"{LINK_NAME}/{BAKES}/{bake_hash(members)}.{tag}{suffix}.safetensors"
+
+
+def bake_mode_id(bake_id: str, mode: str) -> str:
+    """A baked file's copy in ``mode`` -- visual or audio only -- or, for
+    ``normal``, the file itself."""
+    parsed = parse(bake_id)
+    if parsed is None or parsed.kind != "bake":
+        return normalize_id(bake_id)
+    base = parsed.base
+    if mode not in FILE_MODES:
+        return base
+    return base[: -len(".safetensors")] + f".{mode}.safetensors"
+
+
+def bake_spec(size, modes: dict | None = None) -> str:
+    """How a group is baked, as one value: its size, and any of its files
+    used visual or audio only -- ``q999+p1.audio``."""
+    tag = size_tag(size)
+    extra = "".join(f"+{track}.{mode}" for track, mode in sorted((modes or {}).items()) if mode in FILE_MODES)
+    return tag + extra if tag else ""
+
+
+def parse_bake_spec(value) -> tuple[str, dict[str, str]]:
+    """``(size, {track: mode})`` of a :func:`bake_spec`; a plain rank or
+    size reads as itself."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return size_tag(value), {}
+    head, *rest = str(value or "").strip().split("+")
+    modes = {}
+    for part in rest:
+        track, _, mode = part.partition(".")
+        if track in ("all", "picture") + PHASE_TRACKS and mode in FILE_MODES:
+            modes[track] = mode
+    return size_tag(head), modes
 
 
 def folder_key(lora_dir: str) -> str:

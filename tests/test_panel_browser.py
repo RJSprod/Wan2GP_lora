@@ -1956,6 +1956,77 @@ class TestListView:
         assert tokens_by_lora(host)["sound.safetensors"].endswith(";0.7")
         assert problems == []
 
+    def test_a_lora_beside_its_shrunk_file_and_then_its_double(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host, SHRINK_MULTIPLIERS)
+        page.locator('[data-lb="shrink"]').click()
+        page.wait_for_selector(".lb-dialog .lb-shrink-file", timeout=5000)
+        page.locator(".lb-dialog button.lb-primary").click()
+        settle(page, 800)
+        bake = host.selected[0]
+        # Shrinking again waits for the shrunk stack to be taken apart.
+        assert page.locator('[data-lb="shrink"]').is_disabled()
+        # Its tile shows it inside Shrunk A; a click adds it on its own as well.
+        tile = page.locator('.lb-tile[data-id="both.safetensors"]')
+        assert tile.locator(".lb-inside").inner_text() == "A"
+        tile.click()
+        settle(page, 800)
+        assert host.selected == [bake, "sched.safetensors", "both.safetensors"]
+        assert "applies twice now" in page.locator('[data-lb="status"]').inner_text()
+        assert line(page, "both.safetensors").count() == 1
+
+        # Unshrunk, both comes back at what it brought; the copy beside it is
+        # a double: off, its switch locked, Remove its only way out.
+        page.locator(".lb-li-ghead .lb-li-name").click()
+        settle(page, 300)
+        page.locator(".lb-li-editor button.lb-unshrink").first.click()
+        settle(page, 800)
+        assert host.selected[:3] == ["both.safetensors", "picture.safetensors", "sound.safetensors"]
+        assert "#lora_double" in host.multipliers
+        double = page.locator('.lb-li[data-key="d:both.safetensors"]')
+        assert double.count() == 1 and double.locator(".lb-switch").is_disabled()
+        assert double.locator(".lb-double-pill").text_content() == "Double · not applied"
+        assert not page.locator('[data-lb="shrink"]').is_disabled()
+        double.locator(".lb-li-name").click()
+        settle(page, 300)
+        assert "already in the stack" in page.locator(".lb-li-editor .lb-off-double").inner_text()
+        page.locator(".lb-li-editor button.lb-remove").click()
+        settle(page, 800)
+        assert "#lora_double" not in host.multipliers and "both.safetensors" in host.selected
+        assert problems == []
+
+    def test_a_phase_file_applies_audio_only_as_a_copy_of_itself(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host, PHASE_SHRINK_MULTIPLIERS)
+        page.locator('[data-lb="shrink"]').click()
+        page.wait_for_selector(".lb-dialog .lb-shrink-file", timeout=5000)
+        page.locator(".lb-dialog button.lb-primary").click()
+        settle(page, 800)
+        wait_until_built(page, host)
+        first = host.selected[0]
+        page.locator(".lb-li-ghead .lb-li-name").click()
+        settle(page, 300)
+        section = page.locator(".lb-li-editor .lb-track-phase").nth(0)
+        assert section.locator(".lb-file-mode .lb-seg-normal").get_attribute("aria-checked") == "true"
+        section.locator(".lb-file-mode .lb-seg-audio").click()
+        settle(page, 800)
+        audio = host.selected[0]
+        assert audio == first.replace(".p1.safetensors", ".p1.audio.safetensors")
+        assert f"#lora_group A {audio}" in host.multipliers
+        assert "applies audio only now" in page.locator('[data-lb="status"]').inner_text()
+        section = page.locator(".lb-li-editor .lb-track-phase").nth(0)
+        assert section.locator(".lb-file-mode .lb-seg-audio").get_attribute("aria-checked") == "true"
+        assert "P1 audio only" in page.locator(".lb-li-ghead").text_content()
+        # Only the copy is built: the phase file is there already.
+        assert [job["key"] for job in host.plugin._builder.status()["queued"]] == [audio]
+        wait_until_built(page, host)
+        assert page.locator(".lb-li-ghead .lb-bake-pill").inner_text().startswith("Shrunk 99.9%")
+        # Normal brings the phase file back as it is.
+        section.locator(".lb-file-mode .lb-seg-normal").click()
+        settle(page, 800)
+        assert host.selected[0] == first
+        assert problems == []
+
     def test_a_deleted_built_file_leaves_its_recipe(self, av_panel):
         page, host, problems = av_panel
         reset_av(page, host, SHRINK_MULTIPLIERS)

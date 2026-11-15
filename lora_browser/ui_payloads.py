@@ -412,7 +412,10 @@ class Stack:
     ``groups`` are the LoRAs that move together, by letter, as the multiplier
     text's ``#lora_group`` lines declare them (see ``stack_modes``), and
     ``weights`` what each member of a shrunk group brings to its baked file
-    (its ``#lora_weight`` lines).
+    (its ``#lora_weight`` lines).  ``doubles`` are LoRAs the stack holds
+    twice -- added on their own beside a baked file holding them, which was
+    then taken apart -- kept off, apart from the user's entries, until the
+    other copy is gone (``codec.DOUBLE_MARK``).
     """
 
     ids: list[str] = field(default_factory=list)
@@ -421,6 +424,7 @@ class Stack:
     disabled: list[codec.DisabledLora] = field(default_factory=list)
     groups: dict[str, list[str]] = field(default_factory=dict)
     weights: dict[str, dict[str, float]] = field(default_factory=dict)
+    doubles: list[codec.DisabledLora] = field(default_factory=list)
 
     @classmethod
     def from_native(cls, selected, multipliers: str) -> "Stack":
@@ -434,6 +438,12 @@ class Stack:
         seen = set(ids)
         for entry in codec.parse_disabled(multipliers):
             lora_id = normalize_id(entry.id)
+            if lora_id and entry.double:
+                # Beside its other copy by design: never folded into it.
+                if not any(double.id == lora_id for double in stack.doubles):
+                    stack.doubles.append(codec.DisabledLora(
+                        id=lora_id, token=entry.token, at=entry.at, double=True))
+                continue
             # Selected again -- by a preset, say, or WanGP's own picker: the
             # selection is what runs, so it wins over the switched-off copy.
             if lora_id and lora_id not in seen:
@@ -596,7 +606,7 @@ class Stack:
             entry = inventory.get(lora_id) if inventory else None
             values.append(entry.native_value if entry else lora_id)
         return values, codec.serialize(
-            self.tokens, self.separator_index, self.disabled, self.live_groups(), self.weights
+            self.tokens, self.separator_index, self.disabled + self.doubles, self.live_groups(), self.weights
         )
 
     def live_groups(self) -> dict[str, list[str]]:
@@ -630,8 +640,12 @@ def build_items(
     memory: dict[str, list[float]] | None = None,
     catalogue: dict[str, Any] | None = None,
     aliases: dict[str, tuple[str, bool]] | None = None,
+    inside: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Browser tiles for everything WanGP can activate for this model.
+
+    ``inside`` names, for a LoRA held only inside a baked group's file, that
+    group: its tile shows it there, and a click adds it on its own beside it.
 
     ``catalogue`` maps LoRA id -> CatalogueIndex, supplying the Civitai name and
     trigger words. Those travel with the payload so naming, search and sort all
@@ -670,6 +684,7 @@ def build_items(
             "has_catalogue": bool(getattr(index, "has_sidecar", False)) if index else False,
             "has_video": bool(entry.video_preview) if entry else False,
             "mtime": entry.mtime,
+            "inside": (inside or {}).get(entry.id, ""),
         }
         if position >= 0:
             item.update(

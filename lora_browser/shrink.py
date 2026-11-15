@@ -241,7 +241,9 @@ def collect(stack, files) -> tuple[list[Piece], int]:
     """Every piece the stack runs on the user's side, and how many files
     WanGP loads for it now."""
     found = sm.groups(stack)
-    by_member = {member: group for group in found.values() for member in group.members}
+    # A member baked into its group's file is no entry: one with its id is
+    # the same LoRA beside the file, a LoRA of its own.
+    by_member = {member: group for group in found.values() for member in group.members if not group.inside(member)}
     by_bake = {value: (group, track) for group in found.values() for track, value in group.bakes.items()}
     pieces: list[Piece] = []
     seen: set[str] = set()

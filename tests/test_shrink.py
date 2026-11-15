@@ -10,6 +10,7 @@ import pytest
 from lora_browser import bake as bk
 from lora_browser import compare as cmp
 from lora_browser import derived as dv
+from lora_browser import lora_files as lf
 from lora_browser import ui_payloads as up
 from tests.lora_fixtures import effective_delta
 from tests.test_av_bridge import (  # noqa: F401 - fixtures
@@ -177,12 +178,20 @@ def test_a_lora_goes_in_whole_or_not_at_all(plugin, state):
     assert selected[:2] == [V_BIG, S_BIG]
 
 
-def test_shrinking_again_starts_from_the_originals(plugin, state):
-    selected, text, _ = shrink(plugin, state, [BOTH, PICTURE], "0.7;0.7 0.5;0.5")
+def test_a_shrunk_stack_is_not_shrunk_again(plugin, state):
+    selected, text, payload = shrink(plugin, state, [BOTH, PICTURE], "0.7;0.7 0.5;0.5")
+    assert payload["can_shrink"] is False
     lines = text.splitlines()
     lines[0] += " 0.9;0.9"
-    selected, text, payload = shrink(plugin, state, selected + [SOUND], "\n".join(lines))
-    assert len(selected) == 1
+    choices, mults, payload = act(plugin, {"type": "shrink"}, state, selected + [SOUND], "\n".join(lines))
+    assert "value" not in choices and payload["status_warn"]
+    assert payload["status"].startswith("The stack is already shrunk (Shrunk A): unshrink it")
+    plan = plan_of(plugin, state, selected + [SOUND], "\n".join(lines))
+    assert plan["error"].startswith("The stack is already shrunk")
+    # Unshrunk, it shrinks afresh from the originals.
+    choices, mults, _ = act(plugin, {"type": "unshrink", "group": "A"}, state, selected + [SOUND], "\n".join(lines))
+    selected, text, payload = shrink(plugin, state, native(choices, None), native(mults, None))
+    assert len(selected) == 1 and payload["can_shrink"] is False
     row = payload["active"][0]
     assert [(member["id"], member["weights"]) for member in row["members"]] == [
         (BOTH, [0.7]), (PICTURE, [0.5]), (SOUND, [0.9])]
@@ -541,3 +550,215 @@ def test_a_level_survives_unshrinking_and_shrinking_again(plugin, state):
     # Stack text and profiles carry the level.
     _, _, payload = act(plugin, {"type": "shrink", "quality": 990}, state, native(choices, None), native(mults, None))
     assert payload["stack_text"].splitlines()[0] == "both [group A, baked 99%, weight 0.8;0.5]: x1;1"
+
+
+# ------------------------------------------- a LoRA beside its shrunk file
+
+
+def _beside(plugin, state):
+    """BOTH and PICTURE shrunk into Shrunk A, then BOTH added again on its own."""
+    selected, text, payload = shrink(plugin, state, [BOTH, PICTURE], "0.7;0.7 0.5;0.5")
+    tile = next(item for item in payload["items"] if item["id"] == BOTH)
+    assert tile["active"] and tile["inside"] == "Shrunk A"
+    choices, mults, payload = act(plugin, {"type": "toggle", "id": BOTH, "enabled": True}, state, selected, text)
+    return native(choices, None), native(mults, None), payload
+
+
+def test_a_lora_runs_beside_the_shrunk_file_that_holds_it(plugin, state):
+    selected, text, payload = _beside(plugin, state)
+    bake = selected[0]
+    assert selected == [bake, BOTH]
+    lines = text.splitlines()
+    assert lines[0] == "1;1 1;1"
+    assert f"#lora_group A {BOTH}" in lines and f"#lora_weight A 0.7 {BOTH}" in lines
+    assert "applies twice now" in payload["status"]
+    rows = payload["active"]
+    assert [(row["kind"] if "kind" in row else "", row["id"]) for row in rows] == [("group", bake), ("", BOTH)]
+    assert [member["id"] for member in rows[0]["members"]] == [BOTH, PICTURE]
+    tile = next(item for item in payload["items"] if item["id"] == BOTH)
+    assert tile["active"] and tile["inside"] == ""
+    # Its own strength, apart from what the file brings.
+    _, mults, _ = act(plugin, {"type": "set_strength", "id": BOTH, "phase": 0, "value": 0.3}, state, selected, text)
+    assert native(mults, "").splitlines()[0] == "1;1 0.3;1"
+    # Shrinking again waits for the shrunk stack to be taken apart.
+    assert payload["can_shrink"] is False
+
+
+def test_unshrinking_makes_the_copy_beside_it_a_double(plugin, state):
+    selected, text, _ = _beside(plugin, state)
+    text = text.replace("1;1 1;1", "1;1 0.3;0.3", 1)
+    choices, mults, payload = act(plugin, {"type": "unshrink", "group": "A"}, state, selected, text)
+    assert native(choices, None) == [BOTH, PICTURE]
+    # Kept off, right after the copy that stays.
+    assert native(mults, None).splitlines() == ["0.7;0.7 0.5;0.5", f"#lora_double 1 0.3;0.3 {BOTH}"]
+    rows = payload["active"]
+    assert [(row["id"], row["enabled"], row.get("kind", "")) for row in rows] == [
+        (BOTH, True, ""), (BOTH, False, "double"), (PICTURE, True, "")]
+    assert payload["can_shrink"] is True
+    # Removed, it is gone; the LoRA it doubled stays.
+    choices, mults, _ = act(plugin, {"type": "remove_double", "id": BOTH}, state, native(choices, None), native(mults, None))
+    assert native(mults, None) == "0.7;0.7 0.5;0.5"
+
+
+def test_a_double_is_free_again_once_its_other_copy_is_gone(plugin, state):
+    selected, text, _ = _beside(plugin, state)
+    text = text.replace("1;1 1;1", "1;1 0.3;0.3", 1)
+    choices, mults, _ = act(plugin, {"type": "unshrink", "group": "A"}, state, selected, text)
+    choices, mults, payload = act(plugin, {"type": "remove", "id": BOTH}, state, native(choices, None), native(mults, None))
+    assert native(choices, None) == [PICTURE]
+    # Off, where it was, with its own strength -- and free to come back on.
+    assert native(mults, None).splitlines() == ["0.5;0.5", f"#lora_off 1 0.3;0.3 {BOTH}"]
+    row = next(row for row in payload["active"] if row["id"] == BOTH)
+    assert row.get("kind", "") != "double" and not row["enabled"]
+    choices, mults, _ = act(plugin, {"type": "set_enabled", "id": BOTH, "value": True}, state,
+                            native(choices, None), native(mults, None))
+    assert native(choices, None) == [PICTURE, BOTH] and native(mults, None) == "0.5;0.5 0.3;0.3"
+
+
+def test_taking_a_lora_out_of_its_shrunk_file_doubles_its_copy_beside_it(plugin, state):
+    selected, text, _ = shrink(plugin, state, [BOTH, PICTURE, SOUND], "0.7;0.7 0.5;0.5 0.6;0.6")
+    choices, mults, _ = act(plugin, {"type": "toggle", "id": BOTH, "enabled": True}, state, selected, text)
+    choices, mults, payload = act(plugin, {"type": "group_leave", "group": "A", "id": BOTH}, state,
+                                  native(choices, None), native(mults, None))
+    selected, text = native(choices, None), native(mults, None)
+    # Back on its own, at what it brought; the copy beside the file, a double.
+    assert selected[-1] == BOTH and text.splitlines()[0] == "1;1 0.7;0.7"
+    assert f"#lora_double 2 1;1 {BOTH}" in text.splitlines() and f"#lora_group A {BOTH}" not in text
+    assert [row["id"] for row in payload["active"] if row.get("kind") == "double"] == [BOTH]
+
+
+def test_stack_text_and_profiles_keep_a_lora_inside_and_beside(plugin, state):
+    selected, text, payload = _beside(plugin, state)
+    assert payload["stack_text"].splitlines() == [
+        "both [group A, baked 99.9%, weight 0.7]: x1;1",
+        "picture [group A, baked 99.9%, weight 0.5]: x1;1",
+        "both: x1;1",
+    ]
+    choices, mults, _ = act(plugin, {"type": "stack_paste", "text": payload["stack_text"]}, state, [SOUND], "1;1")
+    assert native(choices, None) == selected and native(mults, None) == text
+    act(plugin, {"type": "profile_save", "name": "Twice"}, state, selected, text)
+    choices, mults, _ = act(plugin, {"type": "profile_recall", "name": "Twice"}, state, [SOUND], "1;1")
+    assert native(choices, None) == selected and native(mults, None) == text
+
+
+def test_a_member_s_mode_names_its_group_beside_a_copy_of_it(plugin, state):
+    """A group's member and its copy beside the baked file share an id: the
+    group's row says which it means."""
+    text = f"0.7;0.7 0.7;0.7 1;1\n#lora_group A {BOTH}\n#lora_group A {BIG}"
+    choices, mults, _ = act(plugin, {"type": "bake", "group": "A", "rank": 8}, state, [BOTH, BIG, PICTURE], text)
+    choices, mults, _ = act(plugin, {"type": "toggle", "id": BOTH, "enabled": True}, state,
+                            native(choices, None), native(mults, None))
+    selected, text = native(choices, None), native(mults, None)
+    assert selected[-1] == BOTH
+    # The group's member goes visual only; the copy beside it stays as it is.
+    choices, mults, _ = act(plugin, {"type": "set_mode", "id": BOTH, "mode": "visual", "group": "A"}, state, selected, text)
+    assert native(choices, None)[-1] == BOTH
+    assert f"#lora_group A {dv.split_id(BOTH, 'visual')}" in native(mults, None)
+    # Without the group, it is the copy beside the file.
+    choices, mults, _ = act(plugin, {"type": "set_mode", "id": BOTH, "mode": "audio"}, state, selected, text)
+    assert native(choices, None)[-1] == A_BOTH and f"#lora_group A {BOTH}" in native(mults, None)
+
+
+# ------------------------------------- a shrunk file used visual or audio only
+
+
+def test_a_phase_file_is_used_audio_only_as_a_copy_of_itself(plugin, state, loras):
+    selected, text, _ = shrink(plugin, state, [BOTH, PICTURE, SOUND], PHASED)
+    build_all(plugin)
+    p1, p2 = selected
+    built = os.path.getmtime(loras / p1)
+    choices, mults, payload = act(plugin, {"type": "file_mode", "group": "A", "track": "p1", "mode": "audio"},
+                                  state, selected, text)
+    selected, text = native(choices, None), native(mults, None)
+    audio = dv.bake_mode_id(p1, "audio")
+    assert selected == [audio, p2] and audio.endswith(".q999.p1.audio.safetensors")
+    assert text.splitlines()[0] == "1;0 0;1" and f"#lora_group A {audio}" in text
+    assert "applies audio only now" in payload["status"]
+    row = payload["active"][0]
+    assert [(track["id"], track["file_mode"]) for track in row["phase_tracks"]] == [(audio, "audio"), (p2, "normal")]
+    # Made from the built file: only the copy is built, nothing baked again.
+    assert plugin._builder.status()["queued"] == [{"key": audio, "label": "Shrunk A, phase 1 file, audio only"}]
+    build_all(plugin)
+    assert os.path.getmtime(loras / p1) == built
+    kept = {tensor.name for tensor in lf.read_header(str(loras / audio)).tensors}
+    whole = {tensor.name for tensor in lf.read_header(str(loras / p1)).tensors}
+    assert kept and kept < whole
+    assert all(lf.keeps(lf.ltx2_side(lf.split_key(name)[0]), "audio") for name in kept)
+    recipe = plugin._stack_files(plugin._instance("t"), _inventory(plugin, state)).store.recipe(audio)
+    assert (recipe["kind"], recipe["mode"], recipe["source"]) == ("split", "audio", p1)
+    # Pinned to its phase like the file it came from.
+    _, mults, _ = act(plugin, {"type": "set_strength", "id": audio, "phase": 1, "value": 0.7}, state, selected, text)
+    assert "value" not in mults or native(mults, "").splitlines()[0] == "1;0 0;1"
+    # Normal brings the file back as it is.
+    choices, mults, _ = act(plugin, {"type": "file_mode", "group": "A", "track": "p1", "mode": "normal"},
+                            state, selected, text)
+    assert native(choices, None) == [p1, p2]
+
+
+def _inventory(plugin, state):
+    from lora_browser.inventory import build_inventory
+    model_type = state["model_type"]
+    return build_inventory(plugin._native_loras(state, []), plugin._lora_dir(model_type))
+
+
+def test_a_deleted_file_copy_is_built_again_from_its_recipes(plugin, state, loras):
+    selected, text, _ = shrink(plugin, state, [BOTH, PICTURE, SOUND], PHASED)
+    choices, mults, _ = act(plugin, {"type": "file_mode", "group": "A", "track": "p2", "mode": "visual"},
+                            state, selected, text)
+    selected, text = native(choices, None), native(mults, None)
+    payload_of(plugin, state, selected, text)
+    build_all(plugin)
+    payload_of(plugin, state, selected, text)
+    build_all(plugin)
+    visual = selected[1]
+    assert os.path.isfile(loras / visual)
+    serve(plugin, {"kind": "built", "in_use": [], "action": "delete_all"}, state)
+    assert not os.path.isfile(loras / visual) and not os.path.isfile(loras / dv.parse(visual).base)
+    # A video's settings that name the copy and nothing else: its recipe
+    # names the phase file, whose recipe names the LoRAs.
+    bare = "1;0 0;1"
+    payload = payload_of(plugin, state, selected, bare)
+    row = payload["active"][0]
+    assert row["shrink"] and [track["file_mode"] for track in row["phase_tracks"]] == ["normal", "visual"]
+    for _ in range(2):                 # the phase file, then its copy
+        build_all(plugin)
+        payload_of(plugin, state, selected, bare)
+    build_all(plugin)
+    assert os.path.isfile(loras / visual) and os.path.isfile(loras / dv.parse(visual).base)
+
+
+def test_change_size_and_text_and_profiles_keep_a_file_s_mode(plugin, state):
+    selected, text, _ = shrink(plugin, state, [BOTH, PICTURE, SOUND], PHASED)
+    choices, mults, payload = act(plugin, {"type": "file_mode", "group": "A", "track": "p1", "mode": "audio"},
+                                  state, selected, text)
+    selected, text = native(choices, None), native(mults, None)
+    assert payload["stack_text"].splitlines()[0] == \
+        "both [group A, baked 99.9%, file p1 audio, weight 0.8;0.5]: x1;1"
+    choices, mults, _ = act(plugin, {"type": "stack_paste", "text": payload["stack_text"]}, state, [SOUND], "1;1")
+    assert native(choices, None) == selected and native(mults, None) == text
+    act(plugin, {"type": "profile_save", "name": "Sided"}, state, selected, text)
+    choices, mults, _ = act(plugin, {"type": "profile_recall", "name": "Sided"}, state, [SOUND], "1;1")
+    assert native(choices, None) == selected and native(mults, None) == text
+    # Another size keeps the copy's mode.
+    choices, _, _ = act(plugin, {"type": "bake", "group": "A", "quality": 990}, state, selected, text)
+    assert native(choices, None)[0].endswith(".q990.p1.audio.safetensors")
+    assert native(choices, None)[1].endswith(".q990.p2.safetensors")
+
+
+def test_only_a_shrunk_group_s_files_take_a_mode(plugin, state):
+    text = f"0.7;0.7 0.7;0.7 1;1\n#lora_group A {BOTH}\n#lora_group A {BIG}"
+    choices, mults, _ = act(plugin, {"type": "bake", "group": "A", "rank": 8}, state, [BOTH, BIG, PICTURE], text)
+    _, mults, payload = act(plugin, {"type": "file_mode", "group": "A", "track": "all", "mode": "audio"},
+                            state, native(choices, None), native(mults, None))
+    assert "value" not in mults
+
+
+def test_shrinking_again_frees_a_double_beside_the_new_file(plugin, state):
+    selected, text, _ = _beside(plugin, state)
+    choices, mults, _ = act(plugin, {"type": "unshrink", "group": "A"}, state, selected, text)
+    assert "#lora_double" in native(mults, None)
+    selected, text, payload = shrink(plugin, state, native(choices, None), native(mults, None))
+    # Its other copy is inside the new file: it is a LoRA beside it, off.
+    assert "#lora_double" not in text and f"#lora_off 1 1;1 {BOTH}" in text.splitlines()
+    choices, mults, _ = act(plugin, {"type": "set_enabled", "id": BOTH, "value": True}, state, selected, text)
+    assert native(choices, None)[-1] == BOTH

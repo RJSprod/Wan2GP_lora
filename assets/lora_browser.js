@@ -678,6 +678,11 @@
   function toggle(id) {
     var item = S.byId[id];
     if (!item) { return; }
+    if (item.inside) {
+      // Only inside a baked file: it goes in again on its own, beside it.
+      send({ type: "toggle", id: id, enabled: true });
+      return;
+    }
     send({ type: "toggle", id: id, enabled: !item.active });
   }
 
@@ -698,7 +703,9 @@
       { label: "Copy filename", run: function () { copyText(item.name || ""); } },
       item.disabled
         ? { label: "Switch on", run: function () { send({ type: "set_enabled", id: id, value: true }); } }
-        : { label: item.active ? "Exclude LoRA" : "Include LoRA", run: function () { send({ type: "toggle", id: id, enabled: !item.active }); } }
+        : item.inside
+          ? { label: "Add on its own too", run: function () { send({ type: "toggle", id: id, enabled: true }); } }
+          : { label: item.active ? "Exclude LoRA" : "Include LoRA", run: function () { send({ type: "toggle", id: id, enabled: !item.active }); } }
     ];
   }
 
@@ -834,6 +841,7 @@
     tile.setAttribute("aria-selected", item.active ? "true" : "false");
     var tooltip = [displayName(item), item.name];
     if (item.disabled) { tooltip.push("Switched off - click to switch it back on"); }
+    if (item.inside) { tooltip.push("In " + item.inside + "'s file - click to add it on its own as well"); }
     if (item.parent) { tooltip.push(item.parent); }
     if ((item.words || []).length) { tooltip.push("Triggers: " + item.words.join(", ")); }
     tile.title = tooltip.filter(Boolean).join("\n");
@@ -849,6 +857,11 @@
       check.textContent = "\u2713";
     }
     badges.appendChild(check);
+    if (item.inside) {
+      var inside = span("lb-inside", item.inside.replace(/^\S+ /, ""));
+      inside.title = "In " + item.inside + "'s file";
+      badges.appendChild(inside);
+    }
     if (item.favorite) {
       var star = document.createElement("span");
       star.className = "lb-star";
@@ -1417,6 +1430,9 @@
         head.appendChild(span("lb-track-name", title));
         if (pinned) { head.appendChild(span("lb-muted lb-track-note", "runs in phase " + pinned + " only")); }
         section.appendChild(head);
+        if (pinned && row.shrink && S.avSupported) {
+          section.appendChild(fileModeLine(row, track, rowName(row) + " phase " + pinned + " file"));
+        }
         var trackLabel = rowName(row) + " " + (pinned ? "phase " + pinned : side);
         var sidePainters = buildStrengths(section, track, trackLabel, inline);
         if (!inline) { appendClip(head, track, trackLabel, sidePainters, true); }
@@ -1513,6 +1529,7 @@
     }
     if (row.system_managed) { name.appendChild(note("WanGP-managed")); }
     if (row.missing) { name.appendChild(note("Missing locally")); }
+    if (row.double) { name.appendChild(doublePill(row)); }
     top.appendChild(name);
 
     // Copy and Paste, for a card's one strength (filled in by buildRow).
@@ -1550,6 +1567,13 @@
     power.setAttribute("role", "switch");
     power.setAttribute("aria-checked", on ? "true" : "false");
     power.setAttribute("aria-label", "Apply " + rowName(row));
+    if (row.double) {
+      // WanGP cannot apply one LoRA twice: this copy waits for the other.
+      power.disabled = true;
+      power.classList.add("lb-switch-locked");
+      power.title = doubleText(row);
+      return power;
+    }
     power.title = on
       ? "Applied - switch off to skip it and keep its settings"
       : row.skipped && row.empty
@@ -1565,10 +1589,21 @@
     return power;
   }
 
+  function doubleText(row) {
+    return "A double: " + rowName(row) + " is already in the stack, and WanGP cannot apply one LoRA twice. " +
+      "It stays off until the other copy is gone; then it can be switched on.";
+  }
+
   /* What a switched-off LoRA brings back when it is switched on again. */
   function buildOffSummary(row) {
     var line = document.createElement("div");
     line.className = "lb-off-summary";
+    if (row.double) {
+      line.classList.add("lb-off-double");
+      line.appendChild(span("lb-off-label", "Double"));
+      line.appendChild(span("lb-off-text", doubleText(row)));
+      return line;
+    }
     var label = document.createElement("span");
     label.className = "lb-off-label";
     label.textContent = "Off";
@@ -1962,6 +1997,7 @@
   function rowById(id) {
     var found = null;
     S.rows.forEach(function (row) {
+      if (row.double) { return; }
       tracksOf(row).forEach(function (track) { if (track.id === id) { found = track; } });
     });
     return found;
@@ -2572,8 +2608,13 @@
         (row.has_catalogue ? "Inspect " : "Inspect / fetch info for ") + (row.civitai_name || row.name)));
     }
     bar.appendChild(makeButton("Remove", "lb-btn lb-remove", function () {
+      if (row.double) {
+        send({ type: "remove_double", id: row.id });
+        return;
+      }
       send(row.kind === "group" ? { type: "remove", id: row.id, group: row.group } : { type: "remove", id: row.id });
-    }, "Remove " + rowName(row) + (isOn(row) ? "" : " - and forget its settings")));
+    }, row.double ? "Remove this double; the copy that is applied stays"
+      : "Remove " + rowName(row) + (isOn(row) ? "" : " - and forget its settings")));
     return bar;
   }
 
@@ -2848,7 +2889,10 @@
 
   /* What identifies a row from one payload to the next, whatever file it
      loads: a mode change or a bake renames the file, not the row. */
-  function rowKey(row) { return row.kind === "group" ? "g:" + row.group : sourceId(row); }
+  function rowKey(row) {
+    if (row.kind === "double") { return "d:" + row.id; }
+    return row.kind === "group" ? "g:" + row.group : sourceId(row);
+  }
 
   function buildState(build) { return build ? text(build.state) : ""; }
 
@@ -3043,6 +3087,7 @@
         (row.shrink ? shrunkWhere(row) : row.separate ? ", picture and sound strengths" : ", one strength")));
       var bake = bakePill(row);
       if (bake) { name.appendChild(bake); }
+      fileModePills(row).forEach(function (node) { name.appendChild(node); });
     } else {
       modePills(row).forEach(function (node) { name.appendChild(node); });
       if (row.missing) { name.appendChild(note("Missing locally")); }
@@ -3206,7 +3251,14 @@
   }
 
   /* Visual only / Audio only, and where its copy is. */
+  function doublePill(row) {
+    var pill = span("lb-mode-pill lb-pill-warn lb-double-pill", "Double · not applied");
+    pill.title = doubleText(row);
+    return pill;
+  }
+
   function modePills(row) {
+    if (row.double) { return [doublePill(row)]; }
     var mode = row.mode || "normal";
     if (mode === "normal") { return []; }
     var node = span("lb-mode-pill lb-mode-" + mode);
@@ -3267,6 +3319,7 @@
   }
 
   function pickBox(row, key, picked) {
+    if (row.double) { return span("lb-pick-none"); }
     var box = document.createElement("button");
     box.type = "button";
     box.className = "lb-pick";
@@ -3392,7 +3445,7 @@
 
   /* Normal, Visual only, Audio only -- and, for a LoRA of its own,
      Separate: picture and sound each at a strength of their own. */
-  function modeSeg(row, small) {
+  function modeSeg(row, small, group) {
     var current = row.mode || "normal";
     var seg = document.createElement("div");
     seg.className = "lb-seg" + (small ? " lb-seg-sm" : "");
@@ -3419,11 +3472,62 @@
       }
       button.addEventListener("click", function (event) {
         event.stopPropagation();
-        if (current !== mode) { send({ type: "set_mode", id: row.id, mode: mode }); }
+        if (current !== mode) {
+          send(group ? { type: "set_mode", id: row.id, mode: mode, group: group } : { type: "set_mode", id: row.id, mode: mode });
+        }
       });
       seg.appendChild(button);
     });
     return seg;
+  }
+
+  /* How one of a shrunk group's files is used: as it is, or a copy of it
+     keeping only its picture or its sound -- made from the built file,
+     nothing baked again. */
+  function fileModeLine(row, track, label) {
+    var line = document.createElement("div");
+    line.className = "lb-file-mode";
+    line.appendChild(span("lb-file-mode-label", "File applies to"));
+    var current = track.file_mode || "normal";
+    var seg = document.createElement("div");
+    seg.className = "lb-seg lb-seg-sm";
+    seg.setAttribute("role", "radiogroup");
+    seg.setAttribute("aria-label", label + " applies to");
+    ["normal", "visual", "audio"].forEach(function (mode) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute("role", "radio");
+      button.className = "lb-seg-" + mode;
+      button.setAttribute("aria-checked", current === mode ? "true" : "false");
+      if (mode !== "normal") { button.appendChild(icon(mode === "visual" ? "picture" : "sound")); }
+      button.appendChild(document.createTextNode(MODE_SHORT[mode]));
+      button.title = mode === "normal" ? "Use the shrunk file as it is"
+        : "Use a copy of the shrunk file keeping only its " + (mode === "visual" ? "picture" : "sound") +
+          " side: made from the built file, nothing is baked again";
+      button.addEventListener("click", function (event) {
+        event.stopPropagation();
+        if (current !== mode) { send({ type: "file_mode", group: row.group, track: track.track, mode: mode }); }
+      });
+      seg.appendChild(button);
+    });
+    line.appendChild(seg);
+    return line;
+  }
+
+  /* A shrunk group's files used visual or audio only, as pills. */
+  function fileModePills(row) {
+    if (!row.shrink) { return []; }
+    var tracks = (row.phase_tracks || []).length ? row.phase_tracks : [{ track: "all", file_mode: row.file_mode }];
+    return tracks.filter(function (track) { return track.file_mode && track.file_mode !== "normal"; })
+      .map(function (track) {
+        var pill = span("lb-mode-pill lb-mode-" + track.file_mode);
+        pill.appendChild(icon(track.file_mode === "visual" ? "picture" : "sound"));
+        pill.appendChild(document.createTextNode((track.pinned_phase ? "P" + track.pinned_phase + " " : "") +
+          MODE_LABEL[track.file_mode].toLowerCase()));
+        pill.title = (track.pinned_phase ? "Phase " + track.pinned_phase + "'s file" : "The shrunk file") +
+          " applies " + MODE_LABEL[track.file_mode].toLowerCase();
+        return pill;
+      });
   }
 
   function changesBoth(row) {
@@ -3751,7 +3855,7 @@
       var detail = memberNote(member, row);
       if (detail) { name.appendChild(span("lb-member-note", detail)); }
       item.appendChild(name);
-      if (S.avSupported && !row.shrink) { item.appendChild(modeSeg(member, true)); }
+      if (S.avSupported && !row.shrink) { item.appendChild(modeSeg(member, true, row.group)); }
       var leave = makeButton("×", "lb-btn lb-icon", function () {
         send({ type: "group_leave", group: row.group, id: member.id });
       }, row.shrink
@@ -3842,6 +3946,9 @@
 
     var bake = row.bake || {};
     var count = (row.members || []).length;
+    if (row.shrink && row.baked && S.avSupported && !(row.phase_tracks || []).length) {
+      box.appendChild(fileModeLine(row, { track: "all", file_mode: row.file_mode }, rowName(row) + " file"));
+    }
     var unbake = function () {
       // A shrunk row has Unshrink in its toolbar already.
       if (row.shrink) { return span(""); }
@@ -6871,6 +6978,7 @@
     S.activeProfile = payload.active_profile || "";
     S.canDisableAll = !!payload.can_disable_all;
     S.canEnableAll = !!payload.can_enable_all;
+    S.canShrink = payload.can_shrink !== false;
     S.stackText = payload.stack_text || "";
     S.signature = payload.signature || "";
     S.sliderMin = payload.slider_min !== undefined ? payload.slider_min : 0;
@@ -6981,6 +7089,10 @@
     el.activeTitle.textContent = "Active LoRAs (" + activeCount + ")" + (offCount ? " \u00B7 " + offCount + " off" : "");
     el.disableAll.disabled = !S.canDisableAll;
     el.enableAll.disabled = !S.canEnableAll;
+    el.shrink.disabled = !S.canShrink;
+    el.shrink.title = S.canShrink
+      ? "Bake the stack down into as few files as run the same, so it takes less memory"
+      : "The stack is already shrunk: unshrink it before shrinking again";
     el.viewSwitch.querySelectorAll("button").forEach(function (button) {
       button.setAttribute("aria-checked", button.dataset.view === S.view ? "true" : "false");
     });

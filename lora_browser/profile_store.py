@@ -27,7 +27,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .derived import size_tag
+from .derived import bake_spec, parse_bake_spec
 from .metadata_store import MetadataStore
 from .utils import normalize_id
 
@@ -126,10 +126,10 @@ class Profile:
                 )
             )
         bakes = {}
-        for letter, size in (payload.get("bakes") or {}).items() if isinstance(payload.get("bakes"), dict) else []:
-            tag = size_tag(size)
-            if _letter(letter) and tag:
-                bakes[_letter(letter)] = _bake_value(tag)
+        for letter, spec in (payload.get("bakes") or {}).items() if isinstance(payload.get("bakes"), dict) else []:
+            size, modes = parse_bake_spec(spec)
+            if _letter(letter) and size:
+                bakes[_letter(letter)] = _bake_value(bake_spec(size, modes))
         return cls(
             name=name,
             model_key=str(payload.get("model_key", "") or ""),
@@ -263,11 +263,14 @@ class ProfileStore:
         return ""
 
 
-def _bake_value(size) -> int | str:
-    """A bake size as a profile keeps it: a rank as a number, as profiles
-    always have, or a compression level's ``q999``."""
-    tag = size_tag(size)
-    return int(tag[1:]) if tag.startswith("r") else tag
+def _bake_value(spec) -> int | str:
+    """How a group is baked as a profile keeps it: a rank alone as a number,
+    as profiles always have; otherwise its spec -- a compression level's
+    ``q999``, with any of its files used visual or audio only."""
+    size, modes = parse_bake_spec(spec)
+    if size.startswith("r") and not modes:
+        return int(size[1:])
+    return bake_spec(size, modes)
 
 
 def _signature(entries: list[ProfileEntry], bakes: dict[str, int | str] | None = None) -> tuple:
@@ -275,4 +278,4 @@ def _signature(entries: list[ProfileEntry], bakes: dict[str, int | str] | None =
     return tuple(
         (entry.id, str(entry.multiplier).strip(), bool(entry.enabled), entry.mode, entry.group, entry.skipped)
         for entry in entries
-    ) + (tuple(sorted((letter, size_tag(size)) for letter, size in (bakes or {}).items())),)
+    ) + (tuple(sorted((letter, bake_spec(*parse_bake_spec(spec))) for letter, spec in (bakes or {}).items())),)

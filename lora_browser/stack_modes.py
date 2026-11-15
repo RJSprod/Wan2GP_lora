@@ -230,8 +230,21 @@ class Group:
         """Every baked file, picture first, phase 1 first."""
         return [self.bakes[track] for track in (ALL, PICTURE, SOUND) + PHASE_TRACKS if track in self.bakes]
 
+    def inside(self, lora_id: str) -> bool:
+        """``lora_id`` is a member baked into the group's file: named by the
+        group's lines, never an entry of its own.  An entry with that id is
+        the same LoRA added beside the file."""
+        return lora_id in self.members and self.track_of(lora_id) in self.bakes
+
     def holds(self, lora_id: str) -> bool:
-        return lora_id in self.members or lora_id in self.bakes.values()
+        """An entry of the group's: one of its files, or a member on a side
+        that is not baked."""
+        return lora_id in self.bakes.values() or (lora_id in self.members and not self.inside(lora_id))
+
+    @property
+    def entries(self) -> list[str]:
+        """What the group is in the stack: its files and unbaked members."""
+        return list(self.files) + [member for member in self.members if not self.inside(member)]
 
 
 def groups(stack) -> dict[str, Group]:
@@ -268,6 +281,44 @@ def group_of(stack, lora_id: str) -> Group | None:
     return None
 
 
+def file_mode(group: Group, track: str) -> str:
+    """How a baked file of ``group`` is used: ``normal``, or a copy of it
+    visual or audio only."""
+    parsed = dv.parse(group.bakes.get(track, ""))
+    return parsed.mode if parsed is not None and parsed.mode in dv.FILE_MODES else NORMAL
+
+
+def file_modes(group: Group) -> dict[str, str]:
+    """``track -> mode`` for each of a group's files used visual or audio only."""
+    return {track: file_mode(group, track) for track in group.bakes if file_mode(group, track) != NORMAL}
+
+
+def set_file_mode(stack, letter: str, track: str, mode: str) -> str:
+    """Use a shrunk group's file for ``track`` visual or audio only -- a copy
+    made from the built file, nothing baked again -- or as it is.  Returns
+    the id it is selected by now, or ``""`` when nothing changed."""
+    group = groups(stack).get(letter)
+    if group is None or track not in group.bakes:
+        return ""
+    old = group.bakes[track]
+    new = dv.bake_mode_id(old, mode)
+    if new == old or _named(stack, new):
+        return ""
+    rename(stack, old, new)
+    return new
+
+
+def member_group(stack, lora_id: str) -> Group | None:
+    """The group ``lora_id`` stands for: the one whose entry it is, or --
+    with no entry of that id beside it -- the one whose file it is baked
+    into."""
+    target = normalize_id(lora_id)
+    found = group_of(stack, target)
+    if found is not None or stack.has_entry(target):
+        return found
+    return next((group for group in groups(stack).values() if group.inside(target)), None)
+
+
 def next_letter(stack) -> str:
     used = set(stack.groups)
     return next((letter for letter in LETTERS if letter not in used), "")
@@ -291,7 +342,7 @@ def lead_of(stack, group: Group, track: str = "") -> str:
 
 def group_on(stack, group: Group) -> bool:
     selected = set(stack.ids)
-    return any(value in selected for value in group.members + group.files)
+    return any(value in selected for value in group.entries)
 
 
 # -------------------------------------------------------------- entries
@@ -310,8 +361,13 @@ def _token(stack, lora_id: str) -> str | None:
 
 
 def _named(stack, lora_id: str) -> bool:
-    """In the stack, or named by a group's lines."""
-    return stack.has_entry(lora_id) or any(lora_id in members for members in stack.groups.values())
+    """In the stack, or named by a group's lines as one of its entries -- a
+    member baked into a file leaves its id free for the same LoRA beside it."""
+    if stack.has_entry(lora_id):
+        return True
+    found = groups(stack)
+    return any(lora_id in members and (letter not in found or not found[letter].inside(lora_id))
+               for letter, members in stack.groups.items())
 
 
 def _free(stack, new_ids, old_ids) -> bool:
@@ -358,25 +414,36 @@ def rename(stack, old: str, new: str) -> bool:
         if entry is not None:
             entry.id = new
             changed = True
-    for members in stack.groups.values():
+    found_groups = groups(stack)
+    for letter, members in stack.groups.items():
+        if letter in found_groups and found_groups[letter].inside(old):
+            continue                     # the file's member, not this entry
         for index, value in enumerate(members):
             if value == old:
                 members[index] = new
                 changed = True
-    for found in getattr(stack, "weights", {}).values():
-        if old in found:
-            found[new] = found.pop(old)
+        if old in getattr(stack, "weights", {}).get(letter, {}):
+            stack.weights[letter][new] = stack.weights[letter].pop(old)
     return changed
 
 
-def replace(stack, old: list[str], new: list[tuple[str, str]]) -> bool:
+def replace(stack, old: list[str], new: list[tuple[str, str]], letter: str = "") -> bool:
     """Put ``new`` -- ``(id, token)`` pairs -- where the first of ``old``
     stands, in place of all of ``old``: in the stack, and in any group's
     lines.  An entry that stays keeps its state; a new one is on if any of
-    ``old`` was, off for nothing to apply if every one of ``old`` was."""
+    ``old`` was, off for nothing to apply if every one of ``old`` was.
+
+    ``letter`` names the group whose members ``old`` are: only its lines
+    change, and an entry only where that member is one -- a member baked into
+    its file shares its id with no entry, so one with it is the same LoRA
+    beside the file, and stays as it is.  Without it, a group's lines change
+    only where they name ``old`` as one of its entries."""
     old = [normalize_id(value) for value in old]
     new = [(normalize_id(value), token or DEFAULT_TOKEN) for value, token in new]
-    gone = set(old)
+    found_groups = groups(stack)
+    owner = found_groups.get(letter) if letter else None
+    gone = {value for value in old if owner is None or not owner.inside(value)}
+    lines_gone = set(old)
     entries, skipped = _states(stack)
     hits = [index for index, entry in enumerate(entries) if entry[0] in gone]
     changed = False
@@ -399,14 +466,18 @@ def replace(stack, old: list[str], new: list[tuple[str, str]]) -> bool:
         rest[hits[0]:hits[0]] = placed
         stack.set_user_entries(rest, skipped)
         changed = True
-    for letter, members in stack.groups.items():
-        found = [index for index, value in enumerate(members) if value in gone]
+    for name, members in stack.groups.items():
+        if letter and name != letter:
+            continue
+        group = found_groups.get(name)
+        here = {value for value in lines_gone if letter or group is None or not group.inside(value)}
+        found = [index for index, value in enumerate(members) if value in here]
         if not found:
             continue
-        rest = [value for value in members if value not in gone]
-        at = sum(1 for value in members[:found[0]] if value not in gone)
+        rest = [value for value in members if value not in here]
+        at = sum(1 for value in members[:found[0]] if value not in here)
         rest[at:at] = [value for value, _ in new if value not in rest]
-        stack.groups[letter] = rest
+        stack.groups[name] = rest
         changed = True
     return changed
 
@@ -463,7 +534,7 @@ def set_mode(stack, lora_id: str, mode: str, known_ids=()) -> str:
     return made[0] if made else ""
 
 
-def set_mode_entries(stack, lora_id: str, mode: str, known_ids=()) -> list[str]:
+def set_mode_entries(stack, lora_id: str, mode: str, known_ids=(), letter: str = "") -> list[str]:
     """:func:`set_mode`, returning every entry the LoRA is now selected as.
 
     A single LoRA takes any of :data:`SINGLE_MODES`.  ``separate`` selects it
@@ -473,7 +544,10 @@ def set_mode_entries(stack, lora_id: str, mode: str, known_ids=()) -> list[str]:
     halves its group's strengths need.
     """
     lora_id = normalize_id(lora_id)
-    group = group_of(stack, lora_id)
+    named = groups(stack).get(letter) if letter else None
+    # ``letter`` names the group whose member it is: one baked into its file
+    # shares its id with any copy of the same LoRA beside the file.
+    group = named if named is not None and lora_id in named.members else member_group(stack, lora_id)
     if group is not None:
         return _set_member_mode(stack, group, lora_id, mode, known_ids) if mode in MODES else []
     if mode not in SINGLE_MODES:
@@ -574,7 +648,7 @@ def _set_member_mode(stack, group: Group, lora_id: str, mode: str, known_ids=())
     new = [(value, tokens[track]) for value, track in member_ids(source, mode, group.separate)]
     if not _free(stack, [value for value, _ in new], old):
         return []
-    replace(stack, old, new)
+    replace(stack, old, new, letter=group.letter)
     return [value for value, _ in new]
 
 
@@ -590,7 +664,8 @@ def settle(stack, empty: Callable[[str], bool]) -> dict[str, list[str]]:
     on_now = {lora_id for lora_id, on, _ in entries if on}
     present = {lora_id for lora_id, _, _ in entries}
     found = groups(stack)
-    member_group = {member: group for group in found.values() for member in group.members}
+    member_group = {member: group for group in found.values() for member in group.members
+                    if not group.inside(member)}
     bake_track = {value: (group, track) for group in found.values() for track, value in group.bakes.items()}
     wanted: dict[str, str] = {}
     moved: dict[str, list[str]] = {"off": [], "on": []}
@@ -735,6 +810,62 @@ def _single_out(stack, entries: list[str], known_ids=()) -> None:
                 rename(stack, value, target)
 
 
+def to_doubles(stack, members) -> list[str]:
+    """Entries of the same LoRAs as ``members`` -- added on their own beside
+    the baked file that holds them -- become doubles as those members come
+    back out of it: WanGP cannot apply one LoRA twice, so the copy that was
+    added beside it stays off, and cannot be switched on, until the other is
+    gone.  Returns the ids made doubles."""
+    stems = {dv.stem_of(normalize_id(value)) for value in members}
+    if not stems:
+        return []
+    entries, skipped = _states(stack)
+    moving = [(index, entry) for index, entry in enumerate(entries) if dv.stem_of(entry[0]) in stems]
+    if not moving:
+        return []
+    ids = {entry[0] for _, entry in moving}
+    stack.set_user_entries([entry for entry in entries if entry[0] not in ids], skipped - ids)
+    stack.doubles = [double for double in getattr(stack, "doubles", []) if double.id not in ids] + [
+        codec.DisabledLora(id=lora_id, token=token, at=index, double=True)
+        for index, (lora_id, _, token) in moving
+    ]
+    return [entry[0] for _, entry in moving]
+
+
+def seat_doubles(stack, ids) -> None:
+    """Each of these doubles right after the copy of its LoRA that stays."""
+    wanted = set(ids)
+    if not wanted:
+        return
+    entries = stack.user_entries()
+    for double in getattr(stack, "doubles", []):
+        if double.id not in wanted:
+            continue
+        stem = dv.stem_of(double.id)
+        twins = [index for index, entry in enumerate(entries) if dv.stem_of(entry[0]) == stem]
+        if twins:
+            double.at = twins[-1] + 1
+
+
+def release_doubles(stack) -> bool:
+    """A double whose other copy is no entry any more -- removed, or baked
+    into a file again -- is a LoRA of its own again: off, where it was, and
+    free to be switched on (beside the file, where it is in one)."""
+    doubles = getattr(stack, "doubles", [])
+    if not doubles:
+        return False
+    present = {dv.stem_of(lora_id) for lora_id, _, _ in stack.user_entries()}
+    free = [double for double in doubles if dv.stem_of(double.id) not in present]
+    if not free:
+        return False
+    stack.doubles = [double for double in doubles if double not in free]
+    entries, skipped = _states(stack)
+    for double in sorted(free, key=lambda item: item.at):
+        entries.insert(max(0, min(int(double.at), len(entries))), (double.id, False, double.token))
+    stack.set_user_entries(entries, skipped)
+    return True
+
+
 def leave_group(stack, letter: str, lora_id: str, known_ids=()) -> bool:
     """Take one LoRA out of a group; it keeps the group's multiplier -- or,
     with separate strengths, the picture's and the sound's.
@@ -755,16 +886,17 @@ def leave_group(stack, letter: str, lora_id: str, known_ids=()) -> bool:
     members = [member for member in group.members if member not in mine]
     if group.baked:
         tokens = _track_tokens(stack, group)
+        coming = [(member, member_token(stack, group, member) if group.weighted else tokens[group.track_of(member)])
+                  for member in mine if group.inside(member)]
+        made = to_doubles(stack, [member for member, _ in coming])
         entries, skipped = _states(stack)
-        values = set(group.files) | set(group.members)
+        values = set(group.entries)
         spots = [index for index, entry in enumerate(entries) if entry[0] in values]
         on = any(entries[index][1] for index in spots)
         at = spots[-1] + 1 if spots else len(entries)
-        entries[at:at] = [
-            (member, on, member_token(stack, group, member) if group.weighted else tokens[group.track_of(member)])
-            for member in mine if not stack.has_entry(member)
-        ]
+        entries[at:at] = [(member, on, token) for member, token in coming if not stack.has_entry(member)]
         stack.set_user_entries(entries, skipped)
+        seat_doubles(stack, made)
         stack.groups[letter] = members + group.files
         if group.weighted:
             stack.weights[letter] = {member: list(group.weights.get(member, [1.0])) for member in members}
@@ -796,7 +928,7 @@ def remove_group(stack, letter: str) -> bool:
     if group is None:
         return False
     entries, skipped = _states(stack)
-    gone = set(group.members) | set(group.files)
+    gone = set(group.entries)
     stack.set_user_entries([entry for entry in entries if entry[0] not in gone], skipped)
     stack.groups.pop(letter, None)
     getattr(stack, "weights", {}).pop(letter, None)
@@ -862,8 +994,10 @@ def set_bakes(stack, letter: str, wanted: dict[str, str]) -> bool:
     if any(value not in group.bakes.values() and _named(stack, value) for value in wanted.values()):
         return False
     tokens = _track_tokens(stack, group)
+    made = to_doubles(stack, [member for member in group.members
+                              if group.inside(member) and group.track_of(member) not in wanted])
     entries, skipped = _states(stack)
-    mine = set(group.members) | set(group.files)
+    mine = set(group.entries)
     spots = [index for index, entry in enumerate(entries) if entry[0] in mine]
     if not spots:
         return False
@@ -884,6 +1018,7 @@ def set_bakes(stack, letter: str, wanted: dict[str, str]) -> bool:
     rest[spots[0]:spots[0]] = placed
     stack.set_user_entries(rest, skipped)
     stack.groups[letter] = list(group.members) + [wanted[track] for track in group.tracks if track in wanted]
+    seat_doubles(stack, made)
     return True
 
 
@@ -928,8 +1063,11 @@ def unshrink(stack, letter: str) -> bool:
     if group is None or not group.weighted:
         return False
     restored = [(member, member_token(stack, group, member)) for member in group.members]
+    # Coming out of its file: a copy beside the file becomes a double.  A
+    # group that lost its file holds its members as entries already.
+    made = to_doubles(stack, [member for member in group.members if group.inside(member)])
     entries, skipped = _states(stack)
-    mine = set(group.members) | set(group.files)
+    mine = set(group.entries)
     spots = [index for index, entry in enumerate(entries) if entry[0] in mine]
     on = any(entries[index][1] for index in spots) if spots else True
     rest = [entry for entry in entries if entry[0] not in mine]
@@ -938,6 +1076,7 @@ def unshrink(stack, letter: str) -> bool:
     stack.set_user_entries(rest, skipped - mine)
     stack.groups.pop(letter, None)
     stack.weights.pop(letter, None)
+    seat_doubles(stack, made)
     return True
 
 
@@ -988,6 +1127,8 @@ def repair(stack, known_ids=()) -> bool:
     for letter, group in list(groups(stack).items()):
         if group.weighted and not group.baked:
             unshrink(stack, letter)
+    doubles_before = [(double.id, double.at) for double in getattr(stack, "doubles", [])]
+    release_doubles(stack)
     _single_out(stack, [lora_id for lora_id, _, _ in stack.user_entries()
                         if group_of(stack, lora_id) is None], known_ids)
     for group in groups(stack).values():
@@ -1002,7 +1143,7 @@ def repair(stack, known_ids=()) -> bool:
             if _free(stack, [value for value, _ in new], [member]):
                 replace(stack, [member], new)
     after = (list(stack.ids), [(entry.id, entry.at) for entry in stack.disabled], repr(stack.groups))
-    return before != after
+    return before != after or doubles_before != [(double.id, double.at) for double in getattr(stack, "doubles", [])]
 
 
 # ------------------------------------------------------------------ rows
@@ -1024,7 +1165,7 @@ def fold_rows(rows: list[dict], stack, describe: Callable[[str], dict], known_id
     by_id = {row["id"]: row for row in rows}
     owner = {}
     for group in found.values():
-        for value in group.members + group.files:
+        for value in group.entries:
             owner[value] = group
     folded, done = [], set()
     for row in rows:
