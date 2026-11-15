@@ -34,6 +34,7 @@ from .lora_browser import compare as cmp
 from .lora_browser import derived as dv
 from .lora_browser import lora_files as lf
 from .lora_browser import schedule as sch
+from .lora_browser import shrink as sk
 from .lora_browser import stack_modes as sm
 from .lora_browser import stack_text
 from .lora_browser import ui_payloads as up
@@ -167,6 +168,9 @@ class InstanceState:
         #: and whether this WanGP gave the panel that output at all.
         self.pending_prompt: str | None = None
         self.prompt_writable = False
+        #: What a shrink would make of the stack, for the Shrink dialog --
+        #: carried by the next payload only, the one answering the question.
+        self.shrink_report: dict | None = None
 
     def take_prompt(self) -> str | None:
         prompt, self.pending_prompt = self.pending_prompt, None
@@ -183,6 +187,10 @@ class InstanceState:
 
     def take_paste_report(self) -> dict | None:
         report, self.paste_report = self.paste_report, None
+        return report
+
+    def take_shrink_report(self) -> dict | None:
+        report, self.shrink_report = self.shrink_report, None
         return report
 
     def note(self, message: str, warn: bool = False) -> None:
@@ -565,6 +573,12 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         instance.lora_dir = lora_dir
         instance.inventory_ids = inventory.ids
         instance.sided = up.is_ltx2(model_def)
+        # A baked file named without the lines saying what it holds gets them
+        # back from its recipe, so it is a group again -- and can be rebuilt.
+        try:
+            self._stack_files(instance, inventory).restore_groups(stack)
+        except OSError:
+            pass
         up.remember_hidden_phases(stack, phases, instance.phase_memory)
         up.forget_superseded_phases(stack, instance.hidden_phases)
         # Bring the region editor back in line with the native tokens before
@@ -683,13 +697,14 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 "stack_text": stack_text.format_stack(
                     [
                         (entry.id, entry.multiplier, self._text_mode(entry, entries), entry.group,
-                         bakes.get(entry.group, 0))
+                         bakes.get(entry.group, 0), entry.weight)
                         for entry in entries if entry.enabled
                     ],
                     name_index,
                 ),
                 # Set only on the payload answering a pasted stack.
                 "paste_report": instance.take_paste_report(),
+                "shrink_plan": instance.take_shrink_report(),
                 # Two recipes side by side, while the compare view is open.
                 "compare": self._compare_view(instance, state_value, inventory, model_type),
                 "signature": signature,
@@ -859,6 +874,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             up.fit_phase_structure(result, phases, instance.hidden_phases)
             stack.ids, stack.tokens = result.ids, result.tokens
             stack.separator_index, stack.disabled, stack.groups = result.separator_index, result.disabled, result.groups
+            stack.weights = result.weights
             missing = [
                 lora_id for lora_id, _, _ in stack.user_entries()
                 if inventory.get(lora_id) is None and not dv.is_derived(lora_id)
@@ -951,6 +967,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                     id=source, multiplier=token, enabled=on, mode=mode,
                     group=group.letter if group else member_of.get(member, ""),
                     skipped=(not on) and lora_id in skipped,
+                    weight=group.weight(member) if group is not None and group.weighted else None,
                 ))
         return entries, bakes
 
@@ -959,7 +976,7 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         """Rebuild the user side of the stack from profile-style entries:
         modes as built copies, groups as group lines, bakes as baked files.
         Anything not on disk yet is built by the next payload."""
-        native, skipped, groups, seen = [], set(), {}, set()
+        native, skipped, groups, seen, weights = [], set(), {}, set(), {}
         for entry in entries:
             lora_id = dv.split_id(entry.id, entry.mode) if files.sided else entry.id
             if lora_id in seen:
@@ -970,8 +987,12 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 skipped.add(lora_id)
             if entry.group:
                 groups.setdefault(entry.group, []).append(lora_id)
+                if entry.weight is not None:
+                    weights.setdefault(entry.group, {})[lora_id] = float(entry.weight)
         stack.set_user_entries(native, skipped)
         stack.groups = {letter: members for letter, members in groups.items() if len(members) >= 2}
+        # A shrunk group's members bring their weights to its baked file.
+        stack.weights = {letter: found for letter, found in weights.items() if letter in stack.groups}
         for letter, rank in bakes.items():
             group = sm.groups(stack).get(letter)
             if group is not None and not group.baked:
@@ -1105,6 +1126,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         if kind in ("set_mode", "set_mode_all", "group_create", "group_add", "group_leave",
                     "ungroup", "bake", "unbake", "group_separate"):
             return self._mode_action(instance, action, stack, self._stack_files(instance, inventory))
+
+        if kind in ("shrink_plan", "shrink", "unshrink"):
+            return self._shrink_action(instance, action, stack, self._stack_files(instance, inventory))
 
         if kind == "build_retry":
             self._builder.retry(normalize_id(action.get("id")))
@@ -1550,6 +1574,9 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             return changed
 
         if kind == "unbake":
+            group = sm.groups(stack).get(letter)
+            if group is not None and group.weighted:
+                return self._shrink_action(instance, {"type": "unshrink", "group": letter}, stack, files)
             if not sm.unbake(stack, letter):
                 return False
             sm.settle(stack, files.empty)
@@ -1560,6 +1587,43 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         if kind == "group_separate":
             return self._group_separate(instance, stack, files, letter, bool(action.get("value")))
         return False
+
+    def _shrink_action(self, instance, action, stack, files: StackFiles) -> bool:
+        """Plan a shrink, carry it out, or undo one group of it."""
+        kind = action["type"]
+        if kind == "unshrink":
+            letter = str(action.get("group", "") or "").upper()
+            group = sm.groups(stack).get(letter)
+            if group is None or not group.weighted:
+                return False
+            count = len({files.source(member)[0] for member in group.members})
+            if not sm.unshrink(stack, letter):
+                return False
+            sm.settle(stack, files.empty)
+            instance.note(f"Unshrunk: WanGP loads those {count} LoRAs separately again, each at the strength "
+                          "it had. The shrunk file stays under Built files until you delete it.")
+            return True
+        if files.store is None:
+            instance.note("This model has no LoRA folder to build the shrunk files in.", True)
+            instance.shrink_report = {"error": "This model has no LoRA folder to build the shrunk files in."}
+            return False
+        result = sk.plan(stack, files)
+        if kind == "shrink_plan":
+            instance.shrink_report = result.to_dict()
+            return False
+        if not result.bundles:
+            instance.note("Nothing to shrink: no two LoRAs run at one strength, or share a schedule.", True)
+            return False
+        made = sk.apply(stack, result, files)
+        if not made:
+            return False
+        sm.settle(stack, files.empty)
+        loras = sum(bundle.loras for bundle in result.bundles)
+        files_word = "file" if len(made) == 1 else "files"
+        instance.note(f"Shrinking {loras} LoRAs into {len(made)} {files_word}. Until "
+                      f"{'it is' if len(made) == 1 else 'they are'} built, WanGP reports "
+                      f"{'it' if len(made) == 1 else 'them'} as missing if you generate.")
+        return True
 
     def _group_separate(self, instance, stack, files: StackFiles, letter: str, separate: bool) -> bool:
         """Give a group a picture strength and a sound strength, or one again.
@@ -1709,6 +1773,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         files = self._stack_files(instance, inventory)
         entries, problems, first_line = [], [], {}
         groups: dict[str, list[str]] = {}
+        #: What each LoRA of a shrunk group brings to its file.
+        weights: dict[str, dict[str, float]] = {}
         #: The multiplier each side of a group was first given, and where.
         group_token: dict[tuple[str, str], tuple[str, int]] = {}
         bakes: dict[str, int] = {}
@@ -1755,6 +1821,8 @@ class LoraBrowserPlugin(WAN2GPPlugin):
             if line.group:
                 group_token.setdefault(key, (token, line.number))
                 groups.setdefault(line.group, []).append(native)
+                if line.weight is not None:
+                    weights.setdefault(line.group, {})[native] = float(line.weight)
                 if line.baked:
                     bakes[line.group] = max(bakes.get(line.group, 0), line.baked)
             entries.append((native, True, token))
@@ -1803,11 +1871,20 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 del instance.schedules[key]
         stack.set_user_entries(entries, set())
         stack.groups = {letter: members for letter, members in groups.items() if len(members) >= 2}
+        stack.weights = {}
         sm.repair(stack, files.known)
+        # A shrunk group's weights, once the groups have their shapes; one
+        # that comes without a baked file is its LoRAs at what they brought.
+        stack.weights = {letter: {member: found[member] for member in stack.groups[letter] if member in found}
+                         for letter, found in weights.items() if letter in stack.groups}
         for letter, rank in bakes.items():
             group = sm.groups(stack).get(letter)
             if group is not None:
                 sm.set_bakes(stack, letter, files.bake_ids(group, rank))
+        for letter in list(stack.weights):
+            group = sm.groups(stack).get(letter)
+            if group is not None and not group.baked:
+                sm.unshrink(stack, letter)
         sm.settle(stack, files.empty)
 
         unrun = sum(1 for _, _, token in entries if stack_text.phase_count(token) > phases.effective)
@@ -2082,11 +2159,22 @@ class LoraBrowserPlugin(WAN2GPPlugin):
         used = self._profile_references(files)
         listed = store.files() if (os.path.isdir(store.root) or os.path.isdir(store.link)) else []
         unused = [item["id"] for item in listed if item["id"] not in in_stack and item["id"] not in used]
-        if request.get("action") == "delete_unused":
-            removed = store.delete(unused)
-            instance.note(f"Deleted {removed} unused built file{'s' if removed != 1 else ''}.")
+        action = request.get("action")
+        if action in ("delete_unused", "delete", "delete_all"):
+            # Never this stack's: it would only be built again at once.
+            if action == "delete_unused":
+                targets = unused
+            elif action == "delete_all":
+                targets = [item["id"] for item in listed if item["id"] not in in_stack]
+            else:
+                wanted = {normalize_id(value) for value in (request.get("ids") or [])}
+                targets = [item["id"] for item in listed if item["id"] in wanted and item["id"] not in in_stack]
+            removed = store.delete(targets)
+            instance.note(f"Deleted {removed} built file{'s' if removed != 1 else ''}. "
+                          + ("Its recipe is kept" if removed == 1 else "Their recipes are kept")
+                          + ": whatever names one again builds it again.")
             listed = store.files()
-            unused = []
+            unused = [item["id"] for item in listed if item["id"] not in in_stack and item["id"] not in used]
         rows = []
         for item in listed:
             users = (["this stack"] if item["id"] in in_stack else []) + used.get(item["id"], [])
@@ -2095,12 +2183,27 @@ class LoraBrowserPlugin(WAN2GPPlugin):
                 "mode": item.get("mode", ""), "rank": item.get("rank", 0), "kept": item.get("kept"),
                 "exact": item.get("exact"), "label": item.get("label", ""), "linked": bool(item.get("linked")),
                 "members": [member.get("name", "") for member in item.get("members", []) or []],
+                "shrink": bool(item.get("shrink")),
                 "used_by": users,
+                "deletable": item["id"] not in in_stack,
+            })
+        # Recipes of files no longer on disk: built again whenever named.
+        on_disk = {item["id"] for item in listed}
+        kept = []
+        for derived_id, recipe in sorted(store.recipes().items()):
+            if derived_id in on_disk or not isinstance(recipe, dict):
+                continue
+            kept.append({
+                "id": derived_id, "kind": recipe.get("kind", ""), "mode": recipe.get("mode", ""),
+                "rank": recipe.get("rank", 0), "label": recipe.get("label", ""), "shrink": bool(recipe.get("shrink")),
+                "members": [member.get("name", "") for member in recipe.get("members", []) or []
+                            if isinstance(member, dict)],
             })
         folder = os.path.relpath(store.root, os.path.dirname(PLUGIN_DIR)).replace("\\", "/")
         return {
             "kind": "built", "files": rows, "unused": len(unused), "folder": folder,
             "link": f"{dv.LINK_NAME}/", "linked": store.linked if listed else True,
+            "deletable": sum(1 for row in rows if row["deletable"]), "recipes": kept,
         }
 
     def _serve_bake_plan(self, instance, request, state_value) -> dict:

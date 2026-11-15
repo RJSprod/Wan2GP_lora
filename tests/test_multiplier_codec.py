@@ -254,3 +254,44 @@ class TestSwitchedOffLoras:
     def test_ordinary_comments_are_not_mistaken_for_one(self):
         text = "1\n# lora_off is a fine thing to write\n#lora_off x 1 a.safetensors\n#lora_off 0 1"
         assert codec.parse_disabled(text) == []
+
+
+# ---------------------------------------------------- shrunk group weights
+
+
+def test_weight_lines_read_back_and_follow_their_group():
+    groups = {"A": ["a.safetensors", "my lora.safetensors", "_lora_browser/_bakes/abc123.r8.safetensors"]}
+    weights = {"A": {"a.safetensors": 0.7, "my lora.safetensors": -0.25}, "B": {"gone.safetensors": 2}}
+    text = codec.serialize(["1"], -1, [], groups, weights)
+    assert text.splitlines()[-2:] == [
+        "#lora_weight A 0.7 a.safetensors",
+        "#lora_weight A -0.25 my lora.safetensors",
+    ]
+    # A group no longer written takes its weights with it.
+    assert "gone.safetensors" not in text
+    assert codec.parse_weights(text) == {"A": {"a.safetensors": 0.7, "my lora.safetensors": -0.25}}
+    # WanGP never sees them: they are comments.
+    assert codec.strip_comments(text) == "1"
+
+
+def test_weight_lines_that_are_not_numbers_are_ignored():
+    assert codec.parse_weights("#lora_weight A nan a\n#lora_weight A x b\n#lora_weight a 1 c") == {}
+
+
+@pytest.mark.parametrize("token,factor,expected", [
+    ("1", 0.7, "0.7"),
+    ("1;1", 0.5, "0.5;0.5"),
+    ("1,1,0.5;0.8,0.2", 0.5, "0.5,0.5,0.25;0.4,0.1"),
+    ("0.9", 1, "0.9"),
+    ("-1", -0.5, "0.5"),
+    ("1:0.5", 0.5, None),
+    ("x", 2, None),
+])
+def test_scale_token_keeps_phases_and_steps(token, factor, expected):
+    assert codec.scale_token(token, factor) == expected
+
+
+def test_token_values():
+    assert codec.token_values("1,0.5;0.25") == [[1.0, 0.5], [0.25]]
+    assert codec.token_values("0.7") == [[0.7]]
+    assert codec.token_values("1:0.5") is None

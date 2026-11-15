@@ -29,6 +29,12 @@ What each feature leaves in WanGP's own state -- which is what presets,
   ``track`` each.  Baked, each side with two or more members is baked into a
   file of its own (the sound side's id ends ``.sound``); a side with one
   member keeps it selected.
+* A shrunk group (``shrink``) also says, in ``#lora_weight`` lines, what each
+  member brings to its baked file: the strength that member ran at, for a
+  shrink of single strengths, or 1 for LoRAs that shared a schedule.  It is
+  always baked, as one file whatever its members' sides -- their strengths
+  are in it -- and runs at the group's multiplier on top.  Unbaking it gives
+  each member back as a LoRA of its own, at its weight times that multiplier.
 """
 
 from __future__ import annotations
@@ -37,7 +43,8 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from . import derived as dv
-from .utils import normalize_id
+from . import multiplier_codec as codec
+from .utils import format_number, normalize_id
 
 NORMAL = "normal"
 VISUAL = "visual"
@@ -133,10 +140,23 @@ class Group:
     #: Baked files by the strength they carry: ``ALL``, or ``PICTURE`` and
     #: ``SOUND`` for a group with separate strengths.
     bakes: dict[str, str] = field(default_factory=dict)
+    #: A shrunk group's members, each with what it brings to the baked file.
+    weights: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def weighted(self) -> bool:
+        """A shrunk group: its members' strengths are in its baked file."""
+        return bool(self.weights)
+
+    def weight(self, lora_id: str) -> float:
+        return float(self.weights.get(lora_id, 1.0))
 
     @property
     def separate(self) -> bool:
-        """Picture and sound have strengths of their own."""
+        """Picture and sound have strengths of their own -- never in a shrunk
+        group, whose one file holds each side at its own strength."""
+        if self.weights:
+            return False
         return any(is_sound_entry(value) for value in self.members) or SOUND in self.bakes
 
     @property
@@ -174,15 +194,20 @@ class Group:
 def groups(stack) -> dict[str, Group]:
     """The live groups, by letter (see ``Stack.live_groups``)."""
     found = {}
+    weights_by_letter = getattr(stack, "weights", {}) or {}
     for letter, values in stack.live_groups().items():
         members = [value for value in values if not _is_bake(value)]
-        separate = any(is_sound_entry(value) for value in values)
+        weights = {
+            member: float(value) for member, value in (weights_by_letter.get(letter) or {}).items()
+            if member in members
+        }
+        separate = not weights and any(is_sound_entry(value) for value in values)
         bakes: dict[str, str] = {}
         for value in values:
             if _is_bake(value):
                 track = SOUND if is_sound_entry(value) else (PICTURE if separate else ALL)
                 bakes.setdefault(track, value)
-        found[letter] = Group(letter, members, bakes)
+        found[letter] = Group(letter, members, bakes, weights)
     return found
 
 
@@ -289,6 +314,9 @@ def rename(stack, old: str, new: str) -> bool:
             if value == old:
                 members[index] = new
                 changed = True
+    for found in getattr(stack, "weights", {}).values():
+        if old in found:
+            found[new] = found.pop(old)
     return changed
 
 
@@ -429,6 +457,8 @@ def _track_tokens(stack, group: Group) -> dict[str, str]:
 
 
 def _set_member_mode(stack, group: Group, lora_id: str, mode: str, known_ids=()) -> list[str]:
+    if group.weighted:
+        return []                   # baked in that mode: unshrink to change it
     source = source_of(lora_id, known_ids)[0]
     old = [member for member in group.members if source_of(member, known_ids)[0] == source]
     if not old or member_mode(old, known_ids) == mode:
@@ -561,7 +591,7 @@ def add_to_group(stack, letter: str, lora_id: str, known_ids=()) -> bool:
     """
     group = groups(stack).get(letter)
     units = _units(stack, [lora_id], known_ids)
-    if group is None or not units or any(group_of(stack, entry) for entry in units[0]):
+    if group is None or group.weighted or not units or any(group_of(stack, entry) for entry in units[0]):
         return False
     unit = units[0]
     source = source_of(unit[0], known_ids)[0]
@@ -624,11 +654,13 @@ def leave_group(stack, letter: str, lora_id: str, known_ids=()) -> bool:
         on = any(entries[index][1] for index in spots)
         at = spots[-1] + 1 if spots else len(entries)
         entries[at:at] = [
-            (member, on, tokens[group.track_of(member)])
+            (member, on, _weighted_token(tokens[group.track_of(member)], group.weight(member)))
             for member in mine if not stack.has_entry(member)
         ]
         stack.set_user_entries(entries, skipped)
         stack.groups[letter] = members + group.files
+        if group.weighted:
+            stack.weights[letter] = {member: group.weight(member) for member in members}
     else:
         stack.groups[letter] = members
     _single_out(stack, mine, known_ids)
@@ -639,7 +671,10 @@ def ungroup(stack, letter: str, known_ids=()) -> bool:
     group = groups(stack).get(letter)
     if group is None:
         stack.groups.pop(letter, None)
+        getattr(stack, "weights", {}).pop(letter, None)
         return False
+    if group.weighted:
+        return unshrink(stack, letter)
     if group.baked:
         unbake(stack, letter)
         group = groups(stack).get(letter) or group
@@ -657,6 +692,7 @@ def remove_group(stack, letter: str) -> bool:
     gone = set(group.members) | set(group.files)
     stack.set_user_entries([entry for entry in entries if entry[0] not in gone], skipped)
     stack.groups.pop(letter, None)
+    getattr(stack, "weights", {}).pop(letter, None)
     return True
 
 
@@ -679,7 +715,7 @@ def set_separate(stack, letter: str, separate: bool, known_ids=()) -> bool:
     again after.
     """
     group = groups(stack).get(letter)
-    if group is None or group.baked or group.separate == bool(separate):
+    if group is None or group.baked or group.weighted or group.separate == bool(separate):
         return False
     tokens = _track_tokens(stack, group)
     token = tokens[PICTURE] if group.separate else tokens[ALL]
@@ -760,11 +796,42 @@ def bake(stack, letter: str, bake_id) -> bool:
 
 def unbake(stack, letter: str) -> bool:
     """Select the members again in place of the baked files.  Settle
-    afterwards: a member whose mode leaves it nothing is skipped."""
+    afterwards: a member whose mode leaves it nothing is skipped.  A shrunk
+    group is unshrunk: its members go back to being LoRAs of their own."""
     group = groups(stack).get(letter)
     if group is None or not group.baked:
         return False
+    if group.weighted:
+        return unshrink(stack, letter)
     return set_bakes(stack, letter, {})
+
+
+def _weighted_token(token: str, weight: float) -> str:
+    """What a member ran at inside a shrunk group: its weight times the
+    group's multiplier, in that multiplier's phases and steps."""
+    scaled = codec.scale_token(token or DEFAULT_TOKEN, weight)
+    return scaled if scaled is not None else format_number(weight)
+
+
+def unshrink(stack, letter: str) -> bool:
+    """A shrunk group's LoRAs as LoRAs of their own again, where the group
+    stood, each at its weight times the group's multiplier and on if the
+    group was."""
+    group = groups(stack).get(letter)
+    if group is None or not group.weighted:
+        return False
+    token = _token(stack, lead_of(stack, group)) or DEFAULT_TOKEN
+    entries, skipped = _states(stack)
+    mine = set(group.members) | set(group.files)
+    spots = [index for index, entry in enumerate(entries) if entry[0] in mine]
+    on = any(entries[index][1] for index in spots) if spots else True
+    rest = [entry for entry in entries if entry[0] not in mine]
+    at = sum(1 for index, entry in enumerate(entries) if entry[0] not in mine and index < spots[0]) if spots else len(rest)
+    rest[at:at] = [(member, on, _weighted_token(token, group.weight(member))) for member in group.members]
+    stack.set_user_entries(rest, skipped - mine)
+    stack.groups.pop(letter, None)
+    stack.weights.pop(letter, None)
+    return True
 
 
 def rebake(stack, letter: str, bake_id) -> bool:
@@ -781,6 +848,8 @@ def sync_tokens(stack) -> bool:
     """Give every member of an unbaked side its lead's multiplier."""
     changed = False
     for group in groups(stack).values():
+        if group.weighted:
+            continue                    # each member brings its own strength
         for track in group.tracks:
             if track in group.bakes:
                 continue
@@ -807,6 +876,11 @@ def repair(stack, known_ids=()) -> bool:
     audio-only copy, and a group with separate strengths holds a Normal
     member as both halves."""
     before = (list(stack.ids), [(entry.id, entry.at) for entry in stack.disabled], repr(stack.groups))
+    # A shrunk group is only ever its baked file: one that lost it -- a hand
+    # edit, a preset -- is its LoRAs again, at their own strengths.
+    for letter, group in list(groups(stack).items()):
+        if group.weighted and not group.baked:
+            unshrink(stack, letter)
     _single_out(stack, [lora_id for lora_id, _, _ in stack.user_entries()
                         if group_of(stack, lora_id) is None], known_ids)
     for group in groups(stack).values():
@@ -874,9 +948,10 @@ def fold_rows(rows: list[dict], stack, describe: Callable[[str], dict], known_id
             bake_id=group.bake,
             bake_ids=group.files,
             separate=group.separate,
+            shrink=group.weighted,
             track=tracks[0],
-            name=f"Group {group.letter}",
-            label=f"Group {group.letter}",
+            name=f"Shrunk {group.letter}" if group.weighted else f"Group {group.letter}",
+            label=f"Shrunk {group.letter}" if group.weighted else f"Group {group.letter}",
             civitai_name="",
             has_catalogue=False,
             missing=False,
@@ -905,6 +980,10 @@ def _members(group: Group, stack, by_id: dict, describe, known_ids=()) -> list[d
         out.append(member)
     for member in out:
         member["member_mode"] = member_mode(member["entries"], known_ids)
+        if group.weighted:
+            # What each of its entries brings to the baked file: one weight,
+            # or the picture's and the sound's.
+            member["weights"] = [group.weight(entry) for entry in member["entries"]]
     return out
 
 

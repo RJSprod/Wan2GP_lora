@@ -220,24 +220,35 @@ def _link(source: str, target: str) -> bool:
         return False
 
 
-def bake_job(store: Store, derived_id: str, members: list[tuple[str, str, str, str]], rank: int,
-             sided: bool, label: str) -> Job:
+def bake_job(store: Store, derived_id: str, members: list[tuple], rank: int,
+             sided: bool, label: str, shrunk: bool = False) -> Job:
     """A group baked into one file.  ``members`` is
-    ``(original id, path, mode, display name)`` per LoRA."""
+    ``(original id, path, mode, display name[, weight])`` per LoRA: a shrunk
+    group's members carry what each brings, and its recipe says it is one."""
+    members = [tuple(member) + ((1.0,) if len(member) < 5 else ()) for member in members]
 
     def work(report) -> None:
-        plan = bk.plan([bk.Member(path, mode, name) for _, path, mode, name in members], sided=sided)
-        stamps = [store.source_stamp(lora_id) for lora_id, _, _, _ in members]
+        plan = bk.plan([bk.Member(path, mode, name, float(weight)) for _, path, mode, name, weight in members],
+                       sided=sided)
+        stamps = [store.source_stamp(lora_id) for lora_id, _, _, _, _ in members]
         result = bk.bake(
             plan, rank, store.write_path(derived_id),
-            {"lora_browser_members": ", ".join(name for _, _, _, name in members)},
+            {"lora_browser_members": ", ".join(name for _, _, _, name, _ in members)},
             progress=lambda done, total: report(done / total if total else 1.0),
         )
-        store.record(derived_id, {
+        listed = []
+        for lora_id, _, mode, name, weight in members:
+            item = {"id": lora_id, "mode": mode, "name": name}
+            if abs(float(weight) - 1.0) > 1e-9:
+                item["weight"] = float(weight)
+            listed.append(item)
+        entry = {
             "kind": "bake", "rank": result.rank, "kept": result.kept, "exact": result.exact,
-            "sources": stamps,
-            "members": [{"id": lora_id, "mode": mode, "name": name} for lora_id, _, mode, name in members],
+            "sources": stamps, "members": listed,
             "bytes": os.path.getsize(store.write_path(derived_id)), "label": label,
-        })
+        }
+        if shrunk:
+            entry["shrink"] = True
+        store.record(derived_id, entry)
 
     return Job(key=derived_id, label=f"{label}, baked at rank {int(rank)}", work=work, store=store)

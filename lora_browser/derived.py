@@ -31,6 +31,12 @@ recognises some LoRAs by name (LTX-2's IC-LoRAs).
 ``manifest.json`` in the store records what each file was built from -- the
 originals' size and modification time, and the SHA-256 of a split's source --
 so a copy whose original has been replaced is rebuilt rather than used.
+
+``recipes.json`` beside it keeps every built file's recipe -- a copy's
+original and mode, a bake's members, what each brings, and its rank -- and
+keeps it when the file is deleted: a stack, a profile or a video's settings
+that names the file again gets it built again from its originals, even where
+nothing else in them says what it held.
 """
 
 from __future__ import annotations
@@ -45,11 +51,12 @@ import threading
 import time
 from dataclasses import dataclass
 
-from .utils import is_within, normalize_id
+from .utils import format_number, is_within, normalize_id
 
 LINK_NAME = "_lora_browser"
 BAKES = "_bakes"
 MANIFEST = "manifest.json"
+RECIPES = "recipes.json"
 MODES = ("visual", "audio", "sound")
 #: The track a group's sound-side bake carries.
 SOUND_TRACK = "sound"
@@ -126,19 +133,28 @@ def original_id(derived: Derived, known_ids) -> str:
     return derived.stem + _ORIGINAL_EXTENSIONS[0]
 
 
-def bake_hash(members: list[tuple[str, str]]) -> str:
+def bake_hash(members) -> str:
     """One name per set of members and what each brings.
 
     ``members`` is ``(original id, sides)`` pairs, ``sides`` saying which of
-    its streams a member contributes.  Two groups that would bake the same
-    thing share a file; changing what any member brings changes the name, so
-    a bake is never mistaken for one built from something else.
+    its streams a member contributes -- or ``(original id, sides, weight)``,
+    a shrunk group's member scaled by what it brings.  Two groups that would
+    bake the same thing share a file; changing what any member brings changes
+    the name, so a bake is never mistaken for one built from something else.
+    A weight of 1 is left out, so every name made before weights is the same.
     """
-    text = "\n".join(f"{normalize_id(lora_id)}\t{sides}" for lora_id, sides in members)
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    lines = []
+    for member in members:
+        lora_id, sides = member[0], member[1]
+        line = f"{normalize_id(lora_id)}\t{sides}"
+        weight = float(member[2]) if len(member) > 2 else 1.0
+        if abs(weight - 1.0) > 1e-9:
+            line += f"\t{format_number(weight)}"
+        lines.append(line)
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:12]
 
 
-def bake_id(members: list[tuple[str, str]], rank: int, track: str = "") -> str:
+def bake_id(members, rank: int, track: str = "") -> str:
     suffix = f".{SOUND_TRACK}" if track == SOUND_TRACK else ""
     return f"{LINK_NAME}/{BAKES}/{bake_hash(members)}.r{int(rank)}{suffix}.safetensors"
 
@@ -256,7 +272,9 @@ class Store:
             return data if isinstance(data, dict) else {}
 
     def _write_manifest(self, data: dict) -> None:
-        path = self._manifest_path()
+        self._write_json(self._manifest_path(), data)
+
+    def _write_json(self, path: str, data: dict) -> None:
         handle, temp = tempfile.mkstemp(prefix=".manifest-", suffix=".json", dir=os.path.dirname(path))
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as writer:
@@ -274,6 +292,48 @@ class Store:
             data = self.manifest()
             data[normalize_id(derived_id)] = dict(entry, created=entry.get("created") or time.time())
             self._write_manifest(data)
+            self.remember(derived_id, recipe_of(entry))
+
+    # ----------------------------------------------------------- recipes
+
+    def _recipes_path(self) -> str:
+        return os.path.join(self.base(), RECIPES)
+
+    def _existing_base(self) -> str | None:
+        """The folder files are in, if there is one yet -- making nothing."""
+        if self._base and os.path.isdir(self._base):
+            return self._base
+        if os.path.isdir(self.link):
+            return os.path.realpath(self.link)
+        return None
+
+    def recipes(self) -> dict:
+        """Every recipe kept, built file on disk or not.  Reading makes no
+        folder and no link: a store nothing was ever built in has none."""
+        base = self._existing_base()
+        if base is None:
+            return {}
+        with self._lock:
+            try:
+                with open(os.path.join(base, RECIPES), "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except (OSError, ValueError):
+                return {}
+            return data if isinstance(data, dict) else {}
+
+    def recipe(self, derived_id: str) -> dict | None:
+        value = self.recipes().get(normalize_id(derived_id))
+        return value if isinstance(value, dict) else None
+
+    def remember(self, derived_id: str, recipe: dict) -> None:
+        """Keep what ``derived_id`` is made of -- for as long as the store is
+        there, the file or not."""
+        if not recipe:
+            return
+        with self._lock:
+            data = self.recipes()
+            data[normalize_id(derived_id)] = dict(recipe, remembered=time.time())
+            self._write_json(self._recipes_path(), data)
 
     def entry(self, derived_id: str) -> dict | None:
         value = self.manifest().get(normalize_id(derived_id))
@@ -337,7 +397,7 @@ class Store:
         return found
 
     def delete(self, derived_ids) -> int:
-        """Remove built files; returns how many went."""
+        """Remove built files; returns how many went.  Their recipes stay."""
         removed = 0
         with self._lock:
             data = self.manifest()
@@ -359,6 +419,25 @@ class Store:
                 if folder != base and not os.listdir(folder):
                     shutil.rmtree(folder, ignore_errors=True)
         return removed
+
+
+def recipe_of(entry: dict) -> dict:
+    """What to keep of a manifest entry to build its file again."""
+    kind = entry.get("kind")
+    if kind == "split":
+        sources = entry.get("sources") or [{}]
+        source = sources[0].get("id", "") if isinstance(sources[0], dict) else ""
+        return {"kind": "split", "mode": entry.get("mode", ""), "source": source, "label": entry.get("label", "")}
+    if kind == "bake":
+        members = []
+        for member in entry.get("members") or []:
+            if isinstance(member, dict) and member.get("id"):
+                members.append({key: member[key] for key in ("id", "mode", "name", "weight") if key in member})
+        found = {"kind": "bake", "rank": entry.get("rank", 0), "members": members, "label": entry.get("label", "")}
+        if entry.get("shrink"):
+            found["shrink"] = True
+        return found
+    return {}
 
 
 def _is_junction(path: str) -> bool:

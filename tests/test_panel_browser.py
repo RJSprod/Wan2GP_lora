@@ -1588,6 +1588,8 @@ AV_LORAS = {
 }
 AV_SELECTED = list(AV_LORAS)
 AV_MULTIPLIERS = "0.8;0.5 0.6;0.6 0.7;0.7 1,1,0.875,0.875,0.25,0.25,0,0;0"
+#: Three at one strength, and one on a schedule no other runs.
+SHRINK_MULTIPLIERS = "0.8;0.8 0.6;0.6 0.7;0.7 1,1,0.875,0.875,0.25,0.25,0,0;0"
 
 
 @pytest.fixture(scope="module")
@@ -1786,12 +1788,98 @@ class TestListView:
         page.wait_for_selector(".lb-dialog .lb-table")
         table = page.locator(".lb-dialog .lb-table").inner_text()
         assert "both.visual.safetensors" in table and "nothing" in table
-        page.locator(".lb-dialog button.lb-left").click()
+        page.locator(".lb-dialog button.lb-left", has_text="Delete unused").click()
         page.wait_for_selector(".lb-dialog :text('Nothing is built')", timeout=5000)
         page.locator(".lb-dialog button.lb-primary").click()
         assert page.locator(".lb-dialog").count() == 0
         settle(page, 800)
         assert not page.locator('[data-lb="built"]').is_visible()
+        assert problems == []
+
+    def test_shrink_shows_its_plan_then_bakes_the_stack_down(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host, SHRINK_MULTIPLIERS)
+        page.locator('[data-lb="shrink"]').click()
+        page.wait_for_selector(".lb-dialog .lb-shrink-file", timeout=5000)
+        dialog = page.locator(".lb-dialog")
+        assert dialog.locator(".lb-shrink-lead").inner_text().startswith("3 LoRAs into 1 file")
+        assert "WanGP loads 2 files instead of 4" in dialog.locator(".lb-shrink-lead").inner_text()
+        assert dialog.locator(".lb-shrink-head strong").inner_text() == "At one strength"
+        assert "rank 8" in dialog.locator(".lb-shrink-head").inner_text()
+        details = dialog.locator(".lb-shrink-file .lb-shrink-detail").all_inner_texts()
+        assert details == ["at 0.8", "at 0.6", "at 0.7"]
+        # What stays, and why, a tap away.
+        kept = dialog.locator(".lb-shrink-kept")
+        assert kept.locator("summary").inner_text() == "1 LoRA stays as it is"
+        kept.locator("summary").click()
+        assert kept.locator(".lb-shrink-detail").inner_text() == "No other LoRA runs this schedule."
+        # Asking changed nothing.
+        assert host.multipliers == SHRINK_MULTIPLIERS
+
+        dialog.locator("button.lb-primary", has_text="Shrink 3 LoRAs").click()
+        settle(page, 800)
+        assert len(host.selected) == 2 and host.selected[1] == "sched.safetensors"
+        assert host.selected[0].startswith("_lora_browser/_bakes/") and host.selected[0].endswith(".r8.safetensors")
+        assert "#lora_weight A 0.8 both.safetensors" in host.multipliers
+        head = page.locator(".lb-li-ghead")
+        assert head.locator(".lb-li-label").inner_text() == "Shrunk A"
+        assert "3 LoRAs in one file" in head.inner_text()
+        assert head.locator(".lb-bake-pill").inner_text() == "Shrink queued"
+        assert page.locator(".lb-li-member .lb-li-shared").all_inner_texts() == [
+            "baked in at 0.8", "baked in at 0.6", "baked in at 0.7"]
+
+        wait_until_built(page, host)
+        assert head.locator(".lb-bake-pill").inner_text().startswith("Shrunk r8")
+        assert problems == []
+
+    def test_a_shrunk_row_unshrinks_each_lora_back_to_its_strength(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host, SHRINK_MULTIPLIERS)
+        page.locator('[data-lb="shrink"]').click()
+        page.wait_for_selector(".lb-dialog .lb-shrink-file", timeout=5000)
+        page.locator(".lb-dialog button.lb-primary").click()
+        settle(page, 800)
+        page.locator(".lb-li-ghead .lb-li-name").click()
+        settle(page, 300)
+        editor = page.locator(".lb-li-editor")
+        # A shrunk group's LoRAs keep the modes they were baked in; there is
+        # no group to add to, and Unshrink stands where Ungroup would.
+        assert editor.locator(".lb-member .lb-seg").count() == 0
+        assert editor.locator(".lb-ungroup").count() == 0
+        assert "baked in at 0.8" in editor.locator(".lb-member-note").first.inner_text()
+        editor.locator("button.lb-unshrink").first.click()
+        settle(page, 800)
+        assert host.selected == list(AV_SELECTED)
+        assert host.multipliers.split("\n")[0] == SHRINK_MULTIPLIERS
+        assert page.locator(".lb-li-ghead").count() == 0
+        assert problems == []
+
+    def test_a_deleted_built_file_leaves_its_recipe(self, av_panel):
+        page, host, problems = av_panel
+        reset_av(page, host, SHRINK_MULTIPLIERS)
+        page.locator('[data-lb="shrink"]').click()
+        page.wait_for_selector(".lb-dialog .lb-shrink-file", timeout=5000)
+        page.locator(".lb-dialog button.lb-primary").click()
+        settle(page, 800)
+        wait_until_built(page, host)
+        baked = host.selected[0]
+        page.locator(".lb-li-ghead .lb-li-name").click()
+        settle(page, 300)
+        page.locator(".lb-li-editor button.lb-unshrink").first.click()
+        settle(page, 800)
+
+        page.locator('[data-lb="built"]').click()
+        page.wait_for_selector(".lb-dialog .lb-table")
+        row = page.locator(".lb-dialog .lb-table tbody tr", has=page.locator(f'td[title="{baked}"]'))
+        assert "Shrunk file, rank 8" in row.inner_text()
+        row.locator("button.lb-built-delete").click()
+        page.wait_for_selector(".lb-dialog .lb-built-recipes", timeout=5000)
+        recipes = page.locator(".lb-dialog .lb-built-recipes")
+        # Recipes outlive their files, so earlier tests' are listed too.
+        assert recipes.locator("summary").inner_text().startswith("Recipes kept for ")
+        recipes.locator("summary").click()
+        assert baked.split("/")[-1] in recipes.inner_text()
+        page.locator(".lb-dialog button.lb-primary").click()
         assert problems == []
 
     def test_the_view_is_remembered(self, av_panel):

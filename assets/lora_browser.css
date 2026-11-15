@@ -2304,3 +2304,39 @@ body.lb-scroll-locked {
 }
 .lb-cmp-overlay .lb-cmp-rows,
 .lb-sheet-overlay .lb-sheet-body { touch-action: pan-y pinch-zoom; }
+
+/* ------------------------------------------------------------- shrink */
+
+/* The Shrink dialog: a block per file it would make, then what stays. */
+.__NS__ .lb-shrink-lead { margin: 0 0 6px; }
+.__NS__ .lb-shrink-file {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color-primary);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--lb-raised) 40%, var(--lb-card));
+}
+.__NS__ .lb-shrink-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+.__NS__ .lb-shrink-runs { margin: 4px 0 0; font-size: 12.5px; color: var(--lb-muted); }
+.__NS__ .lb-shrink-runs code { overflow-wrap: anywhere; }
+.__NS__ .lb-shrink-list {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 32vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.__NS__ .lb-shrink-list li { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; }
+.__NS__ .lb-shrink-name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.__NS__ .lb-shrink-detail { flex: 0 1 auto; color: var(--lb-muted); text-align: right; font-variant-numeric: tabular-nums; }
+.__NS__ .lb-shrink-kept { margin: 10px 0 0; }
+.__NS__ .lb-shrink-kept summary { cursor: pointer; font-weight: 600; }
+.__NS__ .lb-shrink-kept .lb-shrink-detail { flex: 1 1 60%; text-align: left; }
+.__NS__ .lb-built-recipes { margin: 10px 0 0; }
+.__NS__ .lb-built-recipes summary { cursor: pointer; font-weight: 600; }
+.__NS__ .lb-built-recipes ul { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; }
+.__NS__ button.lb-btn.lb-built-delete { min-height: 30px; padding: 2px 10px; }

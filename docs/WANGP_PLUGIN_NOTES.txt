@@ -532,6 +532,7 @@ ALWAYS RUN THE NEGATIVE TEST
     stack_files.py           what a stack needs built, and each file's state
     compare.py               two recipes side by side: settings -> entries per
                              LoRA and strength, edits -> native text
+    shrink.py                shrink planning and the shrunk groups it writes
   assets/lora_browser.css    panel styling, from Gradio theme tokens
   assets/lora_browser.js     panel frontend (mount, render, bridges, diagnose)
   tests/                     no WanGP, GPU or network required
@@ -579,6 +580,26 @@ ALWAYS RUN THE NEGATIVE TEST
   prompt into the wizard, and does nothing unless apply_success is 1 or in
   advanced mode. A WanGP without the prompt component gets no prompt outputs,
   and the pop-up greys out Prompt and Both.
+
+  Shrink is groups and bakes with one addition: #lora_weight <letter>
+  <weight> <lora> lines, one per member, saying what each brings to the baked
+  file. A group with them ("weighted", a shrunk group) is one track whatever
+  its members' sides (their strengths are in the file), is always baked, never
+  has its members' tokens synced to a lead, and unbakes by unshrinking: each
+  member back as its own entry at scale_token(group token, weight). repair()
+  unshrinks one that lost its baked file. The bake hash appends a member's
+  weight only when it is not 1, so every bake id made before is unchanged.
+  The planner (shrink.py) takes the on, user-side entries -- a group's
+  members at its token, a baked or shrunk group as its originals -- and puts
+  every constant token into one bundle at weight = that value (file at "1")
+  and every other plain/scheduled token into a bundle per exact token (weight
+  1, file at that token); a bundle needs two LoRAs, and a LoRA's two halves go
+  in together or not at all. Rank = the highest member rank (summary.rank).
+  Every built file's recipe goes to recipes.json beside manifest.json when it
+  is recorded, and Store.delete leaves it: StackFiles.job falls back to it for
+  a baked id no group lines describe, and restore_groups() (run in _context)
+  puts those lines back from it. Reading recipes never creates the store or
+  its link.
 
   The open editor is laid out with container queries on .lb-rows (and on the
   full-screen sheet's body), never media queries: the panel is one column of

@@ -335,6 +335,8 @@
             'title="Make every LoRA visual only, audio only, or normal again">Audio / visual \u25BE</button>' +
           '<button type="button" class="lb-btn" data-lb="compare" aria-haspopup="dialog" ' +
             'title="Compare the LoRAs of the video selected in the gallery with the newest video\'s">Compare</button>' +
+          '<button type="button" class="lb-btn" data-lb="shrink" aria-haspopup="dialog" ' +
+            'title="Bake the stack down into as few files as run the same, so it takes less memory">Shrink</button>' +
           '<button type="button" class="lb-btn" data-lb="collapse-all" disabled ' +
             'title="Close the open LoRA - nothing in it changes">Collapse all</button>' +
           '<button type="button" class="lb-btn" data-lb="paste" aria-haspopup="dialog" aria-expanded="false" ' +
@@ -364,7 +366,7 @@
       search: pick("search"), zoom: pick("zoom"), zoomValue: pick("zoom-value"),
       zoomIn: pick("zoom-in"), zoomOut: pick("zoom-out"),
       gridWrap: pick("grid-wrap"), grid: pick("grid"),
-      activeTitle: pick("active-title"), collapseAll: pick("collapse-all"), compare: pick("compare"),
+      activeTitle: pick("active-title"), collapseAll: pick("collapse-all"), compare: pick("compare"), shrink: pick("shrink"),
       paste: pick("paste"), disableAll: pick("disable-all"),
       enableAll: pick("enable-all"), rows: pick("rows"), status: pick("status"),
       nativeToggle: pick("native"),
@@ -493,6 +495,7 @@
 
     el.collapseAll.addEventListener("click", collapseAll);
     el.compare.addEventListener("click", openCompare);
+    el.shrink.addEventListener("click", openShrinkDialog);
     el.paste.addEventListener("click", togglePaste);
     el.disableAll.addEventListener("click", function () { send({ type: "disable_all" }); });
     el.enableAll.addEventListener("click", function () { send({ type: "enable_all" }); });
@@ -1490,8 +1493,8 @@
     name.textContent = rowName(row);
     name.title = [row.civitai_name, row.name].filter(Boolean).join("\n");
     if (row.kind === "group") {
-      name.title = "Group " + row.group + ": " + (row.members || []).map(rowName).join(", ");
-      name.appendChild(note((row.members || []).length + " LoRAs move as one"));
+      name.title = rowName(row) + ": " + (row.members || []).map(rowName).join(", ");
+      name.appendChild(note((row.members || []).length + (row.shrink ? " LoRAs in one file" : " LoRAs move as one")));
     }
     if (row.system_managed) { name.appendChild(note("WanGP-managed")); }
     if (row.missing) { name.appendChild(note("Missing locally")); }
@@ -1500,7 +1503,7 @@
     top.appendChild(fullScreenButton(row, false));
 
     if (row.kind === "group") {
-      top.appendChild(makeButton("Ungroup", "lb-btn lb-ungroup", function () {
+      top.appendChild(row.shrink ? unshrinkButton(row) : makeButton("Ungroup", "lb-btn lb-ungroup", function () {
         send({ type: "ungroup", group: row.group });
       }, "Make these separate LoRAs again; each keeps the group's strength and schedule"));
     } else {
@@ -2421,7 +2424,7 @@
     bar.className = "lb-toolbar-row";
     if (!inSheet) { bar.appendChild(fullScreenButton(row, true)); }
     if (row.kind === "group") {
-      bar.appendChild(makeButton("Ungroup", "lb-btn lb-ungroup", function () {
+      bar.appendChild(row.shrink ? unshrinkButton(row) : makeButton("Ungroup", "lb-btn lb-ungroup", function () {
         send({ type: "ungroup", group: row.group });
       }, "Make these separate LoRAs again; each keeps the group's strength and schedule"));
     } else {
@@ -2541,7 +2544,7 @@
   function sheetSubtitle(row) {
     if (row.kind === "group") {
       return plural((row.members || []).length, "LoRA", "LoRAs") +
-        (row.separate ? ", picture and sound strengths" : ", one strength");
+        (row.shrink ? " in one file" : row.separate ? ", picture and sound strengths" : ", one strength");
     }
     var streams = row.streams;
     if (!streams) { return ""; }
@@ -2889,7 +2892,7 @@
     name.appendChild(span("lb-li-label", rowName(row)));
     if (group) {
       name.appendChild(span("lb-li-sub", plural((row.members || []).length, "LoRA", "LoRAs") +
-        (row.separate ? ", picture and sound strengths" : ", one strength")));
+        (row.shrink ? " in one file" : row.separate ? ", picture and sound strengths" : ", one strength")));
       var bake = bakePill(row);
       if (bake) { name.appendChild(bake); }
     } else {
@@ -2936,13 +2939,14 @@
     var name = document.createElement("button");
     name.type = "button";
     name.className = "lb-li-name";
-    name.title = "Edit Group " + group.group;
-    name.setAttribute("aria-label", rowName(member) + ", in Group " + group.group + ". Open the group");
+    name.title = "Open " + rowName(group);
+    name.setAttribute("aria-label", rowName(member) + ", in " + rowName(group) + ". Open it");
     name.appendChild(span("lb-li-label", rowName(member)));
     modePills(member).forEach(function (node) { name.appendChild(node); });
     if (member.missing) { name.appendChild(note("Missing locally")); }
     main.appendChild(name);
-    var shared = span("lb-li-shared", "moves with Group " + group.group);
+    var shared = span("lb-li-shared", group.shrink ? "baked in at " + memberWeights(member)
+      : "moves with Group " + group.group);
     shared.style.gridColumn = "span " + listPhaseCount();
     main.appendChild(shared);
     item.appendChild(main);
@@ -3081,17 +3085,18 @@
     var bake = row.bake;
     var state = buildState(bake);
     var node = span("lb-mode-pill lb-bake-pill");
+    var shrunk = !!row.shrink;
     if (state === "built") {
-      node.textContent = "Baked r" + bake.rank + (bake.bytes ? " · " + megabytes(bake.bytes) : "");
+      node.textContent = (shrunk ? "Shrunk r" : "Baked r") + bake.rank + (bake.bytes ? " · " + megabytes(bake.bytes) : "");
     } else if (state === "building") {
-      node.textContent = "Baking ";
+      node.textContent = shrunk ? "Shrinking " : "Baking ";
       var pct = span("", (bake.pct || 0) + "%");
       pct.dataset.buildPct = bake.id || row.bake_id;
       node.appendChild(pct);
     } else if (state === "queued") {
-      node.textContent = "Bake queued";
+      node.textContent = shrunk ? "Shrink queued" : "Bake queued";
     } else if (state === "failed") {
-      node.textContent = "Bake failed";
+      node.textContent = shrunk ? "Shrink failed" : "Bake failed";
       node.classList.add("lb-pill-warn");
       node.title = bake.error || "";
     } else {
@@ -3184,7 +3189,8 @@
     var box = document.createElement("div");
     box.className = "lb-row-extra";
     if (row.kind === "group") {
-      if (S.avSupported) { box.appendChild(strengthsLine(row)); }
+      // A shrunk group's sides are in its file at their own strengths.
+      if (S.avSupported && !row.shrink) { box.appendChild(strengthsLine(row)); }
       box.appendChild(bakeBlock(row));
       card.appendChild(box);
       return;
@@ -3474,7 +3480,8 @@
     select.appendChild(new Option("Group with…", ""));
     others.forEach(function (other) {
       if (other.kind === "group") {
-        select.appendChild(new Option("Add to Group " + other.group, "g:" + other.group));
+        // A shrunk group takes no new LoRA: shrink again instead.
+        if (!other.shrink) { select.appendChild(new Option("Add to Group " + other.group, "g:" + other.group)); }
         return;
       }
       var same = (other.multiplier_raw || "") === (row.multiplier_raw || "");
@@ -3571,10 +3578,12 @@
       var detail = memberNote(member, row);
       if (detail) { name.appendChild(span("lb-member-note", detail)); }
       item.appendChild(name);
-      if (S.avSupported) { item.appendChild(modeSeg(member, true)); }
+      if (S.avSupported && !row.shrink) { item.appendChild(modeSeg(member, true)); }
       var leave = makeButton("×", "lb-btn lb-icon", function () {
         send({ type: "group_leave", group: row.group, id: member.id });
-      }, "Take " + rowName(member) + " out of Group " + row.group);
+      }, row.shrink
+        ? "Take " + rowName(member) + " out: it runs on its own at the strength it had, and the rest are baked again"
+        : "Take " + rowName(member) + " out of Group " + row.group);
       leave.setAttribute("aria-label", leave.title);
       item.appendChild(leave);
       list.appendChild(item);
@@ -3582,11 +3591,25 @@
     return list;
   }
 
+  /* What a shrunk group's member brings: one weight, or its picture's and
+     its sound's. */
+  function memberWeights(member) {
+    var weights = member.weights || [];
+    if (weights.length === 2) { return "picture " + fmt(weights[0]) + ", sound " + fmt(weights[1]); }
+    return weights.length ? fmt(weights[0]) : "1";
+  }
+
   function memberNote(member, group) {
     var parts = [];
     var streams = member.streams;
     if (streams && streams.rank) { parts.push("Rank " + streams.rank); }
     var mode = member.mode || "normal";
+    if (group.shrink) {
+      if (mode !== "normal") { parts.push((MODE_LABEL[mode] || mode).toLowerCase()); }
+      parts.push("baked in at " + memberWeights(member));
+      parts.push(buildState(group.bake) === "built" ? "inside the shrunk file" : "goes in once the file is built");
+      return parts.join(" · ");
+    }
     if (member.empty) {
       parts.push("skipped: nothing to apply in " + MODE_LABEL[mode].toLowerCase());
     } else if (group.baked) {
@@ -3637,9 +3660,12 @@
     var bake = row.bake || {};
     var count = (row.members || []).length;
     var unbake = function () {
+      // A shrunk row has Unshrink in its toolbar already.
+      if (row.shrink) { return span(""); }
       return makeButton("Unbake", "lb-btn", function () { send({ type: "unbake", group: row.group }); },
         "Load the members separately again");
     };
+    var shrunk = !!row.shrink;
     if (!row.baked) {
       head.appendChild(span("lb-muted", "Not baked"));
       head.appendChild(span("lb-grow"));
@@ -3651,7 +3677,7 @@
     }
     var state = buildState(bake);
     if (state === "built") {
-      head.appendChild(span("lb-mode-pill lb-bake-pill", "Baked r" + bake.rank));
+      head.appendChild(span("lb-mode-pill lb-bake-pill", (shrunk ? "Shrunk r" : "Baked r") + bake.rank));
       head.appendChild(span("lb-grow"));
       head.appendChild(makeButton("Change size…", "lb-btn", function () { openBakeDialog(row); }));
       head.appendChild(unbake());
@@ -3659,9 +3685,11 @@
       line.textContent = (several ? "WanGP loads a file per side" : "WanGP loads one file") +
         (bake.bytes ? (several ? ", " + megabytes(bake.bytes) + " in all," : " of " + megabytes(bake.bytes)) : "") +
         " instead of " + count + ". It keeps " + keptText(bake) + " of their combined change. " +
-        "Strength and schedule still apply live.";
+        (shrunk ? "Each LoRA's own strength is baked in; this row's strength scales them all."
+          : "Strength and schedule still apply live.");
     } else if (state === "building" || state === "queued") {
-      head.appendChild(span("", (state === "building" ? "Baking" : "Bake queued") + " at rank " + bake.rank));
+      head.appendChild(span("", (state === "building" ? (shrunk ? "Shrinking" : "Baking")
+        : (shrunk ? "Shrink queued" : "Bake queued")) + " at rank " + bake.rank));
       head.appendChild(span("lb-grow"));
       head.appendChild(unbake());
       if (state === "building") {
@@ -3676,7 +3704,7 @@
           "WanGP reports it as missing.";
       }
     } else if (state === "failed") {
-      head.appendChild(span("lb-mode-pill lb-bake-pill lb-pill-warn", "Bake failed"));
+      head.appendChild(span("lb-mode-pill lb-bake-pill lb-pill-warn", shrunk ? "Shrink failed" : "Bake failed"));
       head.appendChild(span("lb-grow"));
       head.appendChild(makeButton("Retry", "lb-btn", function () {
         var failed = (bake.files || []).filter(function (file) { return file.state === "failed"; });
@@ -3685,14 +3713,15 @@
       }));
       head.appendChild(unbake());
       load.classList.add("lb-load-warn");
-      line.textContent = (bake.error || "The bake did not finish") + ". Unbake to load the members separately.";
+      line.textContent = (bake.error || "The bake did not finish") +
+        (shrunk ? ". Unshrink to load the LoRAs separately, each at its strength." : ". Unbake to load the members separately.");
     } else {
       head.appendChild(span("lb-mode-pill lb-bake-pill lb-pill-warn", "Not built"));
       head.appendChild(span("lb-grow"));
       head.appendChild(unbake());
       load.classList.add("lb-load-warn");
       line.textContent = state === "unavailable" ? "This model has no LoRA folder to build the baked file in."
-        : "The baked file is not built yet. If you generate now, WanGP reports it as missing.";
+        : "The " + (shrunk ? "shrunk" : "baked") + " file is not built yet. If you generate now, WanGP reports it as missing.";
     }
     return box;
   }
@@ -3770,7 +3799,7 @@
   function openBakeDialog(row) {
     var body = document.createElement("div");
     body.appendChild(paragraph("Reading the LoRAs…", "lb-muted"));
-    var dialog = openDialog((row.baked ? "Change the size of " : "Bake ") + "Group " + row.group, body,
+    var dialog = openDialog((row.baked ? "Change the size of " : "Bake ") + rowName(row), body,
       [{ label: "Cancel" }]);
     var members = [];
     (row.members || []).forEach(function (member) {
@@ -3850,9 +3879,10 @@
     loadBuilt(dialog, "");
   }
 
-  function loadBuilt(dialog, action) {
+  function loadBuilt(dialog, action, ids) {
     var request = { kind: "built", in_use: stackFileIds() };
     if (action) { request.action = action; }
+    if (ids) { request.ids = ids; }
     requestMedia(request, function (reply) {
       if (action) { send({ type: "ready" }); }          // the status bar's count
       if (S.dialog !== dialog.overlay) { return; }
@@ -3887,7 +3917,7 @@
       var table = document.createElement("table");
       table.className = "lb-table";
       var headRow = table.createTHead().insertRow();
-      ["File", "Built from", "Size", "Used by"].forEach(function (label) {
+      ["File", "Built from", "Size", "Used by", ""].forEach(function (label) {
         var cell = document.createElement("th");
         cell.scope = "col";
         cell.textContent = label;
@@ -3901,11 +3931,8 @@
         name.appendChild(codeText(text(file.id).split("/").pop()));
         name.title = file.id;
         var from = line.insertCell();
-        from.textContent = file.kind === "bake"
-          ? "Group bake" + (/\.sound\.safetensors$/.test(file.id) ? " (sound side)" : "") +
-            ", rank " + file.rank + ": " + listJoin(file.members || []) +
-            (file.kept !== null && file.kept !== undefined ? " · keeps " + keptText(file) : "")
-          : (file.label || "") + " · " + (MODE_LABEL[file.mode] || file.mode || "");
+        from.textContent = builtFrom(file) +
+          (file.kind === "bake" && file.kept !== null && file.kept !== undefined ? " · keeps " + keptText(file) : "");
         var size = line.insertCell();
         size.className = "lb-t-num";
         size.textContent = megabytes(file.bytes);
@@ -3915,18 +3942,57 @@
         } else {
           used.appendChild(span("lb-muted", "nothing"));
         }
+        var act = line.insertCell();
+        if (file.deletable) {
+          var remove = makeButton("Delete", "lb-btn lb-built-delete", function () {
+            remove.disabled = true;
+            loadBuilt(dialog, "delete", [file.id]);
+          }, "Delete this file; its recipe is kept, so it is built again if anything names it");
+          act.appendChild(remove);
+        }
       });
       wrap.appendChild(table);
       body.appendChild(wrap);
     }
-    body.appendChild(paragraph("Delete unused removes only files that neither this stack nor a saved profile " +
-      "uses. Anything deleted is built again from its originals if it is ever used again.", "lb-fine"));
+    var kept = reply.recipes || [];
+    if (kept.length) {
+      var book = document.createElement("details");
+      book.className = "lb-built-recipes";
+      book.appendChild(document.createElement("summary")).textContent =
+        "Recipes kept for " + plural(kept.length, "deleted file", "deleted files");
+      var list = document.createElement("ul");
+      kept.forEach(function (recipe) {
+        var item = document.createElement("li");
+        item.appendChild(codeText(text(recipe.id).split("/").pop()));
+        item.appendChild(document.createTextNode(" · " + builtFrom(recipe)));
+        list.appendChild(item);
+      });
+      book.appendChild(list);
+      body.appendChild(book);
+    }
+    body.appendChild(paragraph("Deleting a file keeps its recipe: when this stack, a profile or a video's " +
+      "settings names it again, it is built again from its originals. This stack's own files are not offered: " +
+      "they would be built again at once. Delete unused leaves the files saved profiles use, too.", "lb-fine"));
     var unused = reply.unused || 0;
+    var deletable = reply.deletable || 0;
     dialog.setActions([
       { label: "Delete unused (" + unused + ")", left: true, disabled: !unused, keepOpen: true,
         run: function (button) { button.disabled = true; loadBuilt(dialog, "delete_unused"); } },
+      { label: "Delete all but this stack's (" + deletable + ")", left: true, disabled: !deletable, keepOpen: true,
+        run: function (button) { button.disabled = true; loadBuilt(dialog, "delete_all"); } },
       { label: "Close", primary: true }
     ]);
+  }
+
+  /* What a built file holds, in words: a copy's original and mode, or a
+     bake's members. */
+  function builtFrom(file) {
+    if (file.kind === "bake") {
+      return (file.shrink ? "Shrunk file" : "Group bake") +
+        (/\.sound\.safetensors$/.test(file.id) ? " (sound side)" : "") +
+        ", rank " + file.rank + ": " + listJoin(file.members || []);
+    }
+    return (file.label || "") + " · " + (MODE_LABEL[file.mode] || file.mode || "");
   }
 
   function paintBuiltLink() {
@@ -5362,7 +5428,11 @@
     var words = [];
     if (entry.system) { words.push("WanGP's"); }
     if (entry.mode) { words.push(entry.mode); }
-    if (entry.group) { words.push("Group " + entry.group + (entry.baked ? ", baked" : "")); }
+    if (entry.shrunk) {
+      words.push("Shrunk " + entry.group);
+    } else if (entry.group) {
+      words.push("Group " + entry.group + (entry.baked ? ", baked" : ""));
+    }
     if (entry.added) { words.push("Added"); }
     return words;
   }
@@ -5395,7 +5465,7 @@
       return cell;
     }
     if (!entry.on) { cell.classList.add("lb-cmp-off"); }
-    var editable = which === "right" && !entry.system && !!entry.phases;
+    var editable = which === "right" && !entry.system && !entry.shrunk && !!entry.phases;
 
     // One line: the right's switch, the values, the left's "use this value".
     var main = document.createElement("div");
@@ -5699,7 +5769,7 @@
   function cmpCanUse(view, row) {
     if (!view.right.recipe || !row.left || !row.left.phases || row.left.system) { return false; }
     if (!row.right) { return true; }
-    if (row.right.system || !row.right.phases) { return false; }
+    if (row.right.system || row.right.shrunk || !row.right.phases) { return false; }
     return !row.right.on || JSON.stringify(row.left.phases) !== JSON.stringify(row.right.phases);
   }
 
@@ -5860,6 +5930,129 @@
     buttons.both.disabled = !!noPrompt || !recipe;
     buttons.prompt.title = noPrompt || "Only its prompt";
     buttons.both.title = noPrompt || "Its prompt and its LoRA values";
+  }
+
+  /* ----------------------------------------------------------- shrink */
+
+  /* Shrink bakes the stack down into as few files as run the same: one for
+     everything at one strength, each baked in at its strength, and one per
+     schedule several LoRAs share. The plan comes from the plugin -- it reads
+     the files -- and nothing changes until Shrink is pressed. */
+  function openShrinkDialog() {
+    var body = document.createElement("div");
+    body.appendChild(paragraph("Working out what can be baked together…", "lb-muted"));
+    S.shrinkDialog = openDialog("Shrink the stack", body, [{ label: "Cancel" }]);
+    send({ type: "shrink_plan" });
+  }
+
+  function onShrinkPlan(plan) {
+    var dialog = S.shrinkDialog;
+    if (!dialog || S.dialog !== dialog.overlay) { return; }
+    renderShrinkPlan(dialog, plan);
+  }
+
+  function unshrinkButton(row) {
+    var button = makeButton("Unshrink", "lb-btn lb-unshrink", function () {
+      send({ type: "unshrink", group: row.group });
+    }, "Load these LoRAs separately again, each at the strength it had");
+    return button;
+  }
+
+  function shrinkName(piece) {
+    var item = S.byId[piece.source];
+    return item ? displayName(item) : (piece.name || piece.source);
+  }
+
+  function shrinkWhat(bundle) {
+    if (bundle.kind === "flat") { return "At one strength"; }
+    return bundle.schedule ? "Sharing a schedule" : "Sharing strengths per phase";
+  }
+
+  function renderShrinkPlan(dialog, plan) {
+    var body = dialog.body;
+    body.innerHTML = "";
+    if (plan.error) {
+      body.appendChild(paragraph(plan.error));
+      dialog.setActions([{ label: "Close", primary: true }]);
+      return;
+    }
+    var bundles = plan.bundles || [];
+    var kept = plan.kept || [];
+    var loras = bundles.reduce(function (sum, bundle) { return sum + bundle.loras; }, 0);
+    if (!bundles.length) {
+      body.appendChild(paragraph("Nothing to shrink: no two LoRAs run at one strength, or share a schedule."));
+    } else {
+      var before = bundles.reduce(function (sum, bundle) { return sum + (bundle.bytes_before || 0); }, 0);
+      var after = bundles.reduce(function (sum, bundle) { return sum + (bundle.bytes_after || 0); }, 0);
+      var lead = paragraph("", "lb-shrink-lead");
+      lead.appendChild(document.createElement("strong")).textContent =
+        plural(loras, "LoRA", "LoRAs") + " into " + plural(bundles.length, "file", "files");
+      lead.appendChild(document.createTextNode(
+        " · WanGP loads " + plural(plan.files_after, "file", "files") + " instead of " + plan.files_before +
+        (before ? ", about " + megabytes(after) + " of LoRA weights instead of " + megabytes(before) : "") + "."));
+      body.appendChild(lead);
+      body.appendChild(paragraph("LoRAs at one strength are baked in at that strength, and their file runs at 1. " +
+        "LoRAs that share a schedule are baked in at 1, and their file runs the schedule. Each file is fitted to " +
+        "the rank of the highest-rank LoRA in it.", "lb-fine"));
+      bundles.forEach(function (bundle) {
+        var box = document.createElement("section");
+        box.className = "lb-shrink-file";
+        var head = document.createElement("div");
+        head.className = "lb-shrink-head";
+        head.appendChild(document.createElement("strong")).textContent = shrinkWhat(bundle);
+        head.appendChild(span("lb-muted", plural(bundle.loras, "LoRA", "LoRAs") + " → 1 file, rank " + bundle.rank +
+          (bundle.bytes_after ? " · " + megabytes(bundle.bytes_after) : "")));
+        box.appendChild(head);
+        if (bundle.kind !== "flat") {
+          var runs = paragraph("", "lb-shrink-runs");
+          runs.appendChild(document.createTextNode("Runs "));
+          runs.appendChild(codeText(bundle.token));
+          box.appendChild(runs);
+        }
+        var list = document.createElement("ul");
+        list.className = "lb-shrink-list";
+        (bundle.members || []).forEach(function (piece) {
+          var item = document.createElement("li");
+          item.appendChild(span("lb-shrink-name", shrinkName(piece)));
+          var mode = piece.mode && piece.mode !== "normal" ? (MODE_LABEL[piece.mode] || piece.mode) : "";
+          var detail = [mode, bundle.kind === "flat" ? "at " + fmt(piece.weight) : ""].filter(Boolean).join(" · ");
+          if (detail) { item.appendChild(span("lb-shrink-detail", detail)); }
+          list.appendChild(item);
+        });
+        box.appendChild(list);
+        body.appendChild(box);
+      });
+    }
+    if (kept.length) {
+      var rest = document.createElement("details");
+      rest.className = "lb-shrink-kept";
+      if (!bundles.length) { rest.open = true; }
+      rest.appendChild(document.createElement("summary")).textContent =
+        plural(kept.length, "LoRA stays", "LoRAs stay") + " as " + (kept.length === 1 ? "it is" : "they are");
+      var reasons = document.createElement("ul");
+      reasons.className = "lb-shrink-list";
+      kept.forEach(function (piece) {
+        var item = document.createElement("li");
+        item.appendChild(span("lb-shrink-name", shrinkName(piece)));
+        item.appendChild(span("lb-shrink-detail", piece.reason || ""));
+        reasons.appendChild(item);
+      });
+      rest.appendChild(reasons);
+      body.appendChild(rest);
+    }
+    if (bundles.length) {
+      body.appendChild(paragraph("The originals stay where they are. Each shrunk file is built in the background; " +
+        "until it is, WanGP reports it missing if you generate. Unshrink, on each shrunk row, loads the LoRAs " +
+        "separately again.", "lb-fine"));
+      dialog.setActions([
+        { label: "Cancel" },
+        { label: "Shrink " + plural(loras, "LoRA", "LoRAs"), primary: true, run: function () { send({ type: "shrink" }); } }
+      ]);
+      var go = dialog.overlay.querySelector(".lb-dialog-foot .lb-primary");
+      if (go) { go.focus(); }
+    } else {
+      dialog.setActions([{ label: "Close", primary: true }]);
+    }
   }
 
   /* --------------------------------------------------------- inspect */
@@ -6216,6 +6409,7 @@
     // The answer to a paste is about the paste, even when a newer payload
     // overtook the one carrying it.
     if (payload.paste_report) { onPasteReport(payload.paste_report); }
+    if (payload.shrink_plan) { onShrinkPlan(payload.shrink_plan); }
     // Ignore a stale async response that lost the race with a newer sync.
     if (payload.revision !== undefined && payload.revision < S.revision) { return; }
 

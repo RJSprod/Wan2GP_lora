@@ -70,6 +70,11 @@ thumbnail browser and a real-time strength editor.
   grouped, so they move as one, and a group can be baked into a single LoRA at
   a rank you choose to save memory — and unbaked again. See
   [Groups and bakes](#groups-and-bakes).
+- **Shrink a big stack.** *Shrink* bakes every LoRA that runs at one strength
+  into one file, each at its strength, and every set of LoRAs that share a
+  schedule into a file of their own that runs it — twenty LoRAs at one
+  strength and two schedules shared by five more become three files, applying
+  the same. *Unshrink* gives them back. See [Shrinking a stack](#shrinking-a-stack).
 - **Image previews first, video previews as a still.** A LoRA with only a video
   preview gets its *first frame* decoded server-side and cached; the video itself
   is never loaded in the browser.
@@ -608,16 +613,91 @@ a baked group's lines also name its file
 `loras_choices` then holds. A group with separate picture and sound strengths
 lists each member as the halves it is selected as; nothing else marks it.
 
+### Shrinking a stack
+
+A big stack takes a lot of memory: WanGP keeps every LoRA's factors loaded.
+**Shrink**, above the active LoRAs, bakes the stack down into as few files as
+run the same:
+
+- **Every LoRA at one strength** — the same value in every phase and at every
+  step — goes into **one file**, each baked in at its strength, and that file
+  runs at **1**. A LoRA at 0.7 still brings 0.7; a LoRA at −1 still takes away.
+- **LoRAs that share exactly the same schedule** (or the same strengths per
+  phase) go into **a file per schedule**, each at 1, and that file runs the
+  schedule: the sum of LoRAs that each follow a schedule is that sum following
+  it. A LoRA with no other on its schedule stays as it is.
+- **Each file is fitted to the rank of the highest-rank LoRA in it**, the way
+  a bake starts. Once built, its row says how much of the combined change it
+  kept; **Change size…** builds it again at another rank.
+- **Modes count**: an audio-only LoRA goes in as its sound side, a visual-only
+  one as its picture side, and a LoRA with separate picture and sound
+  strengths as its picture half at the one and its sound half at the other.
+  Its two halves go in together or not at all.
+- **What goes in** is what runs: LoRAs that are on, on your side of the bar. A
+  group's members come in at the group's strength, and anything baked or
+  shrunk before comes in as its originals, so shrinking again plans everything
+  afresh. **What stays as it is** is listed with why: LoRAs switched off,
+  WanGP's own, multipliers with `:` branches, LoRAs not on this machine, and
+  files a bake cannot combine (DoRA, LoKr, full weight differences).
+
+```
+ Shrink the stack
+ 3 LoRAs into 1 file · WanGP loads 2 files instead of 4, about 410 MB of
+ LoRA weights instead of 1.2 GB.
+ ┌ At one strength   3 LoRAs → 1 file, rank 64 · 410 MB ┐
+ │ Detail_Enhancer                              at 0.8 │
+ │ Film_Grain                                   at 0.6 │
+ │ Neg_Blur                                      at −1 │
+ └──────────────────────────────────────────────────────┘
+ ▸ 1 LoRA stays as it is
+                                 [ Cancel ] [ Shrink 3 LoRAs ]
+```
+
+The dialog shows the plan first; nothing changes until **Shrink**. Each file
+then builds in the background — until it is ready, WanGP reports it missing if
+you generate, and the panel warns about exactly that. A shrunk file is a row of
+its own, *Shrunk A*, its LoRAs listed under it with the strength each brings.
+Its own strength scales them all. `×` takes one out (it runs on its own again,
+and the rest are baked again), and **Unshrink** gives every one back as a LoRA
+of its own at the strength it had — times the row's strength, if you changed
+it.
+
+A shrunk file is a group whose lines say what each LoRA brings to it:
+
+```
+1 1,1,0.5,0.5
+#lora_group A Detail_Enhancer.safetensors
+#lora_group A Film_Grain.safetensors
+#lora_group A _lora_browser/_bakes/3f9c21a07b4e.r64.safetensors
+#lora_weight A 0.8 Detail_Enhancer.safetensors
+#lora_weight A 0.6 Film_Grain.safetensors
+```
+
+so presets, the queue and every video's saved settings carry everything needed
+to build it again. **Copy current stack** writes the same as tags,
+`Detail_Enhancer [group A, baked r64, weight 0.8]: x1`, and pasting it back
+gives the shrunk file back; profiles keep it too. The compare view shows each
+shrunk LoRA at what it brings, and leaves it as it is: unshrink to change one.
+
 ### Built files
 
-Visual-only and audio-only copies and baked groups are kept in the plugin's own
-folder, under `derived/<LoRA folder>-<hash>/`, and linked into the model's LoRA
-folder as `_lora_browser/` — a symlink, a junction on Windows, or a plain
-folder where neither can be made — which is how WanGP finds them like any other
-LoRA. They never show in the thumbnail grid. **Built files** in the status bar
-lists them with what each was built from, its size and what uses it (this stack
-or a saved profile), and **Delete unused** removes the ones nothing uses.
-Anything deleted is built again from its originals if it is ever used again.
+Visual-only and audio-only copies, baked groups and shrunk files are kept in
+the plugin's own folder, under `derived/<LoRA folder>-<hash>/`, and linked into
+the model's LoRA folder as `_lora_browser/` — a symlink, a junction on Windows,
+or a plain folder where neither can be made — which is how WanGP finds them
+like any other LoRA. They never show in the thumbnail grid. **Built files** in
+the status bar lists them with what each was built from, its size and what uses
+it (this stack or a saved profile). **Delete** removes one; **Delete unused**
+removes those nothing uses; **Delete all but this stack's** removes every one
+this stack does not use, saved profiles' included.
+
+**Every built file's recipe is kept** — a copy's original and mode; a bake's
+or a shrink's LoRAs, what each brings, and its rank — in `recipes.json` beside
+the files, and deleting a file keeps it. Whenever a stack, a recalled profile,
+a preset or a video's settings names a deleted file again, it is built again
+from its originals. That works even where the settings lost the lines saying
+what a baked file holds: its recipe gives the group back. The Built files list
+shows the recipes kept for deleted files.
 
 ### Phases
 
@@ -805,6 +885,8 @@ lora_browser/
   stack_modes.py           modes, groups and bakes in the native stack
   stack_files.py           which built files a stack needs, and their state
   compare.py               two recipes side by side, and edits written back
+  shrink.py                a stack baked down: what goes into which file, and
+                           the shrunk groups that replace them
 assets/                    panel CSS and JavaScript
 ```
 

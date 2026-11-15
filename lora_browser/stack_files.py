@@ -104,14 +104,15 @@ class StackFiles:
     def bake_ids(self, group: sm.Group, rank: int) -> dict[str, str]:
         """The file each side of ``group`` bakes into at ``rank``: the whole
         group's, or -- with separate strengths -- the picture's and the
-        sound's, for each side with two or more members."""
+        sound's, for each side with two or more members.  A shrunk group's
+        members are named with what each brings."""
         found = {}
         for track in group.tracks:
             members = self.bakeable(group, track)
             if len(members) >= 2:
                 found[track] = dv.bake_id(
-                    [(self.source(member)[0], self.sides(member)) for member in members], rank,
-                    track=dv.SOUND_TRACK if track == sm.SOUND else "",
+                    [(self.source(member)[0], self.sides(member), group.weight(member)) for member in members],
+                    rank, track=dv.SOUND_TRACK if track == sm.SOUND else "",
                 )
         return found
 
@@ -136,14 +137,14 @@ class StackFiles:
         sound half, in a group with separate strengths, brings nothing."""
         return [member for member in group.track_members(track) if not self.empty(member)]
 
-    def _members(self, group: sm.Group, track: str = "") -> list[tuple[str, str, str, str]] | None:
+    def _members(self, group: sm.Group, track: str = "") -> list[tuple[str, str, str, str, float]] | None:
         found = []
         for member in (self.bakeable(group, track) if track else group.members):
             source, mode = self.source(member)
             path = self.path_of(source)
             if not path or not os.path.isfile(path):
                 return None
-            found.append((source, path, mode, display_name(source)))
+            found.append((source, path, mode, display_name(source), group.weight(member)))
         return found
 
     def bake_options(self, stack, letter: str) -> dict:
@@ -159,7 +160,7 @@ class StackFiles:
             if len(members) < 2:
                 continue                    # a side of one LoRA stays as it is
             try:
-                plans.append(bk.plan([bk.Member(path, mode, name) for _, path, mode, name in members],
+                plans.append(bk.plan([bk.Member(path, mode, name, weight) for _, path, mode, name, weight in members],
                                      sided=self.sided))
             except bk.BakeError as error:
                 return {"error": str(error)}
@@ -237,12 +238,89 @@ class StackFiles:
         group = sm.group_of(stack, native_id)
         track = next((key for key, value in group.bakes.items() if value == native_id), None) if group else None
         if track is None:
-            return None
+            # Nothing in the stack says what it holds: its recipe does.
+            return self.recipe_job(native_id, parsed.rank)
         members = self._members(group, track)
         if members is None or len(members) < 2:
             return None
-        label = f"Group {group.letter}" + {sm.PICTURE: ", picture", sm.SOUND: ", sound"}.get(track, "")
-        return bd.bake_job(self.store, native_id, members, parsed.rank, self.sided, label)
+        name = "Shrunk" if group.weighted else "Group"
+        label = f"{name} {group.letter}" + {sm.PICTURE: ", picture", sm.SOUND: ", sound"}.get(track, "")
+        return bd.bake_job(self.store, native_id, members, parsed.rank, self.sided, label, shrunk=group.weighted)
+
+    def _recipe_members(self, recipe: dict) -> list[tuple[str, str, str, str, float]] | None:
+        found = []
+        for item in recipe.get("members") or []:
+            if not isinstance(item, dict):
+                continue
+            source = normalize_id(item.get("id"))
+            path = self.path_of(source) if source else None
+            if not path or not os.path.isfile(path):
+                return None
+            try:
+                weight = float(item.get("weight", 1.0))
+            except (TypeError, ValueError):
+                return None
+            found.append((source, path, str(item.get("mode") or sm.NORMAL),
+                          str(item.get("name") or display_name(source)), weight))
+        return found
+
+    def recipe_job(self, native_id: str, rank: int) -> bd.Job | None:
+        """A bake built again from the recipe kept when it was first built."""
+        if self.store is None:
+            return None
+        try:
+            recipe = self.store.recipe(native_id)
+        except OSError:
+            return None
+        if not recipe or recipe.get("kind") != "bake":
+            return None
+        members = self._recipe_members(recipe)
+        if members is None or len(members) < 2:
+            return None
+        return bd.bake_job(self.store, native_id, members, rank, self.sided,
+                           str(recipe.get("label") or "Baked file"), shrunk=bool(recipe.get("shrink")))
+
+    def restore_groups(self, stack) -> bool:
+        """Give a baked file the stack names without the lines that say what
+        it holds -- a setting from somewhere that dropped them -- its group
+        back, from the recipe kept when it was built."""
+        if self.store is None:
+            return False
+        held = {value for group in sm.groups(stack).values() for value in group.files}
+        named = {value for members in stack.groups.values() for value in members}
+        changed = False
+        for lora_id, _, _ in stack.user_entries():
+            parsed = dv.parse(lora_id)
+            if parsed is None or parsed.kind != "bake" or lora_id in held:
+                continue
+            try:
+                recipe = self.store.recipe(lora_id)
+            except OSError:
+                return changed
+            if not recipe or recipe.get("kind") != "bake":
+                continue
+            members, weights = [], {}
+            for item in recipe.get("members") or []:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                source, mode = normalize_id(item.get("id")), str(item.get("mode") or sm.NORMAL)
+                native = dv.split_id(source, mode) if mode in dv.MODES else source
+                members.append(native)
+                try:
+                    weights[native] = float(item.get("weight", 1.0))
+                except (TypeError, ValueError):
+                    weights[native] = 1.0
+            if len(members) < 2 or any(stack.has_entry(member) or member in named for member in members):
+                continue
+            letter = sm.next_letter(stack)
+            if not letter:
+                break
+            stack.groups[letter] = members + [lora_id]
+            if recipe.get("shrink") or any(abs(weight - 1.0) > 1e-9 for weight in weights.values()):
+                stack.weights[letter] = weights
+            named.update(members)
+            changed = True
+        return changed
 
     def ensure(self, stack) -> None:
         """Queue every file the stack selects and does not have ready."""

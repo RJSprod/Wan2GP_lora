@@ -410,7 +410,9 @@ class Stack:
     off in the panel: kept with their multipliers, as comment lines in the
     multiplier text (``codec.DISABLED_MARK``), and applied by nothing.
     ``groups`` are the LoRAs that move together, by letter, as the multiplier
-    text's ``#lora_group`` lines declare them (see ``stack_modes``).
+    text's ``#lora_group`` lines declare them (see ``stack_modes``), and
+    ``weights`` what each member of a shrunk group brings to its baked file
+    (its ``#lora_weight`` lines).
     """
 
     ids: list[str] = field(default_factory=list)
@@ -418,6 +420,7 @@ class Stack:
     separator_index: int = -1
     disabled: list[codec.DisabledLora] = field(default_factory=list)
     groups: dict[str, list[str]] = field(default_factory=dict)
+    weights: dict[str, dict[str, float]] = field(default_factory=dict)
 
     @classmethod
     def from_native(cls, selected, multipliers: str) -> "Stack":
@@ -441,6 +444,10 @@ class Stack:
         stack.groups = {
             letter: [normalize_id(value) for value in members if normalize_id(value)]
             for letter, members in codec.parse_groups(multipliers).items()
+        }
+        stack.weights = {
+            letter: {normalize_id(member): weight for member, weight in found.items() if normalize_id(member)}
+            for letter, found in codec.parse_weights(multipliers).items() if letter in stack.groups
         }
         return stack
 
@@ -492,6 +499,8 @@ class Stack:
         for members in self.groups.values():
             if target in members:
                 members.remove(target)
+        for found in self.weights.values():
+            found.pop(target, None)
         return True
 
     def disabled_entry(self, lora_id: str) -> codec.DisabledLora | None:
@@ -587,7 +596,7 @@ class Stack:
             entry = inventory.get(lora_id) if inventory else None
             values.append(entry.native_value if entry else lora_id)
         return values, codec.serialize(
-            self.tokens, self.separator_index, self.disabled, self.live_groups()
+            self.tokens, self.separator_index, self.disabled, self.live_groups(), self.weights
         )
 
     def live_groups(self) -> dict[str, list[str]]:
